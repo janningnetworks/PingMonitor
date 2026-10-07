@@ -1,0 +1,56 @@
+PingMonitor - Geräte per Ping überwachen (App und optional Windows-Dienst)
+==========================================================================
+
+Ablage
+------
+Ordner z. B. nach C:\PingMonitor kopieren (NICHT nach C:\Programme, dort fehlen
+Schreibrechte für hosts.txt und Logs).
+
+Start
+-----
+PingMonitor.exe doppelklicken (benötigt .NET Framework 4.x, ist in Windows 10/11 enthalten).
+Alternativ selbst kompilieren: build.bat ausführen -> erzeugt PingMonitor.exe aus PingMonitor.cs.
+
+Bedienung (App)
+---------------
+1. Name + IP/Hostname eingeben, Intervall und Timeout wählen, "Hinzufügen" (oder Enter).
+2. Geräte markieren (Strg/Shift für mehrere) und "Start" - oder "Alle starten".
+   Jedes Gerät wird in einem eigenen Thread parallel gepingt.
+3. Farben: grün = erreichbar, rot = Ausfall, gelb = gestartet, noch keine Antwort.
+
+Windows-Dienst (optional)
+-------------------------
+- In der App: "Dienst installieren" (Windows fragt nach Administratorrechten).
+  Der Dienst "Ping Monitor" startet automatisch mit Windows - auch ohne Anmeldung -
+  und überwacht ALLE Geräte aus der Liste (hosts.txt).
+- Geräte in der App hinzufügen/entfernen: Der Dienst übernimmt die Änderung
+  innerhalb von ca. 2 Sekunden, ohne Neustart.
+- Läuft der Dienst, zeigt die App dessen Status ("Dienst: Erreichbar" / "Dienst: AUSFALL")
+  und dessen Protokolleinträge (Spalte "Quelle" = Dienst) live an.
+  Die App muss dafür nicht in der App selbst pingen.
+- "Dienst stoppen" / "Dienst starten" / "Dienst deinstallieren" ebenfalls in der App.
+- Bei einem Absturz startet Windows den Dienst nach 1 Minute automatisch neu.
+- Ohne Oberfläche per Kommandozeile (als Administrator):
+    PingMonitor.exe /install      installieren und starten
+    PingMonitor.exe /uninstall    stoppen und entfernen
+    PingMonitor.exe /start        starten
+    PingMonitor.exe /stop         stoppen
+  Zusatz /quiet unterdrückt die Meldungsfenster.
+- Wichtig: Nach der Installation den Ordner nicht verschieben (der Dienst verweist
+  auf den Pfad der EXE). Zum Verschieben: deinstallieren, verschieben, neu installieren.
+  Zum Aktualisieren der EXE: Dienst stoppen, EXE ersetzen, Dienst starten.
+
+Protokoll
+---------
+- Beim ersten fehlgeschlagenen Ping: Eintrag "Ausfall" mit Zeitstempel.
+- Weitere Fehlschläge: "Ping fehlgeschlagen" (abschaltbar per Checkbox, gilt auch für den Dienst).
+- Wenn das Gerät wieder antwortet: "Wieder erreichbar" inkl. Ausfalldauer.
+- Logdatei: Ordner "Logs" neben der EXE, eine CSV-Datei pro Tag (PingLog_JJJJ-MM-TT.csv,
+  Trennzeichen ";" - direkt in Excel öffnen). Spalte "Quelle": App oder Dienst.
+
+Dateien
+-------
+hosts.txt          Geräteliste (Name;Host;Intervall_ms;Timeout_ms)
+settings.txt       Einstellungen
+Logs\              Ausfallprotokolle
+Dienst_Status.csv  aktueller Status des Dienstes (für die Anzeige in der App)

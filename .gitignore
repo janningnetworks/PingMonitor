@@ -1,0 +1,10 @@
+# Build-Ergebnis
+*.exe
+*.pdb
+# Laufzeitdaten
+Logs/
+hosts.txt
+settings.txt
+Dienst_Status.csv
+Dienst_Status.csv.tmp
+*.zip
