@@ -18,6 +18,28 @@ Bedienung (App)
    Jedes Gerät wird in einem eigenen Thread parallel gepingt.
 3. Farben: grün = erreichbar, rot = Ausfall, gelb = gestartet, noch keine Antwort.
 
+Netzwerkscanner
+---------------
+Schaltfläche "Netzwerk scannen ..." in der App.
+- Bereich wählen: Die Subnetze der eigenen Netzwerkkarten stehen in der Auswahlliste, oder frei eingeben:
+    192.168.1.0/24              ganzes Subnetz (höchstens /16 = 65.536 Adressen)
+    192.168.1.10-192.168.1.50   Von-Bis
+    10.0.0.1-99                 Kurzform (letztes Oktett)
+    mehrere Bereiche mit Komma trennen
+- Gescannt wird parallel (64 gleichzeitig, ein /24-Netz dauert wenige Sekunden).
+- Angezeigt werden IP, DNS-Name, MAC-Adresse, Hersteller und Antwortzeit.
+  MAC-Adressen gibt es nur im eigenen Subnetz (ARP) - hinter einem Router ist die MAC nicht sichtbar.
+  "(private/zufällige MAC)": Gerät verwendet eine zufällige Adresse (z. B. Smartphones im WLAN).
+- Option "Auch Geräte ohne Ping-Antwort": findet im eigenen Subnetz per ARP auch Geräte, deren
+  Firewall Ping blockiert (orange markiert - diese lassen sich per Ping nicht überwachen).
+- Gewünschte Geräte in der Spalte "Überwachen" anhaken, Namen bei Bedarf direkt in der Tabelle
+  ändern, "Ausgewählte überwachen". Übernommen werden Intervall und Timeout aus dem Hauptfenster.
+  Bereits überwachte Geräte sind grau markiert.
+- Hersteller: Die IEEE-Herstellerliste ist eingebaut (Stand 02/2024, ca. 35.000 Einträge).
+  "Herstellerliste aktualisieren" lädt die aktuelle Liste von der IEEE (oui.csv neben der EXE).
+- Auch bei manuell hinzugefügten Geräten werden MAC und Hersteller automatisch ermittelt
+  (sofern im eigenen Subnetz).
+
 Windows-Dienst (optional)
 -------------------------
 - In der App: "Dienst installieren" (Windows fragt nach Administratorrechten).
@@ -83,7 +105,8 @@ Protokoll
 
 Dateien
 -------
-hosts.txt          Geräteliste (Name;Host;Intervall_ms;Timeout_ms)
+hosts.txt          Geräteliste (Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller)
 settings.txt       Einstellungen inkl. Benachrichtigungen
 Logs\              Ausfallprotokolle
+oui.csv            aktualisierte Herstellerliste (optional, sonst eingebaute Liste)
 Dienst_Status.csv  aktueller Status des Dienstes (für die Anzeige in der App)

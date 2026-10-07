@@ -69,6 +69,8 @@ namespace PingMonitor
         public string Host;
         public int IntervalMs;
         public int TimeoutMs;
+        public string Mac = "";
+        public string Vendor = "";
 
         public bool Running;
         public long Sent;
@@ -272,6 +274,11 @@ namespace PingMonitor
 
         public static List<string> ParseCsv(string line)
         {
+            return ParseCsv(line, ';');
+        }
+
+        public static List<string> ParseCsv(string line, char separator)
+        {
             List<string> fields = new List<string>();
             StringBuilder sb = new StringBuilder();
             bool quoted = false;
@@ -285,7 +292,7 @@ namespace PingMonitor
                     else sb.Append(c);
                 }
                 else if (c == '"') quoted = true;
-                else if (c == ';') { fields.Add(sb.ToString()); sb.Length = 0; }
+                else if (c == separator) { fields.Add(sb.ToString()); sb.Length = 0; }
                 else sb.Append(c);
             }
             fields.Add(sb.ToString());
@@ -320,6 +327,8 @@ namespace PingMonitor
                 t.Host = p[1].Trim();
                 t.IntervalMs = Math.Max(100, interval);
                 t.TimeoutMs = Math.Max(100, timeout);
+                if (p.Length > 4) t.Mac = p[4].Trim();
+                if (p.Length > 5) t.Vendor = p[5].Trim();
                 list.Add(t);
             }
             return list;
@@ -328,9 +337,10 @@ namespace PingMonitor
         public static void SaveHosts(IEnumerable<PingTarget> targets)
         {
             List<string> lines = new List<string>();
-            lines.Add("# Name;Host;Intervall_ms;Timeout_ms");
+            lines.Add("# Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller");
             foreach (PingTarget t in targets)
-                lines.Add(t.Name.Replace(";", ",") + ";" + t.Host + ";" + t.IntervalMs + ";" + t.TimeoutMs);
+                lines.Add(t.Name.Replace(";", ",") + ";" + t.Host + ";" + t.IntervalMs + ";" + t.TimeoutMs + ";" +
+                    t.Mac + ";" + t.Vendor.Replace(";", ","));
             File.WriteAllLines(HostsFile, lines.ToArray(), Encoding.UTF8);
         }
 
@@ -1369,7 +1379,7 @@ namespace PingMonitor
             svcTimer = new System.Windows.Forms.Timer();
             svcTimer.Interval = 2000;
             svcTimer.Tick += delegate { RefreshService(); };
-            Shown += delegate { RefreshService(); svcTimer.Start(); };
+            Shown += delegate { RefreshService(); svcTimer.Start(); LookupMacs(targets); };
 
             FormClosing += delegate
             {
@@ -1399,6 +1409,9 @@ namespace PingMonitor
             Button btnAdd = NewButton("Hinzufügen", delegate { AddFromInput(); });
             input.Controls.Add(btnAdd);
             AcceptButton = btnAdd;
+            Button btnScan = NewButton("Netzwerk scannen ...", delegate { ScanNetwork(); });
+            btnScan.Margin = new Padding(12, 3, 3, 3);
+            input.Controls.Add(btnScan);
 
             FlowLayoutPanel actions = NewFlow(new Padding(6, 0, 6, 6));
             actions.Controls.Add(NewButton("Start", delegate { StartTargets(Selected()); }));
@@ -1446,6 +1459,9 @@ namespace PingMonitor
             gridTargets.Columns.Add("Outages", "Ausfälle");
             gridTargets.Columns.Add("LastOutage", "Letzter Ausfall");
             gridTargets.Columns.Add("Interval", "Intervall (ms)");
+            gridTargets.Columns.Add("Mac", "MAC-Adresse");
+            gridTargets.Columns.Add("Vendor", "Hersteller");
+            gridTargets.Columns["Vendor"].FillWeight = 160;
 
             gridLog = NewGrid();
             gridLog.Columns.Add("Time", "Zeitpunkt");
@@ -1560,9 +1576,88 @@ namespace PingMonitor
             t.TimeoutMs = (int)numTimeout.Value;
             AddTarget(t);
             SaveHosts();
+            LookupMacs(new List<PingTarget> { t });
             txtName.Clear();
             txtHost.Clear();
             txtName.Focus();
+        }
+
+        void ScanNetwork()
+        {
+            HashSet<string> monitored = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (PingTarget t in targets) monitored.Add(t.Host);
+            using (ScanForm f = new ScanForm(monitored))
+            {
+                if (f.ShowDialog(this) != DialogResult.OK || f.Chosen.Count == 0) return;
+                List<PingTarget> added = new List<PingTarget>();
+                foreach (ScanResult r in f.Chosen)
+                {
+                    if (monitored.Contains(r.Ip.ToString())) continue;
+                    PingTarget t = new PingTarget();
+                    t.Name = r.HostName;      // vom Benutzer bestätigter Name
+                    t.Host = r.Ip.ToString();
+                    t.Mac = r.Mac;
+                    t.Vendor = r.Vendor;
+                    t.IntervalMs = (int)numInterval.Value;
+                    t.TimeoutMs = (int)numTimeout.Value;
+                    AddTarget(t);
+                    added.Add(t);
+                }
+                SaveHosts();
+                if (added.Count == 0) return;
+                if (MessageBox.Show(this, added.Count + " Gerät(e) hinzugefügt (Intervall " + numInterval.Value + " ms, Timeout " + numTimeout.Value +
+                        " ms).\n\n" + (svcStatus == ServiceControllerStatus.Running
+                            ? "Der Dienst überwacht sie ab sofort automatisch."
+                            : "Überwachung in der App jetzt starten?"),
+                        Text, svcStatus == ServiceControllerStatus.Running ? MessageBoxButtons.OK : MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Information) == DialogResult.Yes)
+                    StartTargets(added);
+            }
+        }
+
+        /// <summary>Ermittelt im Hintergrund MAC-Adresse und Hersteller für Geräte, bei denen sie fehlen.</summary>
+        void LookupMacs(List<PingTarget> list)
+        {
+            List<PingTarget> todo = list.FindAll(delegate (PingTarget t) { return t.Mac.Length == 0; });
+            if (todo.Count == 0) return;
+            List<NetTools.Subnet> subnets = NetTools.LocalSubnets();
+            Thread th = new Thread(delegate ()
+            {
+                bool changed = false;
+                foreach (PingTarget t in todo)
+                {
+                    try
+                    {
+                        IPAddress ip;
+                        if (!IPAddress.TryParse(t.Host, out ip))
+                        {
+                            ip = null;
+                            foreach (IPAddress a in Dns.GetHostAddresses(t.Host))
+                                if (a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork) { ip = a; break; }
+                        }
+                        if (ip == null) continue;
+                        bool local = false;
+                        foreach (NetTools.Subnet s in subnets) if (s.Contains(ip)) local = true;
+                        if (!local) continue;   // MAC ist nur im eigenen Subnetz ermittelbar
+                        string mac = NetTools.GetMac(ip);
+                        if (mac.Length == 0) continue;
+                        string vendor = MacVendors.Lookup(mac);
+                        PingTarget target = t;
+                        BeginInvoke(new Action(delegate
+                        {
+                            target.Mac = mac;
+                            target.Vendor = vendor;
+                            if (targets.Contains(target)) RefreshRow(target);
+                        }));
+                        changed = true;
+                    }
+                    catch { }
+                }
+                if (changed)
+                    try { BeginInvoke(new Action(delegate { SaveHosts(); })); } catch (InvalidOperationException) { }
+            });
+            th.IsBackground = true;
+            th.Start();
         }
 
         void AddTarget(PingTarget t)
@@ -1698,6 +1793,8 @@ namespace PingMonitor
             r.Cells["Outages"].Value = v.Outages;
             r.Cells["LastOutage"].Value = v.LastOutage.HasValue ? v.LastOutage.Value.ToString(Fmt.Time) : "";
             r.Cells["Interval"].Value = t.IntervalMs;
+            r.Cells["Mac"].Value = t.Mac;
+            r.Cells["Vendor"].Value = t.Vendor;
 
             Color back;
             if (!active) back = SystemColors.Window;
@@ -2181,6 +2278,689 @@ namespace PingMonitor
                     MessageBox.Show(this, result, Text, MessageBoxButtons.OK,
                         result.Contains("FEHLER") ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
                 }));
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+    }
+
+    // =====================================================================
+    // Netzwerkscanner
+    // =====================================================================
+
+    /// <summary>Ermittelt den Hersteller zu einer MAC-Adresse (IEEE-OUI-Liste).</summary>
+    static class MacVendors
+    {
+        public const string IeeeUrl = "https://standards-oui.ieee.org/oui/oui.csv";
+        static readonly object sync = new object();
+        static Dictionary<string, string> table;
+
+        public static string DownloadedFile { get { return Path.Combine(Config.BaseDir, "oui.csv"); } }
+
+        public static int Count
+        {
+            get { lock (sync) { Ensure(); return table.Count; } }
+        }
+
+        public static string Source
+        {
+            get { return File.Exists(DownloadedFile) ? "oui.csv vom " + File.GetLastWriteTime(DownloadedFile).ToString("dd.MM.yyyy") : "eingebaute Liste (Stand 02/2024)"; }
+        }
+
+        public static string Lookup(string mac)
+        {
+            string hex = NetTools.MacHex(mac);
+            if (hex.Length < 6) return "";
+            // Bit "lokal verwaltet": zufällige/private MAC (z. B. Smartphones mit privater WLAN-Adresse)
+            if ((Convert.ToInt32(hex.Substring(0, 2), 16) & 0x02) != 0) return "(private/zufällige MAC)";
+            lock (sync)
+            {
+                Ensure();
+                string v;
+                return table.TryGetValue(hex.Substring(0, 6), out v) ? v : "";
+            }
+        }
+
+        static void Ensure()
+        {
+            if (table != null) return;
+            table = new Dictionary<string, string>(40000);
+            try
+            {
+                if (File.Exists(DownloadedFile)) { LoadIeeeCsv(DownloadedFile, table); if (table.Count > 0) return; }
+            }
+            catch { table.Clear(); }
+            using (Stream s = typeof(MacVendors).Assembly.GetManifestResourceStream("macvendors.txt"))
+            {
+                if (s == null) return;
+                using (StreamReader r = new StreamReader(s, Encoding.UTF8))
+                {
+                    string line;
+                    while ((line = r.ReadLine()) != null)
+                    {
+                        int tab = line.IndexOf('\t');
+                        if (tab == 6 && !line.StartsWith("#")) table[line.Substring(0, 6)] = line.Substring(7);
+                    }
+                }
+            }
+        }
+
+        static void LoadIeeeCsv(string file, Dictionary<string, string> d)
+        {
+            // Format: Registry,Assignment,Organization Name,Organization Address
+            foreach (string line in File.ReadAllLines(file, Encoding.UTF8))
+            {
+                List<string> f = Fmt.ParseCsv(line, ',');
+                if (f.Count < 3 || f[1].Length != 6 || f[1] == "Assignment") continue;
+                d[f[1].ToUpperInvariant()] = f[2].Trim();
+            }
+        }
+
+        /// <summary>Lädt die aktuelle Liste von der IEEE herunter und gibt die Anzahl Einträge zurück.</summary>
+        public static int Update()
+        {
+            ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+            string tmp = DownloadedFile + ".tmp";
+            using (WebClient wc = new WebClient())
+            {
+                wc.Headers[HttpRequestHeader.UserAgent] = "Mozilla/5.0 PingMonitor";
+                wc.DownloadFile(IeeeUrl, tmp);
+            }
+            Dictionary<string, string> d = new Dictionary<string, string>(40000);
+            LoadIeeeCsv(tmp, d);
+            if (d.Count < 10000) { File.Delete(tmp); throw new Exception("Die heruntergeladene Liste ist unvollständig (" + d.Count + " Einträge)."); }
+            if (File.Exists(DownloadedFile)) File.Delete(DownloadedFile);
+            File.Move(tmp, DownloadedFile);
+            lock (sync) table = d;
+            return d.Count;
+        }
+    }
+
+    static class NetTools
+    {
+        [System.Runtime.InteropServices.DllImport("iphlpapi.dll", ExactSpelling = true)]
+        static extern int SendARP(uint destIp, uint srcIp, byte[] macAddr, ref int physicalAddrLen);
+
+        public static string MacHex(string mac)
+        {
+            if (mac == null) return "";
+            StringBuilder sb = new StringBuilder();
+            foreach (char c in mac.ToUpperInvariant())
+                if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F')) sb.Append(c);
+            return sb.ToString();
+        }
+
+        /// <summary>MAC-Adresse per ARP (funktioniert nur im eigenen Subnetz). Leer, wenn unbekannt.</summary>
+        public static string GetMac(IPAddress ip)
+        {
+            try
+            {
+                byte[] mac = new byte[6];
+                int len = mac.Length;
+                if (SendARP(BitConverter.ToUInt32(ip.GetAddressBytes(), 0), 0, mac, ref len) == 0 && len >= 6)
+                {
+                    string s = BitConverter.ToString(mac, 0, 6);
+                    return s == "00-00-00-00-00-00" ? "" : s;
+                }
+                return "";
+            }
+            catch (DllNotFoundException) { return ArpCacheLinux(ip); }
+            catch (EntryPointNotFoundException) { return ArpCacheLinux(ip); }
+        }
+
+        // Nur für Tests außerhalb von Windows (Mono unter Linux).
+        static string ArpCacheLinux(IPAddress ip)
+        {
+            try
+            {
+                foreach (string line in File.ReadAllLines("/proc/net/arp"))
+                {
+                    string[] p = line.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (p.Length >= 4 && p[0] == ip.ToString() && p[3] != "00:00:00:00:00:00")
+                        return p[3].ToUpperInvariant().Replace(':', '-');
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        /// <summary>DNS-Name zur IP (mit Zeitlimit). Leer, wenn keiner bekannt.</summary>
+        public static string GetHostName(IPAddress ip, int timeoutMs)
+        {
+            try
+            {
+                IAsyncResult ar = Dns.BeginGetHostEntry(ip, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(timeoutMs)) return "";
+                string name = Dns.EndGetHostEntry(ar).HostName;
+                return name == ip.ToString() ? "" : name;
+            }
+            catch { return ""; }
+        }
+
+        public static uint ToUInt(IPAddress ip)
+        {
+            byte[] b = ip.GetAddressBytes();
+            return ((uint)b[0] << 24) | ((uint)b[1] << 16) | ((uint)b[2] << 8) | b[3];
+        }
+
+        public static IPAddress FromUInt(uint v)
+        {
+            return new IPAddress(new byte[] { (byte)(v >> 24), (byte)(v >> 16), (byte)(v >> 8), (byte)v });
+        }
+
+        public class Subnet
+        {
+            public uint Network, Mask;
+            public int Prefix;
+            public string Interface;
+            public string Cidr { get { return FromUInt(Network) + "/" + Prefix; } }
+            public bool Contains(IPAddress ip) { return (ToUInt(ip) & Mask) == Network; }
+            public override string ToString() { return Cidr + "   (" + Interface + ")"; }
+        }
+
+        /// <summary>IPv4-Subnetze der aktiven Netzwerkkarten.</summary>
+        public static List<Subnet> LocalSubnets()
+        {
+            List<Subnet> list = new List<Subnet>();
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up || ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    foreach (UnicastIPAddressInformation ua in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (ua.Address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork || ua.IPv4Mask == null) continue;
+                        uint mask = ToUInt(ua.IPv4Mask);
+                        if (mask == 0) continue;
+                        int prefix = 0;
+                        for (uint m = mask; (m & 0x80000000) != 0; m <<= 1) prefix++;
+                        Subnet s = new Subnet();
+                        s.Mask = mask; s.Prefix = prefix; s.Network = ToUInt(ua.Address) & mask; s.Interface = ni.Name;
+                        if (ToUInt(ua.Address) >> 24 == 169 && (ToUInt(ua.Address) >> 16 & 0xFF) == 254) continue; // APIPA
+                        bool dup = false;
+                        foreach (Subnet o in list) if (o.Network == s.Network && o.Prefix == s.Prefix) dup = true;
+                        if (!dup) list.Add(s);
+                    }
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        public const int MaxAddresses = 65536;
+
+        /// <summary>
+        /// Liest einen Adressbereich: "192.168.1.0/24", "192.168.1.10-192.168.1.50",
+        /// "192.168.1.10-50" oder eine einzelne Adresse. Mehrere Bereiche mit Komma trennen.
+        /// </summary>
+        public static List<IPAddress> ParseRange(string text)
+        {
+            List<IPAddress> result = new List<IPAddress>();
+            HashSet<uint> seen = new HashSet<uint>();
+            string input = text;
+            int paren = input.IndexOf('(');
+            if (paren >= 0) input = input.Substring(0, paren);   // "(Ethernet)" aus der Auswahlliste entfernen
+
+            foreach (string rawPart in input.Split(new char[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string part = rawPart.Trim();
+                if (part.Length == 0) continue;
+                uint first, last;
+                if (part.Contains("/"))
+                {
+                    string[] p = part.Split('/');
+                    int prefix;
+                    IPAddress ip;
+                    if (!IPAddress.TryParse(p[0].Trim(), out ip) || !int.TryParse(p[1].Trim(), out prefix) || prefix < 0 || prefix > 32)
+                        throw new FormatException("Ungültiger Bereich: " + part);
+                    if (prefix < 16) throw new FormatException("Bereich zu groß: " + part + " (höchstens /16 = 65.536 Adressen)");
+                    uint mask = prefix == 0 ? 0 : 0xFFFFFFFF << (32 - prefix);
+                    first = ToUInt(ip) & mask;
+                    last = first | ~mask;
+                    if (prefix <= 30) { first++; last--; }   // Netz- und Broadcastadresse auslassen
+                }
+                else if (part.Contains("-"))
+                {
+                    string[] p = part.Split('-');
+                    IPAddress a, b;
+                    if (!IPAddress.TryParse(p[0].Trim(), out a)) throw new FormatException("Ungültige Adresse: " + p[0]);
+                    string end = p[1].Trim();
+                    if (!end.Contains("."))
+                    {
+                        string s = a.ToString();
+                        end = s.Substring(0, s.LastIndexOf('.') + 1) + end;
+                    }
+                    if (!IPAddress.TryParse(end, out b)) throw new FormatException("Ungültige Adresse: " + p[1]);
+                    first = ToUInt(a); last = ToUInt(b);
+                    if (last < first) { uint t = first; first = last; last = t; }
+                }
+                else
+                {
+                    IPAddress ip;
+                    if (!IPAddress.TryParse(part, out ip) || ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+                        throw new FormatException("Ungültige Adresse: " + part);
+                    first = last = ToUInt(ip);
+                }
+
+                for (ulong v = first; v <= last; v++)
+                {
+                    if (seen.Add((uint)v)) result.Add(FromUInt((uint)v));
+                    if (result.Count > MaxAddresses) throw new FormatException("Zu viele Adressen (höchstens 65.536).");
+                }
+            }
+            return result;
+        }
+    }
+
+    class ScanResult
+    {
+        public IPAddress Ip;
+        public string HostName = "";
+        public string Mac = "";
+        public string Vendor = "";
+        public long Rtt = -1;          // -1 = keine Ping-Antwort (nur per ARP gefunden)
+
+        /// <summary>Vorschlag für den Gerätenamen.</summary>
+        public string SuggestedName
+        {
+            get
+            {
+                if (HostName.Length > 0)
+                {
+                    int dot = HostName.IndexOf('.');
+                    return dot > 0 ? HostName.Substring(0, dot) : HostName;
+                }
+                if (Vendor.Length > 0 && !Vendor.StartsWith("("))
+                {
+                    string v = Vendor;
+                    foreach (string cut in new string[] { ",", " Co.", " Inc", " Ltd", " GmbH", " Corporation", " Technologies", " Technology" })
+                    {
+                        int i = v.IndexOf(cut, StringComparison.OrdinalIgnoreCase);
+                        if (i > 2) v = v.Substring(0, i);
+                    }
+                    return v.Trim() + " " + Ip;
+                }
+                return Ip.ToString();
+            }
+        }
+    }
+
+    /// <summary>Durchsucht einen IP-Bereich parallel nach erreichbaren Geräten.</summary>
+    class ScanForm : Form
+    {
+        readonly HashSet<string> monitored;
+        readonly List<NetTools.Subnet> subnets = NetTools.LocalSubnets();
+        public readonly List<ScanResult> Chosen = new List<ScanResult>();
+
+        ComboBox cboRange;
+        NumericUpDown numTimeout;
+        CheckBox chkArp;
+        Button btnScan, btnTake, btnVendors;
+        ProgressBar progress;
+        Label lblStatus;
+        DataGridView grid;
+        System.Windows.Forms.Timer uiTimer;
+
+        volatile bool cancel;
+        int done, total, found, running;
+        DateTime started;
+
+        public ScanForm(HashSet<string> monitoredHosts)
+        {
+            monitored = monitoredHosts;
+            Text = "Netzwerk scannen";
+            Font = new Font("Segoe UI", 9F);
+            Size = new Size(1000, 640);
+            MinimumSize = new Size(760, 420);
+            StartPosition = FormStartPosition.CenterParent;
+
+            // --- Eingabe
+            FlowLayoutPanel top = new FlowLayoutPanel();
+            top.Dock = DockStyle.Top;
+            top.AutoSize = true;
+            top.Padding = new Padding(6);
+            cboRange = new ComboBox();
+            cboRange.Width = 330;
+            foreach (NetTools.Subnet s in subnets) cboRange.Items.Add(s.ToString());
+            if (cboRange.Items.Count > 0) cboRange.SelectedIndex = 0;
+            else cboRange.Text = "192.168.1.0/24";
+            numTimeout = new NumericUpDown();
+            numTimeout.Minimum = 100; numTimeout.Maximum = 5000; numTimeout.Increment = 100; numTimeout.Value = 500; numTimeout.Width = 70;
+            chkArp = new CheckBox();
+            chkArp.Text = "Auch Geräte ohne Ping-Antwort (per ARP, nur eigenes Subnetz)";
+            chkArp.AutoSize = true;
+            chkArp.Margin = new Padding(12, 7, 3, 3);
+            btnScan = new Button();
+            btnScan.Text = "Scan starten";
+            btnScan.AutoSize = true;
+            btnScan.Click += delegate { if (running > 0) cancel = true; else StartScan(); };
+            top.Controls.Add(Lbl("Bereich:"));
+            top.Controls.Add(cboRange);
+            top.Controls.Add(Lbl("Timeout (ms):"));
+            top.Controls.Add(numTimeout);
+            top.Controls.Add(btnScan);
+            top.Controls.Add(chkArp);
+            Label hint = Lbl("Beispiele: 192.168.1.0/24  ·  192.168.1.10-192.168.1.50  ·  10.0.0.1-99  ·  mehrere Bereiche mit Komma trennen");
+            hint.ForeColor = SystemColors.GrayText;
+            top.SetFlowBreak(chkArp, true);
+            top.Controls.Add(hint);
+
+            // --- Fortschritt
+            Panel prog = new Panel();
+            prog.Dock = DockStyle.Top;
+            prog.Height = 28;
+            prog.Padding = new Padding(8, 4, 8, 4);
+            progress = new ProgressBar();
+            progress.Dock = DockStyle.Left;
+            progress.Width = 260;
+            lblStatus = new Label();
+            lblStatus.Dock = DockStyle.Fill;
+            lblStatus.TextAlign = ContentAlignment.MiddleLeft;
+            lblStatus.Padding = new Padding(8, 0, 0, 0);
+            lblStatus.Text = "Herstellerliste: " + MacVendors.Source;
+            prog.Controls.Add(lblStatus);
+            prog.Controls.Add(progress);
+
+            // --- Ergebnisse
+            grid = new DataGridView();
+            grid.Dock = DockStyle.Fill;
+            grid.AllowUserToAddRows = false;
+            grid.AllowUserToDeleteRows = false;
+            grid.RowHeadersVisible = false;
+            grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            grid.BackgroundColor = SystemColors.Window;
+            DataGridViewCheckBoxColumn chk = new DataGridViewCheckBoxColumn();
+            chk.Name = "Take"; chk.HeaderText = "Überwachen"; chk.FillWeight = 45;
+            grid.Columns.Add(chk);
+            AddCol("Ip", "IP-Adresse", 60);
+            AddCol("Name", "Name (für die Überwachung)", 100);
+            grid.Columns["Name"].ReadOnly = false;
+            AddCol("HostName", "DNS-Name", 100);
+            AddCol("Mac", "MAC-Adresse", 70);
+            AddCol("Vendor", "Hersteller", 140);
+            AddCol("Rtt", "Antwort", 40);
+            AddCol("Note", "Hinweis", 70);
+            DataGridViewTextBoxColumn sortKey = new DataGridViewTextBoxColumn();
+            sortKey.Name = "Key"; sortKey.Visible = false; sortKey.ValueType = typeof(long);
+            grid.Columns.Add(sortKey);
+            grid.CurrentCellDirtyStateChanged += delegate
+            {
+                if (grid.IsCurrentCellDirty) grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            };
+            grid.CellValueChanged += delegate { UpdateTakeButton(); };
+            grid.CellContentClick += delegate (object sender, DataGridViewCellEventArgs e)
+            {
+                if (e.RowIndex < 0 || grid.Columns[e.ColumnIndex].Name != "Take") return;
+                grid.EndEdit();
+                BeginInvoke(new Action(UpdateTakeButton));
+            };
+            grid.SortCompare += delegate (object sender, DataGridViewSortCompareEventArgs e)
+            {
+                if (e.Column.Name != "Ip") return;
+                e.SortResult = ((long)grid.Rows[e.RowIndex1].Cells["Key"].Value).CompareTo((long)grid.Rows[e.RowIndex2].Cells["Key"].Value);
+                e.Handled = true;
+            };
+
+            // --- Schaltflächen
+            FlowLayoutPanel bottom = new FlowLayoutPanel();
+            bottom.Dock = DockStyle.Bottom;
+            bottom.AutoSize = true;
+            bottom.Padding = new Padding(6);
+            bottom.Controls.Add(Btn("Alle auswählen", delegate { SetAll(true); }));
+            bottom.Controls.Add(Btn("Keine auswählen", delegate { SetAll(false); }));
+            btnVendors = Btn("Herstellerliste aktualisieren", delegate { UpdateVendors(); });
+            bottom.Controls.Add(btnVendors);
+            btnTake = Btn("Ausgewählte überwachen", delegate { TakeSelected(); });
+            btnTake.Font = new Font(Font, FontStyle.Bold);
+            bottom.Controls.Add(btnTake);
+            Button btnClose = Btn("Schließen", delegate { Close(); });
+            bottom.Controls.Add(btnClose);
+            CancelButton = btnClose;
+
+            Controls.Add(grid);
+            Controls.Add(bottom);
+            Controls.Add(prog);
+            Controls.Add(top);
+
+            uiTimer = new System.Windows.Forms.Timer();
+            uiTimer.Interval = 200;
+            uiTimer.Tick += delegate { UpdateProgress(); };
+            FormClosing += delegate { cancel = true; uiTimer.Stop(); };
+            UpdateTakeButton();
+        }
+
+        static Label Lbl(string text)
+        {
+            Label l = new Label();
+            l.Text = text;
+            l.AutoSize = true;
+            l.Margin = new Padding(6, 7, 0, 3);
+            return l;
+        }
+
+        static Button Btn(string text, EventHandler click)
+        {
+            Button b = new Button();
+            b.Text = text;
+            b.AutoSize = true;
+            b.Click += click;
+            return b;
+        }
+
+        void AddCol(string name, string header, int weight)
+        {
+            DataGridViewTextBoxColumn c = new DataGridViewTextBoxColumn();
+            c.Name = name; c.HeaderText = header; c.FillWeight = weight; c.ReadOnly = true;
+            grid.Columns.Add(c);
+        }
+
+        // ---------------------------------------------------------------- Scan
+
+        void StartScan()
+        {
+            List<IPAddress> addresses;
+            try { addresses = NetTools.ParseRange(cboRange.Text); }
+            catch (FormatException ex)
+            {
+                MessageBox.Show(this, ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (addresses.Count == 0) return;
+            if (addresses.Count > 4096 &&
+                MessageBox.Show(this, addresses.Count.ToString("N0") + " Adressen scannen? Das kann einige Minuten dauern.", Text,
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                return;
+
+            grid.Rows.Clear();
+            cancel = false;
+            done = 0; found = 0; total = addresses.Count;
+            started = DateTime.Now;
+            progress.Maximum = total;
+            progress.Value = 0;
+            btnScan.Text = "Abbrechen";
+            cboRange.Enabled = numTimeout.Enabled = chkArp.Enabled = false;
+
+            int timeout = (int)numTimeout.Value;
+            bool arp = chkArp.Checked;
+            int next = -1;
+            int threads = Math.Min(64, total);
+            running = threads;
+            for (int i = 0; i < threads; i++)
+            {
+                Thread th = new Thread(delegate ()
+                {
+                    using (Ping ping = new Ping())
+                    {
+                        int idx;
+                        while (!cancel && (idx = Interlocked.Increment(ref next)) < addresses.Count)
+                        {
+                            ScanResult r = Probe(ping, addresses[idx], timeout, arp);
+                            Interlocked.Increment(ref done);
+                            if (r != null) Report(r);
+                        }
+                    }
+                    if (Interlocked.Decrement(ref running) == 0) Finished();
+                });
+                th.IsBackground = true;
+                th.Start();
+            }
+            uiTimer.Start();
+        }
+
+        ScanResult Probe(Ping ping, IPAddress ip, int timeout, bool arp)
+        {
+            ScanResult r = new ScanResult();
+            r.Ip = ip;
+            try
+            {
+                PingReply reply = ping.Send(ip, timeout);
+                if (reply.Status == IPStatus.Success) r.Rtt = reply.RoundtripTime;
+            }
+            catch { }
+
+            bool local = false;
+            foreach (NetTools.Subnet s in subnets) if (s.Contains(ip)) local = true;
+
+            if (r.Rtt < 0)
+            {
+                if (!arp || !local || cancel) return null;
+                r.Mac = NetTools.GetMac(ip);
+                if (r.Mac.Length == 0) return null;
+            }
+            else if (local)
+            {
+                r.Mac = NetTools.GetMac(ip);
+            }
+            if (r.Mac.Length > 0) r.Vendor = MacVendors.Lookup(r.Mac);
+            if (!cancel) r.HostName = NetTools.GetHostName(ip, 1500);
+            return r;
+        }
+
+        void Report(ScanResult r)
+        {
+            Interlocked.Increment(ref found);
+            try { BeginInvoke(new Action(delegate { AddRow(r); })); }
+            catch (InvalidOperationException) { }
+        }
+
+        void AddRow(ScanResult r)
+        {
+            if (IsDisposed) return;
+            bool known = monitored.Contains(r.Ip.ToString()) ||
+                         (r.HostName.Length > 0 && monitored.Contains(r.HostName.ToLowerInvariant()));
+            string note = known ? "wird bereits überwacht" : (r.Rtt < 0 ? "antwortet nicht auf Ping" : "");
+            int idx = grid.Rows.Add(false, r.Ip.ToString(), r.SuggestedName, r.HostName, r.Mac, r.Vendor,
+                r.Rtt < 0 ? "-" : r.Rtt + " ms", note, (long)NetTools.ToUInt(r.Ip));
+            DataGridViewRow row = grid.Rows[idx];
+            row.Tag = r;
+            if (known)
+            {
+                row.DefaultCellStyle.ForeColor = SystemColors.GrayText;
+                row.Cells["Take"].ReadOnly = true;
+            }
+            else if (r.Rtt < 0)
+                row.DefaultCellStyle.ForeColor = Color.DarkOrange;
+        }
+
+        void Finished()
+        {
+            try { BeginInvoke(new Action(OnFinished)); }
+            catch (InvalidOperationException) { }
+        }
+
+        void OnFinished()
+        {
+            if (IsDisposed) return;
+            uiTimer.Stop();
+            UpdateProgress();
+            btnScan.Text = "Scan starten";
+            cboRange.Enabled = numTimeout.Enabled = chkArp.Enabled = true;
+            grid.Sort(grid.Columns["Ip"], System.ComponentModel.ListSortDirection.Ascending);
+            lblStatus.Text = (cancel ? "Abgebrochen" : "Fertig") + ": " + found + " Geräte gefunden, " + done + " von " + total +
+                " Adressen geprüft (" + (int)(DateTime.Now - started).TotalSeconds + " s). Herstellerliste: " + MacVendors.Source;
+        }
+
+        void UpdateProgress()
+        {
+            progress.Value = Math.Min(progress.Maximum, done);
+            if (running > 0)
+                lblStatus.Text = "Scanne ... " + done + " / " + total + " Adressen, " + found + " Geräte gefunden";
+        }
+
+        // ------------------------------------------------------------ Auswahl
+
+        void SetAll(bool value)
+        {
+            foreach (DataGridViewRow r in grid.Rows)
+                if (!r.Cells["Take"].ReadOnly) r.Cells["Take"].Value = value;
+            UpdateTakeButton();
+        }
+
+        int CheckedCount()
+        {
+            int n = 0;
+            foreach (DataGridViewRow r in grid.Rows)
+                if (r.Cells["Take"].Value is bool && (bool)r.Cells["Take"].Value) n++;
+            return n;
+        }
+
+        void UpdateTakeButton()
+        {
+            int n = CheckedCount();
+            btnTake.Text = n > 0 ? n + " ausgewählte überwachen" : "Ausgewählte überwachen";
+        }
+
+        void TakeSelected()
+        {
+            grid.EndEdit();
+            if (CheckedCount() == 0)
+            {
+                MessageBox.Show(this, "Bitte zuerst in der Spalte \"Überwachen\" die gewünschten Geräte anhaken.", Text,
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            foreach (DataGridViewRow row in grid.Rows)
+            {
+                if (!(row.Cells["Take"].Value is bool) || !(bool)row.Cells["Take"].Value) continue;
+                ScanResult r = (ScanResult)row.Tag;
+                string name = Convert.ToString(row.Cells["Name"].Value).Trim();
+                ScanResult copy = new ScanResult();
+                copy.Ip = r.Ip; copy.HostName = name.Length > 0 ? name : r.SuggestedName;
+                copy.Mac = r.Mac; copy.Vendor = r.Vendor; copy.Rtt = r.Rtt;
+                Chosen.Add(copy);
+            }
+            cancel = true;
+            DialogResult = DialogResult.OK;
+        }
+
+        void UpdateVendors()
+        {
+            btnVendors.Enabled = false;
+            Cursor = Cursors.WaitCursor;
+            Thread th = new Thread(delegate ()
+            {
+                string msg;
+                bool ok = false;
+                try { msg = "Herstellerliste aktualisiert: " + MacVendors.Update().ToString("N0") + " Einträge."; ok = true; }
+                catch (Exception ex) { msg = "Download fehlgeschlagen:\n" + ex.Message + "\n\nDie eingebaute Liste wird weiter verwendet."; }
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        Cursor = Cursors.Default;
+                        btnVendors.Enabled = true;
+                        if (ok)
+                            foreach (DataGridViewRow r in grid.Rows)
+                            {
+                                ScanResult sr = (ScanResult)r.Tag;
+                                if (sr.Mac.Length > 0) { sr.Vendor = MacVendors.Lookup(sr.Mac); r.Cells["Vendor"].Value = sr.Vendor; }
+                            }
+                        if (running == 0) lblStatus.Text = "Herstellerliste: " + MacVendors.Source;
+                        MessageBox.Show(this, msg, Text, MessageBoxButtons.OK, ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                    }));
+                }
+                catch (InvalidOperationException) { }
             });
             th.IsBackground = true;
             th.Start();

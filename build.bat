@@ -10,7 +10,7 @@ if not exist "%CSC%" (
   exit /b 1
 )
 "%CSC%" /nologo /target:winexe /optimize+ /codepage:65001 /out:PingMonitor.exe ^
-  /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.ServiceProcess.dll /r:System.Security.dll PingMonitor.cs
+  /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.ServiceProcess.dll /r:System.Security.dll /resource:macvendors.txt,macvendors.txt PingMonitor.cs
 if errorlevel 1 (
   echo.
   echo Fehler beim Kompilieren.
