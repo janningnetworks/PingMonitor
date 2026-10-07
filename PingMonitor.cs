@@ -78,8 +78,12 @@ namespace PingMonitor
         public string LastReply = "";
         public DateTime? OutageStart;
         public DateTime? LastOutage;
+        // Meldestatus (getrennt vom Protokoll, damit flatternde Geräte nicht ständig melden)
         public int FailStreak;          // aufeinanderfolgende Fehlschläge
-        public bool OutageNotified;     // Ausfall wurde gemeldet (Schwelle erreicht)
+        public int OkStreak;            // aufeinanderfolgende Erfolge
+        public bool NotifiedDown;       // als offline gemeldet, Online-Meldung steht noch aus
+        public DateTime NotifiedSince;  // Beginn des gemeldeten Ausfalls
+        public DateTime OkSince;        // erster erfolgreicher Ping der aktuellen Erfolgsserie
 
         public DataGridViewRow Row;        // nur in der Oberfläche
         public PingTarget ServiceView;     // Status aus dem Dienst (nur in der Oberfläche)
@@ -188,16 +192,17 @@ namespace PingMonitor
                 t.LastReply = rtt + " ms";
                 t.Status = "Erreichbar";
                 if (t.OutageStart.HasValue)
-                {
-                    DateTime since = t.OutageStart.Value;
-                    bool notified = t.OutageNotified;   // wird von Close() zurückgesetzt
-                    LogEntry e = Close(t, now, EvRecovered);
-                    result.Add(e);
-                    if (notified && cfg.OnRecovery)
-                        Notifier.Enqueue(Notification.Recovered(t, since, now, e.Info, source));
-                }
+                    result.Add(Close(t, now, EvRecovered));
+
                 t.FailStreak = 0;
-                t.OutageNotified = false;
+                if (t.OkStreak++ == 0) t.OkSince = now;
+                // "Wieder online" erst melden, wenn das Gerät stabil antwortet.
+                if (t.NotifiedDown && t.OkStreak >= cfg.RecoveryThreshold)
+                {
+                    t.NotifiedDown = false;
+                    if (cfg.OnRecovery)
+                        Notifier.Enqueue(Notification.Recovered(t, t.NotifiedSince, t.OkSince, source));
+                }
             }
             else
             {
@@ -216,12 +221,15 @@ namespace PingMonitor
                     result.Add(Entry(now, t, EvFailed, info));
                 }
 
+                t.OkStreak = 0;
                 t.FailStreak++;
-                if (!t.OutageNotified && t.FailStreak >= cfg.Threshold)
+                // Nur einmal melden: solange die Online-Meldung aussteht, gilt das Gerät weiter als offline.
+                if (!t.NotifiedDown && t.FailStreak >= cfg.Threshold)
                 {
-                    t.OutageNotified = true;
+                    t.NotifiedDown = true;
+                    t.NotifiedSince = t.OutageStart.Value;
                     if (cfg.OnOutage)
-                        Notifier.Enqueue(Notification.Outage(t, t.OutageStart.Value, info, source));
+                        Notifier.Enqueue(Notification.Outage(t, t.NotifiedSince, info, source));
                 }
             }
             return result;
@@ -230,13 +238,16 @@ namespace PingMonitor
         /// <summary>Beendet einen laufenden Ausfall und liefert den Eintrag mit der Dauer.</summary>
         public static LogEntry Close(PingTarget t, DateTime now, string evt)
         {
-            TimeSpan d = now - t.OutageStart.Value;
-            string info = string.Format("Ausfalldauer {0:00}:{1:00}:{2:00} (seit {3})",
-                (int)d.TotalHours, d.Minutes, d.Seconds, t.OutageStart.Value.ToString(Fmt.Time));
+            string info = "Ausfalldauer " + Duration(t.OutageStart.Value, now) +
+                " (seit " + t.OutageStart.Value.ToString(Fmt.Time) + ")";
             t.OutageStart = null;
-            t.FailStreak = 0;
-            t.OutageNotified = false;
             return Entry(now, t, evt, info);
+        }
+
+        public static string Duration(DateTime from, DateTime to)
+        {
+            TimeSpan d = to - from;
+            return string.Format("{0:00}:{1:00}:{2:00}", (int)d.TotalHours, d.Minutes, d.Seconds);
         }
 
         static LogEntry Entry(DateTime time, PingTarget t, string evt, string info)
@@ -442,7 +453,11 @@ namespace PingMonitor
     {
         public bool OnOutage = true;
         public bool OnRecovery = true;
-        public int Threshold = 1;            // Meldung nach so vielen Fehlschlägen in Folge
+        public int Threshold = 1;            // Offline-Meldung nach so vielen Fehlschlägen in Folge
+        public int RecoveryThreshold = 3;    // Online-Meldung nach so vielen Erfolgen in Folge
+        public int BundleSeconds = 15;       // Ereignisse so lange sammeln und gemeinsam senden
+        public int MaxMessages = 10;         // höchstens so viele Nachrichten ...
+        public int WindowMinutes = 60;       // ... pro Zeitraum (0 Nachrichten = unbegrenzt)
 
         public bool WebhookEnabled;
         public string WebhookUrl = "";
@@ -492,6 +507,10 @@ namespace PingMonitor
             c.OnRecovery = Config.Get(d, "Benachrichtigen.WiederErreichbar", "1") != "0";
             int.TryParse(Config.Get(d, "Benachrichtigen.NachFehlschlaegen", "1"), out c.Threshold);
             if (c.Threshold < 1) c.Threshold = 1;
+            c.RecoveryThreshold = Int(d, "Benachrichtigen.OnlineNachErfolgen", 3, 1);
+            c.BundleSeconds = Int(d, "Benachrichtigen.SammelzeitSekunden", 15, 0);
+            c.MaxMessages = Int(d, "Benachrichtigen.MaxNachrichten", 10, 0);
+            c.WindowMinutes = Int(d, "Benachrichtigen.ZeitraumMinuten", 60, 1);
             c.WebhookEnabled = Config.Get(d, "Webhook.Aktiv", "0") == "1";
             c.WebhookUrl = Config.Get(d, "Webhook.Url", "");
             c.MailEnabled = Config.Get(d, "Mail.Aktiv", "0") == "1";
@@ -505,12 +524,23 @@ namespace PingMonitor
             return c;
         }
 
+        static int Int(Dictionary<string, string> d, string key, int def, int min)
+        {
+            int v;
+            if (!int.TryParse(Config.Get(d, key, def.ToString()), out v)) v = def;
+            return Math.Max(min, v);
+        }
+
         public void Save()
         {
             Dictionary<string, string> d = new Dictionary<string, string>();
             d["Benachrichtigen.Ausfall"] = OnOutage ? "1" : "0";
             d["Benachrichtigen.WiederErreichbar"] = OnRecovery ? "1" : "0";
             d["Benachrichtigen.NachFehlschlaegen"] = Threshold.ToString();
+            d["Benachrichtigen.OnlineNachErfolgen"] = RecoveryThreshold.ToString();
+            d["Benachrichtigen.SammelzeitSekunden"] = BundleSeconds.ToString();
+            d["Benachrichtigen.MaxNachrichten"] = MaxMessages.ToString();
+            d["Benachrichtigen.ZeitraumMinuten"] = WindowMinutes.ToString();
             d["Webhook.Aktiv"] = WebhookEnabled ? "1" : "0";
             d["Webhook.Url"] = WebhookUrl.Trim();
             d["Mail.Aktiv"] = MailEnabled ? "1" : "0";
@@ -564,6 +594,7 @@ namespace PingMonitor
         public string Name, Host, Details, Source;
         public DateTime Time;
         public DateTime? Since;
+        public DateTime Queued;
 
         public static Notification Outage(PingTarget t, DateTime since, string details, string source)
         {
@@ -572,10 +603,11 @@ namespace PingMonitor
             return n;
         }
 
-        public static Notification Recovered(PingTarget t, DateTime since, DateTime now, string details, string source)
+        public static Notification Recovered(PingTarget t, DateTime since, DateTime back, string source)
         {
-            Notification n = Create("recovered", "Wieder erreichbar", t, details, source);
-            n.Time = now;
+            Notification n = Create("recovered", "Wieder erreichbar", t,
+                "Ausfalldauer " + Outages.Duration(since, back) + " (seit " + since.ToString(Fmt.Time) + ")", source);
+            n.Time = back;
             n.Since = since;
             return n;
         }
@@ -600,20 +632,92 @@ namespace PingMonitor
             return n;
         }
 
+        public string Line
+        {
+            get { return Title + ": " + Name + " (" + Host + ") - " + Time.ToString(Fmt.Time) + " - " + Details; }
+        }
+
+        public string JsonFields
+        {
+            get
+            {
+                return "\"event\":" + Json.Str(Event) + "," +
+                    "\"title\":" + Json.Str(Title) + "," +
+                    "\"name\":" + Json.Str(Name) + "," +
+                    "\"host\":" + Json.Str(Host) + "," +
+                    "\"time\":" + Json.Str(Time.ToString("yyyy-MM-ddTHH:mm:sszzz")) + "," +
+                    "\"since\":" + (Since.HasValue ? Json.Str(Since.Value.ToString("yyyy-MM-ddTHH:mm:sszzz")) : "null") + "," +
+                    "\"details\":" + Json.Str(Details);
+            }
+        }
+    }
+
+    /// <summary>Eine zu versendende Nachricht: ein einzelnes Ereignis oder eine Sammelmeldung.</summary>
+    class NotifyMessage
+    {
+        public List<Notification> Events;
+        public string Note;        // z. B. Hinweis auf die Begrenzung
+
+        public NotifyMessage(List<Notification> events, string note)
+        {
+            Events = events;
+            Note = note;
+        }
+
+        bool Single { get { return Events.Count == 1; } }
+        string Source { get { return Events[0].Source; } }
+
+        int Count(string evt)
+        {
+            int n = 0;
+            foreach (Notification e in Events) if (e.Event == evt) n++;
+            return n;
+        }
+
+        public string Title
+        {
+            get
+            {
+                if (Single) return Events[0].Title;
+                List<string> parts = new List<string>();
+                int down = Count("outage"), up = Count("recovered");
+                if (down > 0) parts.Add(down + (down == 1 ? " Gerät AUSGEFALLEN" : " Geräte AUSGEFALLEN"));
+                if (up > 0) parts.Add(up + " wieder erreichbar");
+                return parts.Count > 0 ? string.Join(", ", parts.ToArray()) : Events.Count + " Meldungen";
+            }
+        }
+
         public string Subject
         {
-            get { return "[PingMonitor] " + Title + ": " + Name + " (" + Host + ")"; }
+            get
+            {
+                if (Single) return "[PingMonitor] " + Events[0].Title + ": " + Events[0].Name + " (" + Events[0].Host + ")";
+                return "[PingMonitor] " + Title;
+            }
         }
+
+        public string LogName { get { return Single ? Events[0].Name : "Sammelmeldung"; } }
+        public string LogHost { get { return Single ? Events[0].Host : Events.Count + " Ereignisse"; } }
 
         public string Text
         {
             get
             {
                 StringBuilder sb = new StringBuilder();
-                sb.AppendLine(Title + ": " + Name + " (" + Host + ")");
-                sb.AppendLine("Zeitpunkt: " + Time.ToString(Fmt.Time));
-                if (Since.HasValue) sb.AppendLine("Ausfall seit: " + Since.Value.ToString(Fmt.Time));
-                sb.AppendLine("Details: " + Details);
+                if (Single)
+                {
+                    Notification n = Events[0];
+                    sb.AppendLine(n.Title + ": " + n.Name + " (" + n.Host + ")");
+                    sb.AppendLine("Zeitpunkt: " + n.Time.ToString(Fmt.Time));
+                    if (n.Since.HasValue) sb.AppendLine("Ausfall seit: " + n.Since.Value.ToString(Fmt.Time));
+                    sb.AppendLine("Details: " + n.Details);
+                }
+                else
+                {
+                    sb.AppendLine(Title + ":");
+                    foreach (Notification n in Events) sb.AppendLine("- " + n.Line);
+                }
+                if (!string.IsNullOrEmpty(Note)) sb.AppendLine(Note);
                 sb.AppendLine("Überwacht von: " + Environment.MachineName + " (" + Source + ")");
                 return sb.ToString();
             }
@@ -622,28 +726,36 @@ namespace PingMonitor
         /// <summary>
         /// JSON für den Webhook. "text" und "content" enthalten die fertige Nachricht,
         /// damit Slack, Microsoft Teams, Discord, Mattermost & Co. sie direkt anzeigen.
+        /// Einzelereignis: Felder des Ereignisses. Sammelmeldung: event = "summary" + Liste "events".
         /// </summary>
         public string Json
         {
             get
             {
+                StringBuilder sb = new StringBuilder("{");
+                if (Single)
+                    sb.Append(Events[0].JsonFields);
+                else
+                {
+                    sb.Append("\"event\":\"summary\",\"title\":" + PingMonitor.Json.Str(Title) + ",\"count\":" + Events.Count + ",\"events\":[");
+                    for (int i = 0; i < Events.Count; i++)
+                        sb.Append(i > 0 ? ",{" : "{").Append(Events[i].JsonFields).Append("}");
+                    sb.Append("]");
+                }
                 string text = Text.TrimEnd();
-                return "{" +
-                    "\"event\":" + J(Event) + "," +
-                    "\"title\":" + J(Title) + "," +
-                    "\"name\":" + J(Name) + "," +
-                    "\"host\":" + J(Host) + "," +
-                    "\"time\":" + J(Time.ToString("yyyy-MM-ddTHH:mm:sszzz")) + "," +
-                    "\"since\":" + (Since.HasValue ? J(Since.Value.ToString("yyyy-MM-ddTHH:mm:sszzz")) : "null") + "," +
-                    "\"details\":" + J(Details) + "," +
-                    "\"computer\":" + J(Environment.MachineName) + "," +
-                    "\"source\":" + J(Source) + "," +
-                    "\"text\":" + J(text) + "," +
-                    "\"content\":" + J(text) + "}";
+                sb.Append(",\"note\":" + (string.IsNullOrEmpty(Note) ? "null" : PingMonitor.Json.Str(Note)));
+                sb.Append(",\"computer\":" + PingMonitor.Json.Str(Environment.MachineName));
+                sb.Append(",\"source\":" + PingMonitor.Json.Str(Source));
+                sb.Append(",\"text\":" + PingMonitor.Json.Str(text));
+                sb.Append(",\"content\":" + PingMonitor.Json.Str(text));
+                return sb.Append("}").ToString();
             }
         }
+    }
 
-        static string J(string s)
+    static class Json
+    {
+        public static string Str(string s)
         {
             if (s == null) return "null";
             StringBuilder sb = new StringBuilder("\"");
@@ -666,19 +778,29 @@ namespace PingMonitor
         }
     }
 
-    /// <summary>Versendet Benachrichtigungen im Hintergrund, damit die Pings nicht blockiert werden.</summary>
+    /// <summary>
+    /// Versendet Benachrichtigungen im Hintergrund, damit die Pings nicht blockiert werden.
+    /// Ereignisse innerhalb der Sammelzeit werden zu einer Nachricht zusammengefasst; ist die
+    /// Höchstzahl an Nachrichten pro Zeitraum erreicht, wird weiter gesammelt und nach Ablauf
+    /// der Sperre eine Zusammenfassung verschickt. Es geht kein Ereignis verloren.
+    /// </summary>
     static class Notifier
     {
-        static readonly BlockingCollection<Notification> queue = new BlockingCollection<Notification>();
-        static readonly object startLock = new object();
+        static readonly object sync = new object();
+        static readonly List<Notification> pending = new List<Notification>();
+        static readonly List<DateTime> sent = new List<DateTime>();   // Versandzeitpunkte (UTC) für die Begrenzung
+        static readonly AutoResetEvent signal = new AutoResetEvent(false);
         static Thread worker;
         static int busy;
+        static volatile bool flushing;
 
         public static void Enqueue(Notification n)
         {
             if (!NotifyConfig.Current.AnyChannel) return;
-            lock (startLock)
+            n.Queued = DateTime.UtcNow;
+            lock (sync)
             {
+                pending.Add(n);
                 if (worker == null)
                 {
                     worker = new Thread(Work);
@@ -687,38 +809,99 @@ namespace PingMonitor
                     worker.Start();
                 }
             }
-            queue.Add(n);
+            signal.Set();
         }
 
-        /// <summary>Wartet, bis alle anstehenden Nachrichten verschickt sind (z. B. beim Beenden).</summary>
+        /// <summary>Verschickt alles Anstehende sofort (ohne Sammelzeit/Begrenzung), z. B. beim Beenden.</summary>
         public static void Flush(TimeSpan timeout)
         {
+            flushing = true;
+            signal.Set();
             DateTime end = DateTime.UtcNow + timeout;
-            while ((queue.Count > 0 || busy > 0) && DateTime.UtcNow < end) Thread.Sleep(100);
+            while (DateTime.UtcNow < end)
+            {
+                lock (sync) if (pending.Count == 0 && busy == 0) return;
+                Thread.Sleep(100);
+            }
         }
 
         static void Work()
         {
-            foreach (Notification n in queue.GetConsumingEnumerable())
+            while (true)
             {
-                Interlocked.Increment(ref busy);
-                try { Deliver(n, NotifyConfig.Current, true); }
-                finally { Interlocked.Decrement(ref busy); }
+                List<Notification> batch = null;
+                string note = null;
+                NotifyConfig cfg = NotifyConfig.Current;
+                TimeSpan wait = TimeSpan.FromSeconds(5);
+
+                lock (sync)
+                {
+                    if (pending.Count > 0)
+                    {
+                        DateTime now = DateTime.UtcNow;
+                        DateTime due = pending[0].Queued.AddSeconds(cfg.BundleSeconds);
+                        bool limited = false;
+                        if (cfg.MaxMessages > 0)
+                        {
+                            TimeSpan window = TimeSpan.FromMinutes(cfg.WindowMinutes);
+                            sent.RemoveAll(delegate (DateTime d) { return now - d >= window; });
+                            if (sent.Count >= cfg.MaxMessages)
+                            {
+                                DateTime free = sent[0] + window;
+                                if (free > due) { due = free; limited = true; }
+                            }
+                        }
+
+                        if (flushing || now >= due)
+                        {
+                            batch = new List<Notification>(pending);
+                            pending.Clear();
+                            busy++;
+                            if (limited)
+                                note = "Hinweis: Wegen der Begrenzung (max. " + cfg.MaxMessages + " Nachrichten pro " +
+                                       cfg.WindowMinutes + " Min.) zusammengefasst.";
+                        }
+                        else
+                        {
+                            wait = due - now;
+                            if (wait > TimeSpan.FromSeconds(5)) wait = TimeSpan.FromSeconds(5); // Einstellungen regelmäßig neu prüfen
+                            if (wait < TimeSpan.FromMilliseconds(50)) wait = TimeSpan.FromMilliseconds(50);
+                        }
+                    }
+                    else wait = TimeSpan.FromMinutes(1);
+                }
+
+                if (batch == null)
+                {
+                    signal.WaitOne(wait);
+                    continue;
+                }
+
+                try
+                {
+                    Deliver(new NotifyMessage(batch, note), cfg, true);
+                    lock (sync) sent.Add(DateTime.UtcNow);
+                }
+                catch { }
+                finally
+                {
+                    lock (sync) busy--;
+                }
             }
         }
 
         /// <summary>Sendet über alle aktiven Kanäle (mit Wiederholung) und protokolliert das Ergebnis.</summary>
-        public static List<string> Deliver(Notification n, NotifyConfig cfg, bool log)
+        public static List<string> Deliver(NotifyMessage m, NotifyConfig cfg, bool log)
         {
             List<string> results = new List<string>();
             if (cfg.WebhookEnabled)
-                results.Add(Try("Webhook", n, log, delegate { SendWebhook(n, cfg); }));
+                results.Add(Try("Webhook", m, log, delegate { SendWebhook(m, cfg); }));
             if (cfg.MailEnabled)
-                results.Add(Try("E-Mail", n, log, delegate { SendMail(n, cfg); }));
+                results.Add(Try("E-Mail", m, log, delegate { SendMail(m, cfg); }));
             return results;
         }
 
-        static string Try(string channel, Notification n, bool log, Action send)
+        static string Try(string channel, NotifyMessage m, bool log, Action send)
         {
             Exception last = null;
             for (int attempt = 1; attempt <= 3; attempt++)
@@ -726,17 +909,17 @@ namespace PingMonitor
                 try
                 {
                     send();
-                    if (log) Log(n, channel + " gesendet", n.Title);
+                    if (log) Log(m, channel + " gesendet", m.Title);
                     return channel + ": gesendet";
                 }
                 catch (Exception ex)
                 {
                     last = ex;
-                    if (attempt < 3) Thread.Sleep(5000 * attempt);
+                    if (attempt < 3 && !flushing) Thread.Sleep(5000 * attempt);
                 }
             }
             string msg = Describe(last);
-            if (log) Log(n, channel + " fehlgeschlagen", n.Title + " - " + msg);
+            if (log) Log(m, channel + " fehlgeschlagen", m.Title + " - " + msg);
             return channel + ": FEHLER - " + msg;
         }
 
@@ -748,15 +931,15 @@ namespace PingMonitor
             return msg;
         }
 
-        static void Log(Notification n, string evt, string info)
+        static void Log(NotifyMessage m, string evt, string info)
         {
             LogEntry e = new LogEntry();
-            e.Time = DateTime.Now; e.Name = n.Name; e.Host = n.Host; e.Event = evt; e.Info = info;
-            e.Source = "Benachrichtigung (" + n.Source + ")";
+            e.Time = DateTime.Now; e.Name = m.LogName; e.Host = m.LogHost; e.Event = evt; e.Info = info;
+            e.Source = "Benachrichtigung (" + m.Events[0].Source + ")";
             try { CsvLog.Write(e); } catch { }
         }
 
-        static void SendWebhook(Notification n, NotifyConfig cfg)
+        static void SendWebhook(NotifyMessage m, NotifyConfig cfg)
         {
             // .NET Framework verwendet je nach Version standardmäßig kein TLS 1.2.
             ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
@@ -765,7 +948,7 @@ namespace PingMonitor
             req.ContentType = "application/json; charset=utf-8";
             req.UserAgent = "PingMonitor";
             req.Timeout = 15000;
-            byte[] body = new UTF8Encoding(false).GetBytes(n.Json);
+            byte[] body = new UTF8Encoding(false).GetBytes(m.Json);
             req.ContentLength = body.Length;
             using (Stream s = req.GetRequestStream()) s.Write(body, 0, body.Length);
             using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
@@ -774,26 +957,26 @@ namespace PingMonitor
             }
         }
 
-        static void SendMail(Notification n, NotifyConfig cfg)
+        static void SendMail(NotifyMessage m, NotifyConfig cfg)
         {
             ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
-            using (MailMessage m = new MailMessage())
+            using (MailMessage mail = new MailMessage())
             {
-                m.From = new MailAddress(cfg.MailFrom.Trim());
+                mail.From = new MailAddress(cfg.MailFrom.Trim());
                 foreach (string to in cfg.MailTo.Split(new char[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
-                    if (to.Trim().Length > 0) m.To.Add(to.Trim());
-                if (m.To.Count == 0) throw new Exception("Kein Empfänger angegeben.");
-                m.Subject = n.Subject;
-                m.Body = n.Text;
-                m.SubjectEncoding = Encoding.UTF8;
-                m.BodyEncoding = Encoding.UTF8;
+                    if (to.Trim().Length > 0) mail.To.Add(to.Trim());
+                if (mail.To.Count == 0) throw new Exception("Kein Empfänger angegeben.");
+                mail.Subject = m.Subject;
+                mail.Body = m.Text;
+                mail.SubjectEncoding = Encoding.UTF8;
+                mail.BodyEncoding = Encoding.UTF8;
                 using (SmtpClient c = new SmtpClient(cfg.SmtpHost.Trim(), cfg.SmtpPort))
                 {
                     c.EnableSsl = cfg.SmtpSsl;
                     c.Timeout = 20000;
                     if (cfg.SmtpUser.Trim().Length > 0)
                         c.Credentials = new NetworkCredential(cfg.SmtpUser.Trim(), cfg.SmtpPassword);
-                    c.Send(m);
+                    c.Send(mail);
                 }
             }
         }
@@ -1706,7 +1889,7 @@ namespace PingMonitor
     class NotifyForm : Form
     {
         CheckBox chkOutage, chkRecovery, chkWebhook, chkMail, chkSsl;
-        NumericUpDown numThreshold, numPort;
+        NumericUpDown numThreshold, numRecovery, numBundle, numMax, numWindow, numPort;
         TextBox txtUrl, txtHost, txtUser, txtPassword, txtFrom, txtTo;
         Button btnTest;
 
@@ -1732,8 +1915,21 @@ namespace PingMonitor
             chkOutage = Check(tl, "Bei Ausfall");
             numThreshold = new NumericUpDown();
             numThreshold.Minimum = 1; numThreshold.Maximum = 1000; numThreshold.Width = 70;
-            Row(tl, "Ausfall melden nach", Inline(numThreshold, Hint("fehlgeschlagenen Pings in Folge (1 = sofort)")));
+            Row(tl, "Offline melden nach", Inline(numThreshold, Hint("fehlgeschlagenen Pings in Folge (1 = sofort)")));
             chkRecovery = Check(tl, "Wenn das Gerät wieder erreichbar ist (mit Ausfalldauer)");
+            numRecovery = Number(1, 1000);
+            Row(tl, "Online melden nach", Inline(numRecovery, Hint("erfolgreichen Pings in Folge - verhindert Meldungsflut bei \"flatternden\" Geräten")));
+            Row(tl, "", Hint("Pro Gerät gibt es genau 1 Offline- und 1 Online-Meldung, egal wie viele Pings dazwischen fehlschlagen."));
+
+            // Begrenzung
+            Header(tl, "Sammeln und begrenzen");
+            numBundle = Number(0, 3600);
+            Row(tl, "Sammelzeit", Inline(numBundle, Hint("Sekunden - Ereignisse in diesem Zeitraum (auch mehrerer Geräte) als EINE Nachricht senden (0 = sofort)")));
+            numMax = Number(0, 1000);
+            numWindow = Number(1, 1440);
+            Row(tl, "Höchstens", Inline(numMax, NewLabel("Nachrichten pro"), numWindow, Hint("Minuten (0 = unbegrenzt)")));
+            Row(tl, "", Hint("Ist die Grenze erreicht, geht nichts verloren: Weitere Ereignisse werden gesammelt und nach\n" +
+                             "Ablauf des Zeitraums als eine Zusammenfassung verschickt."));
 
             // Webhook
             Header(tl, "Webhook");
@@ -1781,6 +1977,8 @@ namespace PingMonitor
             chkWebhook.CheckedChanged += delegate { UpdateEnabled(); };
             chkMail.CheckedChanged += delegate { UpdateEnabled(); };
             chkOutage.CheckedChanged += delegate { UpdateEnabled(); };
+            chkRecovery.CheckedChanged += delegate { UpdateEnabled(); };
+            numMax.ValueChanged += delegate { UpdateEnabled(); };
 
             Fill(NotifyConfig.Load());
         }
@@ -1837,6 +2035,15 @@ namespace PingMonitor
             return t;
         }
 
+        static NumericUpDown Number(int min, int max)
+        {
+            NumericUpDown n = new NumericUpDown();
+            n.Minimum = min;
+            n.Maximum = max;
+            n.Width = 70;
+            return n;
+        }
+
         static FlowLayoutPanel Inline(params Control[] controls)
         {
             FlowLayoutPanel p = new FlowLayoutPanel();
@@ -1854,6 +2061,10 @@ namespace PingMonitor
             chkOutage.Checked = c.OnOutage;
             chkRecovery.Checked = c.OnRecovery;
             numThreshold.Value = Math.Min(1000, Math.Max(1, c.Threshold));
+            numRecovery.Value = Math.Min(1000, Math.Max(1, c.RecoveryThreshold));
+            numBundle.Value = Math.Min(3600, Math.Max(0, c.BundleSeconds));
+            numMax.Value = Math.Min(1000, Math.Max(0, c.MaxMessages));
+            numWindow.Value = Math.Min(1440, Math.Max(1, c.WindowMinutes));
             chkWebhook.Checked = c.WebhookEnabled;
             txtUrl.Text = c.WebhookUrl;
             chkMail.Checked = c.MailEnabled;
@@ -1873,6 +2084,10 @@ namespace PingMonitor
             c.OnOutage = chkOutage.Checked;
             c.OnRecovery = chkRecovery.Checked;
             c.Threshold = (int)numThreshold.Value;
+            c.RecoveryThreshold = (int)numRecovery.Value;
+            c.BundleSeconds = (int)numBundle.Value;
+            c.MaxMessages = (int)numMax.Value;
+            c.WindowMinutes = (int)numWindow.Value;
             c.WebhookEnabled = chkWebhook.Checked;
             c.WebhookUrl = txtUrl.Text.Trim();
             c.MailEnabled = chkMail.Checked;
@@ -1889,6 +2104,8 @@ namespace PingMonitor
         void UpdateEnabled()
         {
             numThreshold.Enabled = chkOutage.Checked;
+            numRecovery.Enabled = chkRecovery.Checked;
+            numWindow.Enabled = numMax.Value > 0;
             txtUrl.Enabled = chkWebhook.Checked;
             foreach (Control c in new Control[] { txtHost, numPort, chkSsl, txtUser, txtPassword, txtFrom, txtTo })
                 c.Enabled = chkMail.Checked;
@@ -1954,7 +2171,7 @@ namespace PingMonitor
             Thread th = new Thread(delegate ()
             {
                 string result;
-                try { result = string.Join("\n", Notifier.Deliver(Notification.Test("App"), c, false).ToArray()); }
+                try { result = string.Join("\n", Notifier.Deliver(new NotifyMessage(new List<Notification> { Notification.Test("App") }, null), c, false).ToArray()); }
                 catch (Exception ex) { result = ex.Message; }
                 BeginInvoke(new Action(delegate
                 {
