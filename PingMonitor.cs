@@ -11,12 +11,16 @@
 //   PingMonitor.exe /service     wird vom Dienststeuerungs-Manager verwendet
 //   Zusatz /quiet unterdrückt Meldungsfenster.
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Net;
+using System.Net.Mail;
 using System.Net.NetworkInformation;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.ServiceProcess;
 using System.Text;
@@ -74,6 +78,8 @@ namespace PingMonitor
         public string LastReply = "";
         public DateTime? OutageStart;
         public DateTime? LastOutage;
+        public int FailStreak;          // aufeinanderfolgende Fehlschläge
+        public bool OutageNotified;     // Ausfall wurde gemeldet (Schwelle erreicht)
 
         public DataGridViewRow Row;        // nur in der Oberfläche
         public PingTarget ServiceView;     // Status aus dem Dienst (nur in der Oberfläche)
@@ -171,17 +177,27 @@ namespace PingMonitor
         public const string EvFailed = "Ping fehlgeschlagen";
         public const string EvRecovered = "Wieder erreichbar";
 
-        public static List<LogEntry> Process(PingTarget t, bool ok, long rtt, string info, bool logEachFailure)
+        public static List<LogEntry> Process(PingTarget t, bool ok, long rtt, string info, bool logEachFailure, string source)
         {
             List<LogEntry> result = new List<LogEntry>();
             DateTime now = DateTime.Now;
+            NotifyConfig cfg = NotifyConfig.Current;
             t.Sent++;
             if (ok)
             {
                 t.LastReply = rtt + " ms";
                 t.Status = "Erreichbar";
                 if (t.OutageStart.HasValue)
-                    result.Add(Close(t, now, EvRecovered));
+                {
+                    DateTime since = t.OutageStart.Value;
+                    bool notified = t.OutageNotified;   // wird von Close() zurückgesetzt
+                    LogEntry e = Close(t, now, EvRecovered);
+                    result.Add(e);
+                    if (notified && cfg.OnRecovery)
+                        Notifier.Enqueue(Notification.Recovered(t, since, now, e.Info, source));
+                }
+                t.FailStreak = 0;
+                t.OutageNotified = false;
             }
             else
             {
@@ -199,6 +215,14 @@ namespace PingMonitor
                 {
                     result.Add(Entry(now, t, EvFailed, info));
                 }
+
+                t.FailStreak++;
+                if (!t.OutageNotified && t.FailStreak >= cfg.Threshold)
+                {
+                    t.OutageNotified = true;
+                    if (cfg.OnOutage)
+                        Notifier.Enqueue(Notification.Outage(t, t.OutageStart.Value, info, source));
+                }
             }
             return result;
         }
@@ -210,6 +234,8 @@ namespace PingMonitor
             string info = string.Format("Ausfalldauer {0:00}:{1:00}:{2:00} (seit {3})",
                 (int)d.TotalHours, d.Minutes, d.Seconds, t.OutageStart.Value.ToString(Fmt.Time));
             t.OutageStart = null;
+            t.FailStreak = 0;
+            t.OutageNotified = false;
             return Entry(now, t, evt, info);
         }
 
@@ -297,22 +323,51 @@ namespace PingMonitor
             File.WriteAllLines(HostsFile, lines.ToArray(), Encoding.UTF8);
         }
 
-        public static bool LoadLogEachFailure()
+        /// <summary>settings.txt als Schlüssel=Wert-Liste.</summary>
+        public static Dictionary<string, string> LoadSettings()
         {
+            Dictionary<string, string> d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             try
             {
                 if (File.Exists(SettingsFile))
-                    foreach (string line in ReadAllLinesShared(SettingsFile))
-                        if (line.Trim().StartsWith("JedenFehlschlagProtokollieren="))
-                            return !line.Trim().EndsWith("=0");
+                    foreach (string raw in ReadAllLinesShared(SettingsFile))
+                    {
+                        string line = raw.Trim();
+                        int eq = line.IndexOf('=');
+                        if (line.StartsWith("#") || eq <= 0) continue;
+                        d[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+                    }
             }
             catch { }
-            return true;
+            return d;
+        }
+
+        /// <summary>Übernimmt die angegebenen Werte in settings.txt (andere Werte bleiben erhalten).</summary>
+        public static void SaveSettings(Dictionary<string, string> values)
+        {
+            Dictionary<string, string> d = LoadSettings();
+            foreach (KeyValuePair<string, string> kv in values) d[kv.Key] = kv.Value;
+            List<string> lines = new List<string>();
+            foreach (KeyValuePair<string, string> kv in d) lines.Add(kv.Key + "=" + kv.Value);
+            File.WriteAllLines(SettingsFile, lines.ToArray(), Encoding.UTF8);
+        }
+
+        public static string Get(Dictionary<string, string> d, string key, string def)
+        {
+            string v;
+            return d.TryGetValue(key, out v) ? v : def;
+        }
+
+        public static bool LoadLogEachFailure()
+        {
+            return Get(LoadSettings(), "JedenFehlschlagProtokollieren", "1") != "0";
         }
 
         public static void SaveLogEachFailure(bool value)
         {
-            File.WriteAllText(SettingsFile, "JedenFehlschlagProtokollieren=" + (value ? "1" : "0") + "\r\n", Encoding.UTF8);
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            d["JedenFehlschlagProtokollieren"] = value ? "1" : "0";
+            SaveSettings(d);
         }
 
         public static DateTime Stamp(string file)
@@ -380,6 +435,371 @@ namespace PingMonitor
     }
 
     // =====================================================================
+    // Benachrichtigungen (Webhook / E-Mail)
+    // =====================================================================
+
+    class NotifyConfig
+    {
+        public bool OnOutage = true;
+        public bool OnRecovery = true;
+        public int Threshold = 1;            // Meldung nach so vielen Fehlschlägen in Folge
+
+        public bool WebhookEnabled;
+        public string WebhookUrl = "";
+
+        public bool MailEnabled;
+        public string SmtpHost = "";
+        public int SmtpPort = 587;
+        public bool SmtpSsl = true;
+        public string SmtpUser = "";
+        public string SmtpPassword = "";
+        public string MailFrom = "";
+        public string MailTo = "";
+
+        public bool AnyChannel { get { return WebhookEnabled || MailEnabled; } }
+
+        static readonly object sync = new object();
+        static NotifyConfig cached;
+        static DateTime cachedStamp, lastCheck;
+
+        /// <summary>Aktuelle Einstellungen; settings.txt wird bei Änderung automatisch neu gelesen.</summary>
+        public static NotifyConfig Current
+        {
+            get
+            {
+                lock (sync)
+                {
+                    if (cached == null || DateTime.UtcNow - lastCheck > TimeSpan.FromSeconds(2))
+                    {
+                        lastCheck = DateTime.UtcNow;
+                        DateTime stamp = Config.Stamp(Config.SettingsFile);
+                        if (cached == null || stamp != cachedStamp)
+                        {
+                            cached = Load();
+                            cachedStamp = stamp;
+                        }
+                    }
+                    return cached;
+                }
+            }
+        }
+
+        public static NotifyConfig Load()
+        {
+            Dictionary<string, string> d = Config.LoadSettings();
+            NotifyConfig c = new NotifyConfig();
+            c.OnOutage = Config.Get(d, "Benachrichtigen.Ausfall", "1") != "0";
+            c.OnRecovery = Config.Get(d, "Benachrichtigen.WiederErreichbar", "1") != "0";
+            int.TryParse(Config.Get(d, "Benachrichtigen.NachFehlschlaegen", "1"), out c.Threshold);
+            if (c.Threshold < 1) c.Threshold = 1;
+            c.WebhookEnabled = Config.Get(d, "Webhook.Aktiv", "0") == "1";
+            c.WebhookUrl = Config.Get(d, "Webhook.Url", "");
+            c.MailEnabled = Config.Get(d, "Mail.Aktiv", "0") == "1";
+            c.SmtpHost = Config.Get(d, "Mail.Server", "");
+            if (!int.TryParse(Config.Get(d, "Mail.Port", "587"), out c.SmtpPort)) c.SmtpPort = 587;
+            c.SmtpSsl = Config.Get(d, "Mail.SSL", "1") != "0";
+            c.SmtpUser = Config.Get(d, "Mail.Benutzer", "");
+            c.SmtpPassword = Unprotect(Config.Get(d, "Mail.Passwort", ""));
+            c.MailFrom = Config.Get(d, "Mail.Absender", "");
+            c.MailTo = Config.Get(d, "Mail.Empfaenger", "");
+            return c;
+        }
+
+        public void Save()
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            d["Benachrichtigen.Ausfall"] = OnOutage ? "1" : "0";
+            d["Benachrichtigen.WiederErreichbar"] = OnRecovery ? "1" : "0";
+            d["Benachrichtigen.NachFehlschlaegen"] = Threshold.ToString();
+            d["Webhook.Aktiv"] = WebhookEnabled ? "1" : "0";
+            d["Webhook.Url"] = WebhookUrl.Trim();
+            d["Mail.Aktiv"] = MailEnabled ? "1" : "0";
+            d["Mail.Server"] = SmtpHost.Trim();
+            d["Mail.Port"] = SmtpPort.ToString();
+            d["Mail.SSL"] = SmtpSsl ? "1" : "0";
+            d["Mail.Benutzer"] = SmtpUser.Trim();
+            d["Mail.Passwort"] = Protect(SmtpPassword);
+            d["Mail.Absender"] = MailFrom.Trim();
+            d["Mail.Empfaenger"] = MailTo.Trim();
+            Config.SaveSettings(d);
+        }
+
+        // Passwort verschlüsselt ablegen (DPAPI, an diesen Rechner gebunden), damit es
+        // nicht im Klartext in settings.txt steht und der Dienst (LocalSystem) es trotzdem lesen kann.
+        static readonly byte[] Entropy = Encoding.UTF8.GetBytes("PingMonitor");
+
+        static string Protect(string plain)
+        {
+            if (string.IsNullOrEmpty(plain)) return "";
+            try
+            {
+                byte[] data = ProtectedData.Protect(Encoding.UTF8.GetBytes(plain), Entropy, DataProtectionScope.LocalMachine);
+                return "dpapi:" + Convert.ToBase64String(data);
+            }
+            catch
+            {
+                return "b64:" + Convert.ToBase64String(Encoding.UTF8.GetBytes(plain));
+            }
+        }
+
+        static string Unprotect(string stored)
+        {
+            try
+            {
+                if (stored.StartsWith("dpapi:"))
+                    return Encoding.UTF8.GetString(ProtectedData.Unprotect(
+                        Convert.FromBase64String(stored.Substring(6)), Entropy, DataProtectionScope.LocalMachine));
+                if (stored.StartsWith("b64:"))
+                    return Encoding.UTF8.GetString(Convert.FromBase64String(stored.Substring(4)));
+            }
+            catch { return ""; }
+            return stored;
+        }
+    }
+
+    class Notification
+    {
+        public string Event;      // outage | recovered | test
+        public string Title;
+        public string Name, Host, Details, Source;
+        public DateTime Time;
+        public DateTime? Since;
+
+        public static Notification Outage(PingTarget t, DateTime since, string details, string source)
+        {
+            Notification n = Create("outage", "AUSFALL", t, details, source);
+            n.Time = since;
+            return n;
+        }
+
+        public static Notification Recovered(PingTarget t, DateTime since, DateTime now, string details, string source)
+        {
+            Notification n = Create("recovered", "Wieder erreichbar", t, details, source);
+            n.Time = now;
+            n.Since = since;
+            return n;
+        }
+
+        public static Notification Test(string source)
+        {
+            Notification n = new Notification();
+            n.Event = "test";
+            n.Title = "Testnachricht";
+            n.Name = "Test";
+            n.Host = "-";
+            n.Details = "Wenn diese Nachricht ankommt, sind die Benachrichtigungen richtig eingerichtet.";
+            n.Source = source;
+            n.Time = DateTime.Now;
+            return n;
+        }
+
+        static Notification Create(string evt, string title, PingTarget t, string details, string source)
+        {
+            Notification n = new Notification();
+            n.Event = evt; n.Title = title; n.Name = t.Name; n.Host = t.Host; n.Details = details; n.Source = source;
+            return n;
+        }
+
+        public string Subject
+        {
+            get { return "[PingMonitor] " + Title + ": " + Name + " (" + Host + ")"; }
+        }
+
+        public string Text
+        {
+            get
+            {
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine(Title + ": " + Name + " (" + Host + ")");
+                sb.AppendLine("Zeitpunkt: " + Time.ToString(Fmt.Time));
+                if (Since.HasValue) sb.AppendLine("Ausfall seit: " + Since.Value.ToString(Fmt.Time));
+                sb.AppendLine("Details: " + Details);
+                sb.AppendLine("Überwacht von: " + Environment.MachineName + " (" + Source + ")");
+                return sb.ToString();
+            }
+        }
+
+        /// <summary>
+        /// JSON für den Webhook. "text" und "content" enthalten die fertige Nachricht,
+        /// damit Slack, Microsoft Teams, Discord, Mattermost & Co. sie direkt anzeigen.
+        /// </summary>
+        public string Json
+        {
+            get
+            {
+                string text = Text.TrimEnd();
+                return "{" +
+                    "\"event\":" + J(Event) + "," +
+                    "\"title\":" + J(Title) + "," +
+                    "\"name\":" + J(Name) + "," +
+                    "\"host\":" + J(Host) + "," +
+                    "\"time\":" + J(Time.ToString("yyyy-MM-ddTHH:mm:sszzz")) + "," +
+                    "\"since\":" + (Since.HasValue ? J(Since.Value.ToString("yyyy-MM-ddTHH:mm:sszzz")) : "null") + "," +
+                    "\"details\":" + J(Details) + "," +
+                    "\"computer\":" + J(Environment.MachineName) + "," +
+                    "\"source\":" + J(Source) + "," +
+                    "\"text\":" + J(text) + "," +
+                    "\"content\":" + J(text) + "}";
+            }
+        }
+
+        static string J(string s)
+        {
+            if (s == null) return "null";
+            StringBuilder sb = new StringBuilder("\"");
+            foreach (char c in s)
+            {
+                switch (c)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < 0x20) sb.AppendFormat("\\u{0:x4}", (int)c);
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            return sb.Append('"').ToString();
+        }
+    }
+
+    /// <summary>Versendet Benachrichtigungen im Hintergrund, damit die Pings nicht blockiert werden.</summary>
+    static class Notifier
+    {
+        static readonly BlockingCollection<Notification> queue = new BlockingCollection<Notification>();
+        static readonly object startLock = new object();
+        static Thread worker;
+        static int busy;
+
+        public static void Enqueue(Notification n)
+        {
+            if (!NotifyConfig.Current.AnyChannel) return;
+            lock (startLock)
+            {
+                if (worker == null)
+                {
+                    worker = new Thread(Work);
+                    worker.IsBackground = true;
+                    worker.Name = "Benachrichtigungen";
+                    worker.Start();
+                }
+            }
+            queue.Add(n);
+        }
+
+        /// <summary>Wartet, bis alle anstehenden Nachrichten verschickt sind (z. B. beim Beenden).</summary>
+        public static void Flush(TimeSpan timeout)
+        {
+            DateTime end = DateTime.UtcNow + timeout;
+            while ((queue.Count > 0 || busy > 0) && DateTime.UtcNow < end) Thread.Sleep(100);
+        }
+
+        static void Work()
+        {
+            foreach (Notification n in queue.GetConsumingEnumerable())
+            {
+                Interlocked.Increment(ref busy);
+                try { Deliver(n, NotifyConfig.Current, true); }
+                finally { Interlocked.Decrement(ref busy); }
+            }
+        }
+
+        /// <summary>Sendet über alle aktiven Kanäle (mit Wiederholung) und protokolliert das Ergebnis.</summary>
+        public static List<string> Deliver(Notification n, NotifyConfig cfg, bool log)
+        {
+            List<string> results = new List<string>();
+            if (cfg.WebhookEnabled)
+                results.Add(Try("Webhook", n, log, delegate { SendWebhook(n, cfg); }));
+            if (cfg.MailEnabled)
+                results.Add(Try("E-Mail", n, log, delegate { SendMail(n, cfg); }));
+            return results;
+        }
+
+        static string Try(string channel, Notification n, bool log, Action send)
+        {
+            Exception last = null;
+            for (int attempt = 1; attempt <= 3; attempt++)
+            {
+                try
+                {
+                    send();
+                    if (log) Log(n, channel + " gesendet", n.Title);
+                    return channel + ": gesendet";
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    if (attempt < 3) Thread.Sleep(5000 * attempt);
+                }
+            }
+            string msg = Describe(last);
+            if (log) Log(n, channel + " fehlgeschlagen", n.Title + " - " + msg);
+            return channel + ": FEHLER - " + msg;
+        }
+
+        static string Describe(Exception ex)
+        {
+            string msg = ex.Message;
+            for (Exception inner = ex.InnerException; inner != null; inner = inner.InnerException)
+                msg += " / " + inner.Message;
+            return msg;
+        }
+
+        static void Log(Notification n, string evt, string info)
+        {
+            LogEntry e = new LogEntry();
+            e.Time = DateTime.Now; e.Name = n.Name; e.Host = n.Host; e.Event = evt; e.Info = info;
+            e.Source = "Benachrichtigung (" + n.Source + ")";
+            try { CsvLog.Write(e); } catch { }
+        }
+
+        static void SendWebhook(Notification n, NotifyConfig cfg)
+        {
+            // .NET Framework verwendet je nach Version standardmäßig kein TLS 1.2.
+            ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(cfg.WebhookUrl.Trim());
+            req.Method = "POST";
+            req.ContentType = "application/json; charset=utf-8";
+            req.UserAgent = "PingMonitor";
+            req.Timeout = 15000;
+            byte[] body = new UTF8Encoding(false).GetBytes(n.Json);
+            req.ContentLength = body.Length;
+            using (Stream s = req.GetRequestStream()) s.Write(body, 0, body.Length);
+            using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+            {
+                // GetResponse wirft bei 4xx/5xx bereits eine WebException.
+            }
+        }
+
+        static void SendMail(Notification n, NotifyConfig cfg)
+        {
+            ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+            using (MailMessage m = new MailMessage())
+            {
+                m.From = new MailAddress(cfg.MailFrom.Trim());
+                foreach (string to in cfg.MailTo.Split(new char[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+                    if (to.Trim().Length > 0) m.To.Add(to.Trim());
+                if (m.To.Count == 0) throw new Exception("Kein Empfänger angegeben.");
+                m.Subject = n.Subject;
+                m.Body = n.Text;
+                m.SubjectEncoding = Encoding.UTF8;
+                m.BodyEncoding = Encoding.UTF8;
+                using (SmtpClient c = new SmtpClient(cfg.SmtpHost.Trim(), cfg.SmtpPort))
+                {
+                    c.EnableSsl = cfg.SmtpSsl;
+                    c.Timeout = 20000;
+                    if (cfg.SmtpUser.Trim().Length > 0)
+                        c.Credentials = new NetworkCredential(cfg.SmtpUser.Trim(), cfg.SmtpPassword);
+                    c.Send(m);
+                }
+            }
+        }
+    }
+
+    // =====================================================================
     // Windows-Dienst
     // =====================================================================
 
@@ -422,6 +842,7 @@ namespace PingMonitor
                 targets.Clear();
             }
             try { File.Delete(Config.StatusFile); } catch { }
+            Notifier.Flush(TimeSpan.FromSeconds(10)); // noch anstehende Meldungen versenden
         }
 
         void Tick(object state)
@@ -489,7 +910,7 @@ namespace PingMonitor
             lock (sync)
             {
                 if (!t.Running) return;
-                foreach (LogEntry e in Outages.Process(t, ok, rtt, info, logEachFailure)) Write(e);
+                foreach (LogEntry e in Outages.Process(t, ok, rtt, info, logEachFailure, Source)) Write(e);
                 dirty = true;
             }
         }
@@ -771,6 +1192,7 @@ namespace PingMonitor
             {
                 svcTimer.Stop();
                 foreach (PingTarget t in targets) t.Stop();
+                Notifier.Flush(TimeSpan.FromSeconds(5));
             };
         }
 
@@ -803,6 +1225,10 @@ namespace PingMonitor
             actions.Controls.Add(NewButton("Entfernen", delegate { RemoveSelected(); }));
             actions.Controls.Add(NewButton("Statistik zurücksetzen", delegate { ResetStats(); }));
             actions.Controls.Add(NewButton("Log-Ordner öffnen", delegate { OpenLogFolder(); }));
+            actions.Controls.Add(NewButton("Benachrichtigungen ...", delegate
+            {
+                using (NotifyForm f = new NotifyForm()) f.ShowDialog(this);
+            }));
             chkEachFailure = new CheckBox();
             chkEachFailure.Text = "Jeden fehlgeschlagenen Ping protokollieren";
             chkEachFailure.AutoSize = true;
@@ -846,7 +1272,7 @@ namespace PingMonitor
             gridLog.Columns.Add("Info", "Details");
             gridLog.Columns.Add("Source", "Quelle");
             gridLog.Columns["Info"].FillWeight = 200;
-            gridLog.Columns["Source"].FillWeight = 50;
+            gridLog.Columns["Source"].FillWeight = 120;
 
             GroupBox grpTargets = new GroupBox();
             grpTargets.Text = "Geräte";
@@ -1067,7 +1493,7 @@ namespace PingMonitor
         void HandleResult(PingTarget t, bool ok, long rtt, string info)
         {
             if (!t.Running || !targets.Contains(t)) return;
-            foreach (LogEntry e in Outages.Process(t, ok, rtt, info, chkEachFailure.Checked))
+            foreach (LogEntry e in Outages.Process(t, ok, rtt, info, chkEachFailure.Checked, LocalSource))
                 AddLog(e);
             RefreshRow(t);
         }
@@ -1273,6 +1699,274 @@ namespace PingMonitor
                 t.ServiceView = v;
                 RefreshRow(t);
             }
+        }
+    }
+
+    /// <summary>Einstellungen für Webhook- und E-Mail-Benachrichtigungen.</summary>
+    class NotifyForm : Form
+    {
+        CheckBox chkOutage, chkRecovery, chkWebhook, chkMail, chkSsl;
+        NumericUpDown numThreshold, numPort;
+        TextBox txtUrl, txtHost, txtUser, txtPassword, txtFrom, txtTo;
+        Button btnTest;
+
+        public NotifyForm()
+        {
+            Text = "Benachrichtigungen";
+            Font = new Font("Segoe UI", 9F);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+
+            TableLayoutPanel tl = new TableLayoutPanel();
+            tl.ColumnCount = 2;
+            tl.AutoSize = true;
+            tl.Padding = new Padding(10);
+            tl.Dock = DockStyle.Fill;
+
+            // Wann
+            Header(tl, "Wann benachrichtigen?");
+            chkOutage = Check(tl, "Bei Ausfall");
+            numThreshold = new NumericUpDown();
+            numThreshold.Minimum = 1; numThreshold.Maximum = 1000; numThreshold.Width = 70;
+            Row(tl, "Ausfall melden nach", Inline(numThreshold, Hint("fehlgeschlagenen Pings in Folge (1 = sofort)")));
+            chkRecovery = Check(tl, "Wenn das Gerät wieder erreichbar ist (mit Ausfalldauer)");
+
+            // Webhook
+            Header(tl, "Webhook");
+            chkWebhook = Check(tl, "Webhook aktivieren");
+            txtUrl = TextRow(tl, "URL", 420);
+            Row(tl, "", Hint("HTTP POST mit JSON. Geeignet z. B. für Microsoft Teams (Workflows), Slack, Discord,\n" +
+                             "Mattermost, Home Assistant, n8n, Node-RED - Felder: event, name, host, time, details, text."));
+
+            // E-Mail
+            Header(tl, "E-Mail (SMTP)");
+            chkMail = Check(tl, "E-Mail aktivieren");
+            txtHost = new TextBox(); txtHost.Width = 260;
+            numPort = new NumericUpDown(); numPort.Minimum = 1; numPort.Maximum = 65535; numPort.Width = 70;
+            Row(tl, "SMTP-Server", Inline(txtHost, NewLabel("Port:"), numPort));
+            chkSsl = Check(tl, "Verschlüsselung (STARTTLS) verwenden");
+            txtUser = TextRow(tl, "Benutzername", 260);
+            txtPassword = TextRow(tl, "Passwort", 260);
+            txtPassword.UseSystemPasswordChar = true;
+            txtFrom = TextRow(tl, "Absender", 260);
+            txtTo = TextRow(tl, "Empfänger", 420);
+            Row(tl, "", Hint("Mehrere Empfänger mit Komma trennen. Port 587 + STARTTLS (z. B. Microsoft 365, GMX, web.de)\n" +
+                             "oder Port 25 ohne Verschlüsselung (interner Mailserver). Port 465 wird nicht unterstützt."));
+
+            FlowLayoutPanel buttons = new FlowLayoutPanel();
+            buttons.AutoSize = true;
+            buttons.Dock = DockStyle.Fill;
+            buttons.FlowDirection = FlowDirection.RightToLeft;
+            buttons.Margin = new Padding(0, 12, 0, 0);
+            Button btnCancel = new Button(); btnCancel.Text = "Abbrechen"; btnCancel.AutoSize = true;
+            btnCancel.DialogResult = DialogResult.Cancel;
+            Button btnSave = new Button(); btnSave.Text = "Speichern"; btnSave.AutoSize = true;
+            btnSave.Click += delegate { SaveAndClose(); };
+            btnTest = new Button(); btnTest.Text = "Testnachricht senden"; btnTest.AutoSize = true;
+            btnTest.Click += delegate { SendTest(); };
+            buttons.Controls.Add(btnCancel);
+            buttons.Controls.Add(btnSave);
+            buttons.Controls.Add(btnTest);
+            tl.Controls.Add(buttons, 0, tl.RowCount);
+            tl.SetColumnSpan(buttons, 2);
+            tl.RowCount++;
+
+            Controls.Add(tl);
+            CancelButton = btnCancel;
+
+            chkWebhook.CheckedChanged += delegate { UpdateEnabled(); };
+            chkMail.CheckedChanged += delegate { UpdateEnabled(); };
+            chkOutage.CheckedChanged += delegate { UpdateEnabled(); };
+
+            Fill(NotifyConfig.Load());
+        }
+
+        // ------------------------------------------------------- Layout-Helfer
+
+        static Label NewLabel(string text)
+        {
+            Label l = new Label();
+            l.Text = text;
+            l.AutoSize = true;
+            l.Margin = new Padding(3, 6, 3, 3);
+            return l;
+        }
+
+        static Label Hint(string text)
+        {
+            Label l = NewLabel(text);
+            l.ForeColor = SystemColors.GrayText;
+            return l;
+        }
+
+        static void Header(TableLayoutPanel tl, string text)
+        {
+            Label l = NewLabel(text);
+            l.Font = new Font("Segoe UI", 9.5F, FontStyle.Bold);
+            l.Margin = new Padding(0, tl.RowCount == 0 ? 0 : 12, 0, 3);
+            tl.Controls.Add(l, 0, tl.RowCount);
+            tl.SetColumnSpan(l, 2);
+            tl.RowCount++;
+        }
+
+        static void Row(TableLayoutPanel tl, string label, Control c)
+        {
+            tl.Controls.Add(NewLabel(label), 0, tl.RowCount);
+            tl.Controls.Add(c, 1, tl.RowCount);
+            tl.RowCount++;
+        }
+
+        static CheckBox Check(TableLayoutPanel tl, string text)
+        {
+            CheckBox c = new CheckBox();
+            c.Text = text;
+            c.AutoSize = true;
+            Row(tl, "", c);
+            return c;
+        }
+
+        static TextBox TextRow(TableLayoutPanel tl, string label, int width)
+        {
+            TextBox t = new TextBox();
+            t.Width = width;
+            Row(tl, label, t);
+            return t;
+        }
+
+        static FlowLayoutPanel Inline(params Control[] controls)
+        {
+            FlowLayoutPanel p = new FlowLayoutPanel();
+            p.AutoSize = true;
+            p.WrapContents = false;
+            p.Margin = new Padding(0);
+            p.Controls.AddRange(controls);
+            return p;
+        }
+
+        // ------------------------------------------------------------ Daten
+
+        void Fill(NotifyConfig c)
+        {
+            chkOutage.Checked = c.OnOutage;
+            chkRecovery.Checked = c.OnRecovery;
+            numThreshold.Value = Math.Min(1000, Math.Max(1, c.Threshold));
+            chkWebhook.Checked = c.WebhookEnabled;
+            txtUrl.Text = c.WebhookUrl;
+            chkMail.Checked = c.MailEnabled;
+            txtHost.Text = c.SmtpHost;
+            numPort.Value = Math.Min(65535, Math.Max(1, c.SmtpPort));
+            chkSsl.Checked = c.SmtpSsl;
+            txtUser.Text = c.SmtpUser;
+            txtPassword.Text = c.SmtpPassword;
+            txtFrom.Text = c.MailFrom;
+            txtTo.Text = c.MailTo;
+            UpdateEnabled();
+        }
+
+        NotifyConfig Collect()
+        {
+            NotifyConfig c = new NotifyConfig();
+            c.OnOutage = chkOutage.Checked;
+            c.OnRecovery = chkRecovery.Checked;
+            c.Threshold = (int)numThreshold.Value;
+            c.WebhookEnabled = chkWebhook.Checked;
+            c.WebhookUrl = txtUrl.Text.Trim();
+            c.MailEnabled = chkMail.Checked;
+            c.SmtpHost = txtHost.Text.Trim();
+            c.SmtpPort = (int)numPort.Value;
+            c.SmtpSsl = chkSsl.Checked;
+            c.SmtpUser = txtUser.Text.Trim();
+            c.SmtpPassword = txtPassword.Text;
+            c.MailFrom = txtFrom.Text.Trim();
+            c.MailTo = txtTo.Text.Trim();
+            return c;
+        }
+
+        void UpdateEnabled()
+        {
+            numThreshold.Enabled = chkOutage.Checked;
+            txtUrl.Enabled = chkWebhook.Checked;
+            foreach (Control c in new Control[] { txtHost, numPort, chkSsl, txtUser, txtPassword, txtFrom, txtTo })
+                c.Enabled = chkMail.Checked;
+            btnTest.Enabled = chkWebhook.Checked || chkMail.Checked;
+        }
+
+        string ValidateConfig(NotifyConfig c)
+        {
+            if (c.WebhookEnabled)
+            {
+                Uri u;
+                if (!Uri.TryCreate(c.WebhookUrl, UriKind.Absolute, out u) || (u.Scheme != "http" && u.Scheme != "https"))
+                    return "Bitte eine gültige Webhook-URL (http:// oder https://) eingeben.";
+            }
+            if (c.MailEnabled)
+            {
+                if (c.SmtpHost.Length == 0) return "Bitte den SMTP-Server eingeben.";
+                if (c.MailFrom.Length == 0) return "Bitte eine Absenderadresse eingeben.";
+                if (c.MailTo.Length == 0) return "Bitte mindestens einen Empfänger eingeben.";
+                try
+                {
+                    new MailAddress(c.MailFrom);
+                    foreach (string to in c.MailTo.Split(new char[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+                        if (to.Trim().Length > 0) new MailAddress(to.Trim());
+                }
+                catch (FormatException) { return "Bitte die E-Mail-Adressen prüfen."; }
+            }
+            return null;
+        }
+
+        void SaveAndClose()
+        {
+            NotifyConfig c = Collect();
+            string error = ValidateConfig(c);
+            if (error != null)
+            {
+                MessageBox.Show(this, error, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            try
+            {
+                c.Save();
+                DialogResult = DialogResult.OK;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Speichern fehlgeschlagen:\n" + ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        void SendTest()
+        {
+            NotifyConfig c = Collect();
+            string error = ValidateConfig(c);
+            if (error != null)
+            {
+                MessageBox.Show(this, error, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            btnTest.Enabled = false;
+            btnTest.Text = "Wird gesendet ...";
+            Cursor = Cursors.WaitCursor;
+            Thread th = new Thread(delegate ()
+            {
+                string result;
+                try { result = string.Join("\n", Notifier.Deliver(Notification.Test("App"), c, false).ToArray()); }
+                catch (Exception ex) { result = ex.Message; }
+                BeginInvoke(new Action(delegate
+                {
+                    Cursor = Cursors.Default;
+                    btnTest.Text = "Testnachricht senden";
+                    UpdateEnabled();
+                    MessageBox.Show(this, result, Text, MessageBoxButtons.OK,
+                        result.Contains("FEHLER") ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+                }));
+            });
+            th.IsBackground = true;
+            th.Start();
         }
     }
 }

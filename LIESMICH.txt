@@ -40,6 +40,29 @@ Windows-Dienst (optional)
   auf den Pfad der EXE). Zum Verschieben: deinstallieren, verschieben, neu installieren.
   Zum Aktualisieren der EXE: Dienst stoppen, EXE ersetzen, Dienst starten.
 
+Benachrichtigungen (Webhook / E-Mail)
+------------------------------------
+Schaltfläche "Benachrichtigungen ..." in der App. Gilt für App UND Dienst (gespeichert in settings.txt,
+der Dienst übernimmt Änderungen automatisch).
+- Wann: bei Ausfall und/oder wenn das Gerät wieder erreichbar ist (mit Ausfalldauer).
+  "Ausfall melden nach X fehlgeschlagenen Pings in Folge" verhindert Meldungen bei einzelnen
+  verlorenen Pings (1 = sofort melden). Protokolliert wird trotzdem jeder Ausfall.
+  Pro Ausfall gibt es genau eine Meldung, nicht eine pro fehlgeschlagenem Ping.
+- Webhook: HTTP POST mit JSON an die eingetragene URL, z. B.
+    {"event":"outage","title":"AUSFALL","name":"Drucker","host":"192.168.1.50",
+     "time":"2026-10-07T14:03:12+02:00","since":null,"details":"Zeitüberschreitung",
+     "computer":"SERVER01","source":"Dienst","text":"AUSFALL: Drucker ...","content":"AUSFALL: Drucker ..."}
+  event = outage | recovered | test. "text"/"content" enthalten die fertige Nachricht, damit
+  Slack, Microsoft Teams (Workflows), Discord, Mattermost usw. sie direkt anzeigen.
+- E-Mail: über SMTP, Port 587 mit STARTTLS (z. B. Microsoft 365, GMX, web.de) oder Port 25 ohne
+  Verschlüsselung (interner Mailserver/Relay). Port 465 (implizites SSL) wird nicht unterstützt.
+  Mehrere Empfänger mit Komma trennen. Das Passwort wird verschlüsselt (Windows-DPAPI,
+  an diesen Rechner gebunden) in settings.txt gespeichert.
+  Hinweis Microsoft 365 / Gmail: ggf. ist SMTP-Authentifizierung bzw. ein App-Passwort nötig.
+- "Testnachricht senden" prüft die Einstellungen sofort und zeigt das Ergebnis an.
+- Jede Benachrichtigung steht auch im Protokoll ("Webhook gesendet", "E-Mail fehlgeschlagen" ...,
+  Quelle "Benachrichtigung"). Fehlgeschlagene Sendungen werden 3x wiederholt.
+
 Protokoll
 ---------
 - Beim ersten fehlgeschlagenen Ping: Eintrag "Ausfall" mit Zeitstempel.
@@ -51,6 +74,6 @@ Protokoll
 Dateien
 -------
 hosts.txt          Geräteliste (Name;Host;Intervall_ms;Timeout_ms)
-settings.txt       Einstellungen
+settings.txt       Einstellungen inkl. Benachrichtigungen
 Logs\              Ausfallprotokolle
 Dienst_Status.csv  aktueller Status des Dienstes (für die Anzeige in der App)
