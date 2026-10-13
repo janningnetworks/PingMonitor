@@ -71,6 +71,11 @@ namespace PingMonitor
         public int TimeoutMs;
         public string Mac = "";
         public string Vendor = "";
+        public string Comment = "";
+        public string DnsName = "";      // "" = noch nicht ermittelt, "-" = nicht auflösbar
+        public string NetBiosName = "";
+        public string Info = "";         // Kurzfassung der Geräteinfos
+        public string InfoDetails = "";  // ausführlich (nur zur Laufzeit)
 
         public bool Running;
         public long Sent;
@@ -131,7 +136,9 @@ namespace PingMonitor
                     string info;
                     try
                     {
-                        PingReply reply = ping.Send(Host, TimeoutMs, buffer);
+                        // Hostnamen über den eingestellten DNS-Server auflösen (mit Ausweichservern).
+                        IPAddress target = Resolver.ResolveForPing(Host);
+                        PingReply reply = target != null ? ping.Send(target, TimeoutMs, buffer) : ping.Send(Host, TimeoutMs, buffer);
                         ok = reply.Status == IPStatus.Success;
                         rtt = reply.RoundtripTime;
                         info = ok ? "OK" : StatusText(reply.Status);
@@ -329,6 +336,10 @@ namespace PingMonitor
                 t.TimeoutMs = Math.Max(100, timeout);
                 if (p.Length > 4) t.Mac = p[4].Trim();
                 if (p.Length > 5) t.Vendor = p[5].Trim();
+                if (p.Length > 6) t.Comment = p[6].Trim();
+                if (p.Length > 7) t.DnsName = p[7].Trim();
+                if (p.Length > 8) t.NetBiosName = p[8].Trim();
+                if (p.Length > 9) t.Info = p[9].Trim();
                 list.Add(t);
             }
             return list;
@@ -337,11 +348,17 @@ namespace PingMonitor
         public static void SaveHosts(IEnumerable<PingTarget> targets)
         {
             List<string> lines = new List<string>();
-            lines.Add("# Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller");
+            lines.Add("# Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller;Kommentar;DNS-Name;NetBIOS;Geräteinfo");
             foreach (PingTarget t in targets)
-                lines.Add(t.Name.Replace(";", ",") + ";" + t.Host + ";" + t.IntervalMs + ";" + t.TimeoutMs + ";" +
-                    t.Mac + ";" + t.Vendor.Replace(";", ","));
+                lines.Add(Clean(t.Name) + ";" + t.Host + ";" + t.IntervalMs + ";" + t.TimeoutMs + ";" +
+                    t.Mac + ";" + Clean(t.Vendor) + ";" + Clean(t.Comment) + ";" + Clean(t.DnsName) + ";" +
+                    Clean(t.NetBiosName) + ";" + Clean(t.Info));
             File.WriteAllLines(HostsFile, lines.ToArray(), Encoding.UTF8);
+        }
+
+        static string Clean(string v)
+        {
+            return (v ?? "").Replace(";", ",").Replace("\r", " ").Replace("\n", " ").Trim();
         }
 
         /// <summary>settings.txt als Schlüssel=Wert-Liste.</summary>
@@ -1357,6 +1374,8 @@ namespace PingMonitor
         CheckBox chkEachFailure;
         Label lblLogPath, lblService;
         Button btnSvcInstall, btnSvcStart, btnSvcStop, btnSvcUninstall;
+        ComboBox cboDns;
+        string lastDnsSaved;
         System.Windows.Forms.Timer svcTimer;
 
         ServiceControllerStatus? svcStatus;
@@ -1366,7 +1385,7 @@ namespace PingMonitor
         public MainForm()
         {
             Text = "Ping Monitor";
-            Size = new Size(1150, 760);
+            Size = new Size(1360, 800);
             MinimumSize = new Size(850, 520);
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Segoe UI", 9F);
@@ -1379,7 +1398,7 @@ namespace PingMonitor
             svcTimer = new System.Windows.Forms.Timer();
             svcTimer.Interval = 2000;
             svcTimer.Tick += delegate { RefreshService(); };
-            Shown += delegate { RefreshService(); svcTimer.Start(); LookupMacs(targets); };
+            Shown += delegate { RefreshService(); svcTimer.Start(); LookupInfo(targets, false); };
 
             FormClosing += delegate
             {
@@ -1425,11 +1444,29 @@ namespace PingMonitor
             {
                 using (NotifyForm f = new NotifyForm()) f.ShowDialog(this);
             }));
+            actions.Controls.Add(NewButton("Geräteinfo abrufen", delegate
+            {
+                List<PingTarget> sel = Selected();
+                LookupInfo(sel.Count > 0 ? sel : targets, true);
+            }));
             chkEachFailure = new CheckBox();
             chkEachFailure.Text = "Jeden fehlgeschlagenen Ping protokollieren";
             chkEachFailure.AutoSize = true;
             chkEachFailure.Margin = new Padding(12, 7, 3, 3);
             actions.Controls.Add(chkEachFailure);
+
+            FlowLayoutPanel dnsRow = NewFlow(new Padding(6, 0, 6, 6));
+            dnsRow.Controls.Add(NewLabel("DNS-Server:"));
+            cboDns = new ComboBox();
+            cboDns.Width = 330;
+            FillDnsChoices();
+            cboDns.SelectedIndexChanged += delegate { SaveDns(); };
+            cboDns.Leave += delegate { SaveDns(); };
+            dnsRow.Controls.Add(cboDns);
+            dnsRow.Controls.Add(NewButton("DNS testen", delegate { TestDns(); }));
+            Label dnsHint = NewLabel("Kennt dieser Server einen Namen nicht, werden automatisch die Windows-DNS-Server, das Gateway und NetBIOS gefragt.");
+            dnsHint.ForeColor = SystemColors.GrayText;
+            dnsRow.Controls.Add(dnsHint);
 
             FlowLayoutPanel service = NewFlow(new Padding(6, 0, 6, 6));
             lblService = NewLabel("Windows-Dienst: ...");
@@ -1449,19 +1486,39 @@ namespace PingMonitor
             service.Controls.Add(hint);
 
             gridTargets = NewGrid();
-            gridTargets.Columns.Add("Name", "Name");
-            gridTargets.Columns.Add("Host", "IP / Hostname");
-            gridTargets.Columns.Add("Status", "Status");
-            gridTargets.Columns.Add("Reply", "Antwortzeit");
-            gridTargets.Columns.Add("Sent", "Gesendet");
-            gridTargets.Columns.Add("Lost", "Verloren");
-            gridTargets.Columns.Add("Loss", "Verlust %");
-            gridTargets.Columns.Add("Outages", "Ausfälle");
-            gridTargets.Columns.Add("LastOutage", "Letzter Ausfall");
-            gridTargets.Columns.Add("Interval", "Intervall (ms)");
-            gridTargets.Columns.Add("Mac", "MAC-Adresse");
-            gridTargets.Columns.Add("Vendor", "Hersteller");
-            gridTargets.Columns["Vendor"].FillWeight = 160;
+            AddTargetColumn("Name", "Name", 100);
+            AddTargetColumn("Comment", "Kommentar", 100);
+            AddTargetColumn("Host", "IP / Hostname", 90);
+            AddTargetColumn("Status", "Status", 80);
+            AddTargetColumn("Reply", "Antwort", 50);
+            AddTargetColumn("Sent", "Gesendet", 55);
+            AddTargetColumn("Lost", "Verloren", 50);
+            AddTargetColumn("Loss", "Verlust %", 50);
+            AddTargetColumn("Outages", "Ausfälle", 45);
+            AddTargetColumn("LastOutage", "Letzter Ausfall", 105);
+            AddTargetColumn("Interval", "Intervall", 50);
+            AddTargetColumn("Dns", "DNS-Name", 110);
+            AddTargetColumn("NetBios", "NetBIOS", 80);
+            AddTargetColumn("Mac", "MAC-Adresse", 100);
+            AddTargetColumn("Vendor", "Hersteller", 110);
+            AddTargetColumn("Info", "Geräteinfo", 160);
+            // Nur der Kommentar ist direkt in der Tabelle bearbeitbar.
+            gridTargets.ReadOnly = false;
+            gridTargets.Columns["Comment"].ReadOnly = false;
+            gridTargets.Columns["Comment"].DefaultCellStyle.Font = new Font(Font, FontStyle.Italic);
+            gridTargets.ShowCellToolTips = true;
+            gridTargets.CellEndEdit += delegate (object sender, DataGridViewCellEventArgs e)
+            {
+                if (e.RowIndex < 0 || gridTargets.Columns[e.ColumnIndex].Name != "Comment") return;
+                PingTarget t = (PingTarget)gridTargets.Rows[e.RowIndex].Tag;
+                t.Comment = Convert.ToString(gridTargets.Rows[e.RowIndex].Cells["Comment"].Value).Trim();
+                SaveHosts();
+            };
+            gridTargets.CellDoubleClick += delegate (object sender, DataGridViewCellEventArgs e)
+            {
+                if (e.RowIndex < 0 || gridTargets.Columns[e.ColumnIndex].Name == "Comment") return;
+                ShowDetails((PingTarget)gridTargets.Rows[e.RowIndex].Tag);
+            };
 
             gridLog = NewGrid();
             gridLog.Columns.Add("Time", "Zeitpunkt");
@@ -1498,10 +1555,18 @@ namespace PingMonitor
             Controls.Add(split);
             Controls.Add(lblLogPath);
             Controls.Add(service);
+            Controls.Add(dnsRow);
             Controls.Add(actions);
             Controls.Add(input);
 
             Load += delegate { split.SplitterDistance = split.Height / 2; };
+        }
+
+        void AddTargetColumn(string name, string header, int weight)
+        {
+            DataGridViewTextBoxColumn c = new DataGridViewTextBoxColumn();
+            c.Name = name; c.HeaderText = header; c.FillWeight = weight; c.ReadOnly = true;
+            gridTargets.Columns.Add(c);
         }
 
         static FlowLayoutPanel NewFlow(Padding padding)
@@ -1576,7 +1641,7 @@ namespace PingMonitor
             t.TimeoutMs = (int)numTimeout.Value;
             AddTarget(t);
             SaveHosts();
-            LookupMacs(new List<PingTarget> { t });
+            LookupInfo(new List<PingTarget> { t }, true);
             txtName.Clear();
             txtHost.Clear();
             txtName.Focus();
@@ -1594,10 +1659,12 @@ namespace PingMonitor
                 {
                     if (monitored.Contains(r.Ip.ToString())) continue;
                     PingTarget t = new PingTarget();
-                    t.Name = r.HostName;      // vom Benutzer bestätigter Name
+                    t.Name = r.Name;          // vom Benutzer bestätigter Name
                     t.Host = r.Ip.ToString();
                     t.Mac = r.Mac;
                     t.Vendor = r.Vendor;
+                    t.Comment = r.Comment;
+                    ApplyInfo(t, r.Info);
                     t.IntervalMs = (int)numInterval.Value;
                     t.TimeoutMs = (int)numTimeout.Value;
                     AddTarget(t);
@@ -1615,49 +1682,88 @@ namespace PingMonitor
             }
         }
 
-        /// <summary>Ermittelt im Hintergrund MAC-Adresse und Hersteller für Geräte, bei denen sie fehlen.</summary>
-        void LookupMacs(List<PingTarget> list)
+        int infoRunning;
+
+        /// <summary>
+        /// Ermittelt im Hintergrund MAC, Hersteller, DNS-/NetBIOS-Namen und weitere Geräteinfos.
+        /// force = false: nur für Geräte, bei denen noch nie gesucht wurde.
+        /// </summary>
+        void LookupInfo(List<PingTarget> list, bool force)
         {
-            List<PingTarget> todo = list.FindAll(delegate (PingTarget t) { return t.Mac.Length == 0; });
+            List<PingTarget> todo = list.FindAll(delegate (PingTarget t) { return force || t.DnsName.Length == 0; });
             if (todo.Count == 0) return;
             List<NetTools.Subnet> subnets = NetTools.LocalSubnets();
-            Thread th = new Thread(delegate ()
+            string community = ScanForm.SnmpCommunity;
+            Interlocked.Add(ref infoRunning, todo.Count);
+            lblLogPath.Text = "Geräteinfos werden abgerufen ... (" + infoRunning + ")";
+            int next = -1;
+            int threads = Math.Min(16, todo.Count);
+            int left = threads;
+            for (int i = 0; i < threads; i++)
             {
-                bool changed = false;
-                foreach (PingTarget t in todo)
+                Thread th = new Thread(delegate ()
                 {
-                    try
+                    int idx;
+                    while ((idx = Interlocked.Increment(ref next)) < todo.Count)
                     {
-                        IPAddress ip;
-                        if (!IPAddress.TryParse(t.Host, out ip))
+                        PingTarget t = todo[idx];
+                        try
                         {
-                            ip = null;
-                            foreach (IPAddress a in Dns.GetHostAddresses(t.Host))
-                                if (a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork) { ip = a; break; }
+                            string src;
+                            IPAddress ip = Resolver.Lookup(t.Host, out src);
+                            DeviceInfo d = null;
+                            string mac = t.Mac;
+                            if (ip != null)
+                            {
+                                int ttl = 0;
+                                try
+                                {
+                                    using (Ping p = new Ping())
+                                    {
+                                        PingReply reply = p.Send(ip, 1000);
+                                        if (reply.Status == IPStatus.Success && reply.Options != null) ttl = reply.Options.Ttl;
+                                    }
+                                }
+                                catch { }
+                                d = DeviceInfo.Gather(ip, ttl, true, community);
+                                bool local = false;
+                                foreach (NetTools.Subnet s in subnets) if (s.Contains(ip)) local = true;
+                                string arp = local ? NetTools.GetMac(ip) : "";
+                                if (arp.Length > 0) mac = arp;
+                                else if (mac.Length == 0) mac = d.NetBiosMac;
+                            }
+                            PingTarget target = t;
+                            DeviceInfo info = d;
+                            string newMac = mac;
+                            BeginInvoke(new Action(delegate
+                            {
+                                if (info != null) ApplyInfo(target, info);
+                                else if (target.DnsName.Length == 0) target.DnsName = "-";
+                                if (newMac.Length > 0) { target.Mac = newMac; target.Vendor = MacVendors.Lookup(newMac); }
+                                if (targets.Contains(target)) RefreshInfo(target);
+                            }));
                         }
-                        if (ip == null) continue;
-                        bool local = false;
-                        foreach (NetTools.Subnet s in subnets) if (s.Contains(ip)) local = true;
-                        if (!local) continue;   // MAC ist nur im eigenen Subnetz ermittelbar
-                        string mac = NetTools.GetMac(ip);
-                        if (mac.Length == 0) continue;
-                        string vendor = MacVendors.Lookup(mac);
-                        PingTarget target = t;
-                        BeginInvoke(new Action(delegate
+                        catch (InvalidOperationException) { return; }
+                        catch { }
+                        finally
                         {
-                            target.Mac = mac;
-                            target.Vendor = vendor;
-                            if (targets.Contains(target)) RefreshRow(target);
-                        }));
-                        changed = true;
+                            Interlocked.Decrement(ref infoRunning);
+                        }
                     }
-                    catch { }
-                }
-                if (changed)
-                    try { BeginInvoke(new Action(delegate { SaveHosts(); })); } catch (InvalidOperationException) { }
-            });
-            th.IsBackground = true;
-            th.Start();
+                    if (Interlocked.Decrement(ref left) == 0)
+                        try
+                        {
+                            BeginInvoke(new Action(delegate
+                            {
+                                SaveHosts();
+                                lblLogPath.Text = "Geräteinfos aktualisiert.   Logdatei: " + CsvLog.CurrentFile;
+                            }));
+                        }
+                        catch (InvalidOperationException) { }
+                });
+                th.IsBackground = true;
+                th.Start();
+            }
         }
 
         void AddTarget(PingTarget t)
@@ -1668,6 +1774,7 @@ namespace PingMonitor
             t.Row.Tag = t;
             targets.Add(t);
             RefreshRow(t);
+            RefreshInfo(t);
         }
 
         void LoadHosts()
@@ -1776,6 +1883,146 @@ namespace PingMonitor
             RefreshRow(t);
         }
 
+        /// <summary>Gerätedaten, die sich selten ändern (Kommentar, Namen, MAC, Infos).</summary>
+        void RefreshInfo(PingTarget t)
+        {
+            DataGridViewRow r = t.Row;
+            if (!(gridTargets.IsCurrentCellInEditMode && gridTargets.CurrentCell != null && gridTargets.CurrentCell.RowIndex == r.Index))
+                r.Cells["Comment"].Value = t.Comment;
+            r.Cells["Dns"].Value = t.DnsName;
+            r.Cells["NetBios"].Value = t.NetBiosName;
+            r.Cells["Mac"].Value = t.Mac;
+            r.Cells["Vendor"].Value = t.Vendor;
+            r.Cells["Info"].Value = t.Info;
+            string tip = DetailText(t);
+            foreach (DataGridViewCell c in r.Cells)
+                if (c.OwningColumn.Name != "Comment") c.ToolTipText = tip;
+        }
+
+        static string DetailText(PingTarget t)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine(t.Name + "  (" + t.Host + ")");
+            if (t.Comment.Length > 0) sb.AppendLine("Kommentar: " + t.Comment);
+            if (t.Mac.Length > 0) sb.AppendLine("MAC: " + t.Mac + (t.Vendor.Length > 0 ? "  -  " + t.Vendor : ""));
+            if (t.InfoDetails.Length > 0) sb.AppendLine(t.InfoDetails);
+            else
+            {
+                if (t.DnsName.Length > 0) sb.AppendLine("DNS-Name: " + t.DnsName);
+                if (t.NetBiosName.Length > 0) sb.AppendLine("NetBIOS: " + t.NetBiosName);
+                if (t.Info.Length > 0) sb.AppendLine("Info: " + t.Info);
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        void ShowDetails(PingTarget t)
+        {
+            string text = DetailText(t);
+            if (t.InfoDetails.Length == 0) text += "\n\n(Tipp: \"Geräteinfo abrufen\" fragt DNS, NetBIOS, mDNS, SNMP und Webseite neu ab.)";
+            MessageBox.Show(this, text, "Geräteinfo", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        static void ApplyInfo(PingTarget t, DeviceInfo d)
+        {
+            t.DnsName = d.DnsDisplay;
+            t.NetBiosName = d.NetBiosDisplay;
+            t.Info = d.Summary;
+            t.InfoDetails = d.Details;
+        }
+
+        // ------------------------------------------------------------ DNS
+
+        void FillDnsChoices()
+        {
+            cboDns.Items.Clear();
+            List<IPAddress> sys = Resolver.SystemServers();
+            cboDns.Items.Add("Automatisch (Windows" + (sys.Count > 0 ? ": " + string.Join(", ", sys.ConvertAll(delegate (IPAddress a) { return a.ToString(); }).ToArray()) : "") + ")");
+            foreach (IPAddress g in Resolver.Gateways()) cboDns.Items.Add("Gateway / Firewall: " + g);
+            cboDns.Items.Add("Google: 8.8.8.8, 8.8.4.4");
+            cboDns.Items.Add("Cloudflare: 1.1.1.1, 1.0.0.1");
+            cboDns.Items.Add("Quad9: 9.9.9.9");
+            string current = Resolver.Setting;
+            lastDnsSaved = current;
+            if (current == Resolver.Auto) { cboDns.SelectedIndex = 0; return; }
+            foreach (object item in cboDns.Items)
+                if (Resolver.ParseServers(item.ToString()).Count > 0 &&
+                    string.Join(",", Resolver.ParseServers(item.ToString()).ConvertAll(delegate (IPAddress a) { return a.ToString(); }).ToArray()) ==
+                    string.Join(",", Resolver.ParseServers(current).ConvertAll(delegate (IPAddress a) { return a.ToString(); }).ToArray()))
+                { cboDns.SelectedItem = item; return; }
+            cboDns.Text = current;
+        }
+
+        void SaveDns()
+        {
+            string text = cboDns.Text.Trim();
+            string value;
+            if (text.Length == 0 || text.StartsWith("Automatisch")) value = Resolver.Auto;
+            else
+            {
+                List<IPAddress> servers = Resolver.ParseServers(text);
+                if (servers.Count == 0)
+                {
+                    MessageBox.Show(this, "Bitte eine oder mehrere IP-Adressen von DNS-Servern eingeben (z. B. 192.168.1.1 oder 8.8.8.8, 1.1.1.1).",
+                        Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    FillDnsChoices();
+                    return;
+                }
+                value = string.Join(", ", servers.ConvertAll(delegate (IPAddress a) { return a.ToString(); }).ToArray());
+            }
+            if (value == lastDnsSaved) return;
+            lastDnsSaved = value;
+            TrySave(delegate { Resolver.Save(value); });
+        }
+
+        /// <summary>Fragt jeden DNS-Server der Reihe nach und zeigt Ergebnis und Antwortzeit.</summary>
+        void TestDns()
+        {
+            SaveDns();
+            Cursor = Cursors.WaitCursor;
+            Thread th = new Thread(delegate ()
+            {
+                StringBuilder sb = new StringBuilder();
+                sb.AppendLine("Reihenfolge der befragten DNS-Server:");
+                sb.AppendLine();
+                List<IPAddress> gws = Resolver.Gateways();
+                foreach (IPAddress server in Resolver.Chain())
+                {
+                    sb.AppendLine(server.ToString() + ":");
+                    int rc;
+                    Stopwatch sw = Stopwatch.StartNew();
+                    List<DnsClient.Answer> a = DnsClient.Query(server, 53, "www.microsoft.com", DnsClient.TypeA, 1500, out rc);
+                    sw.Stop();
+                    if (a == null) sb.AppendLine("   www.microsoft.com  ->  KEINE ANTWORT (Server nicht erreichbar / Port 53 gesperrt?)");
+                    else
+                    {
+                        string ip = "";
+                        foreach (DnsClient.Answer x in a) if (x.Type == DnsClient.TypeA) { ip = x.Data; break; }
+                        sb.AppendLine("   www.microsoft.com  ->  " + (ip.Length > 0 ? ip : "nicht gefunden (Code " + rc + ")") + "   (" + sw.ElapsedMilliseconds + " ms)");
+                    }
+                    if (a != null && gws.Count > 0)
+                    {
+                        List<DnsClient.Answer> p = DnsClient.Query(server, 53, DnsClient.ReverseName(gws[0]), DnsClient.TypePtr, 1500, out rc);
+                        string name = "";
+                        if (p != null) foreach (DnsClient.Answer x in p) if (x.Type == DnsClient.TypePtr) { name = x.Data; break; }
+                        sb.AppendLine("   " + gws[0] + " (Gateway)  ->  " + (name.Length > 0 ? name : "kein Name (interne Namen kennt nur ein interner DNS)"));
+                    }
+                }
+                sb.AppendLine();
+                sb.AppendLine("Danach: Windows-Namensauflösung (Hosts-Datei, LLMNR, NetBIOS).");
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        Cursor = Cursors.Default;
+                        MessageBox.Show(this, sb.ToString(), "DNS-Test", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
         void RefreshRow(PingTarget t)
         {
             // Läuft das Gerät nicht in der App, aber im Dienst, wird der Dienst-Status angezeigt.
@@ -1793,8 +2040,6 @@ namespace PingMonitor
             r.Cells["Outages"].Value = v.Outages;
             r.Cells["LastOutage"].Value = v.LastOutage.HasValue ? v.LastOutage.Value.ToString(Fmt.Time) : "";
             r.Cells["Interval"].Value = t.IntervalMs;
-            r.Cells["Mac"].Value = t.Mac;
-            r.Cells["Vendor"].Value = t.Vendor;
 
             Color back;
             if (!active) back = SystemColors.Window;
@@ -2555,20 +2800,24 @@ namespace PingMonitor
     class ScanResult
     {
         public IPAddress Ip;
-        public string HostName = "";
         public string Mac = "";
         public string Vendor = "";
         public long Rtt = -1;          // -1 = keine Ping-Antwort (nur per ARP gefunden)
+        public int Ttl;
+        public DeviceInfo Info = new DeviceInfo();
+        public string Name = "";       // vom Benutzer gewählter Name
+        public string Comment = "";
 
         /// <summary>Vorschlag für den Gerätenamen.</summary>
         public string SuggestedName
         {
             get
             {
-                if (HostName.Length > 0)
+                foreach (string n in new string[] { Info.DnsName, Info.NetBiosName, Info.SnmpName, Info.MdnsName })
                 {
-                    int dot = HostName.IndexOf('.');
-                    return dot > 0 ? HostName.Substring(0, dot) : HostName;
+                    if (string.IsNullOrEmpty(n)) continue;
+                    int dot = n.IndexOf('.');
+                    return dot > 0 ? n.Substring(0, dot) : n;
                 }
                 if (Vendor.Length > 0 && !Vendor.StartsWith("("))
                 {
@@ -2594,7 +2843,7 @@ namespace PingMonitor
 
         ComboBox cboRange;
         NumericUpDown numTimeout;
-        CheckBox chkArp;
+        CheckBox chkArp, chkExtended;
         Button btnScan, btnTake, btnVendors;
         ProgressBar progress;
         Label lblStatus;
@@ -2640,9 +2889,16 @@ namespace PingMonitor
             top.Controls.Add(numTimeout);
             top.Controls.Add(btnScan);
             top.Controls.Add(chkArp);
-            Label hint = Lbl("Beispiele: 192.168.1.0/24  ·  192.168.1.10-192.168.1.50  ·  10.0.0.1-99  ·  mehrere Bereiche mit Komma trennen");
+            chkExtended = new CheckBox();
+            chkExtended.Text = "Erweiterte Geräteinfos (NetBIOS, mDNS, SNMP, Webseite)";
+            chkExtended.Checked = true;
+            chkExtended.AutoSize = true;
+            chkExtended.Margin = new Padding(12, 7, 3, 3);
+            top.Controls.Add(chkExtended);
+            top.SetFlowBreak(chkExtended, true);
+            Label hint = Lbl("Beispiele: 192.168.1.0/24  ·  192.168.1.10-192.168.1.50  ·  10.0.0.1-99  ·  mehrere Bereiche mit Komma trennen" +
+                "   ·   DNS: " + (Resolver.Setting == Resolver.Auto ? "automatisch" : Resolver.Setting) + " (+ Ausweichserver)");
             hint.ForeColor = SystemColors.GrayText;
-            top.SetFlowBreak(chkArp, true);
             top.Controls.Add(hint);
 
             // --- Fortschritt
@@ -2674,13 +2930,18 @@ namespace PingMonitor
             chk.Name = "Take"; chk.HeaderText = "Überwachen"; chk.FillWeight = 45;
             grid.Columns.Add(chk);
             AddCol("Ip", "IP-Adresse", 60);
-            AddCol("Name", "Name (für die Überwachung)", 100);
+            AddCol("Name", "Name (für die Überwachung)", 90);
             grid.Columns["Name"].ReadOnly = false;
-            AddCol("HostName", "DNS-Name", 100);
+            AddCol("Comment", "Kommentar", 80);
+            grid.Columns["Comment"].ReadOnly = false;
+            AddCol("Dns", "DNS-Name", 90);
+            AddCol("NetBios", "NetBIOS", 70);
             AddCol("Mac", "MAC-Adresse", 70);
-            AddCol("Vendor", "Hersteller", 140);
-            AddCol("Rtt", "Antwort", 40);
-            AddCol("Note", "Hinweis", 70);
+            AddCol("Vendor", "Hersteller", 100);
+            AddCol("Info", "Geräteinfo", 160);
+            AddCol("Rtt", "Antwort", 35);
+            AddCol("Note", "Hinweis", 60);
+            grid.ShowCellToolTips = true;
             DataGridViewTextBoxColumn sortKey = new DataGridViewTextBoxColumn();
             sortKey.Name = "Key"; sortKey.Visible = false; sortKey.ValueType = typeof(long);
             grid.Columns.Add(sortKey);
@@ -2779,10 +3040,12 @@ namespace PingMonitor
             progress.Maximum = total;
             progress.Value = 0;
             btnScan.Text = "Abbrechen";
-            cboRange.Enabled = numTimeout.Enabled = chkArp.Enabled = false;
+            cboRange.Enabled = numTimeout.Enabled = chkArp.Enabled = chkExtended.Enabled = false;
 
             int timeout = (int)numTimeout.Value;
             bool arp = chkArp.Checked;
+            bool extended = chkExtended.Checked;
+            string community = SnmpCommunity;
             int next = -1;
             int threads = Math.Min(64, total);
             running = threads;
@@ -2795,7 +3058,7 @@ namespace PingMonitor
                         int idx;
                         while (!cancel && (idx = Interlocked.Increment(ref next)) < addresses.Count)
                         {
-                            ScanResult r = Probe(ping, addresses[idx], timeout, arp);
+                            ScanResult r = Probe(ping, addresses[idx], timeout, arp, extended, community);
                             Interlocked.Increment(ref done);
                             if (r != null) Report(r);
                         }
@@ -2808,14 +3071,23 @@ namespace PingMonitor
             uiTimer.Start();
         }
 
-        ScanResult Probe(Ping ping, IPAddress ip, int timeout, bool arp)
+        public static string SnmpCommunity
+        {
+            get { return Config.Get(Config.LoadSettings(), "SNMP.Community", "public"); }
+        }
+
+        ScanResult Probe(Ping ping, IPAddress ip, int timeout, bool arp, bool extended, string community)
         {
             ScanResult r = new ScanResult();
             r.Ip = ip;
             try
             {
                 PingReply reply = ping.Send(ip, timeout);
-                if (reply.Status == IPStatus.Success) r.Rtt = reply.RoundtripTime;
+                if (reply.Status == IPStatus.Success)
+                {
+                    r.Rtt = reply.RoundtripTime;
+                    if (reply.Options != null) r.Ttl = reply.Options.Ttl;
+                }
             }
             catch { }
 
@@ -2832,8 +3104,10 @@ namespace PingMonitor
             {
                 r.Mac = NetTools.GetMac(ip);
             }
+            if (!cancel) r.Info = DeviceInfo.Gather(ip, r.Ttl, extended, community);
+            // Über Router hinweg liefert ARP keine MAC - NetBIOS gibt sie aber oft mit aus.
+            if (r.Mac.Length == 0 && r.Info.NetBiosMac.Length > 0) r.Mac = r.Info.NetBiosMac;
             if (r.Mac.Length > 0) r.Vendor = MacVendors.Lookup(r.Mac);
-            if (!cancel) r.HostName = NetTools.GetHostName(ip, 1500);
             return r;
         }
 
@@ -2848,12 +3122,14 @@ namespace PingMonitor
         {
             if (IsDisposed) return;
             bool known = monitored.Contains(r.Ip.ToString()) ||
-                         (r.HostName.Length > 0 && monitored.Contains(r.HostName.ToLowerInvariant()));
+                         (r.Info.DnsName.Length > 0 && monitored.Contains(r.Info.DnsName));
             string note = known ? "wird bereits überwacht" : (r.Rtt < 0 ? "antwortet nicht auf Ping" : "");
-            int idx = grid.Rows.Add(false, r.Ip.ToString(), r.SuggestedName, r.HostName, r.Mac, r.Vendor,
-                r.Rtt < 0 ? "-" : r.Rtt + " ms", note, (long)NetTools.ToUInt(r.Ip));
+            int idx = grid.Rows.Add(false, r.Ip.ToString(), r.SuggestedName, "", r.Info.DnsDisplay, r.Info.NetBiosDisplay,
+                r.Mac.Length > 0 ? r.Mac : "-", r.Vendor, r.Info.Summary, r.Rtt < 0 ? "-" : r.Rtt + " ms", note, (long)NetTools.ToUInt(r.Ip));
             DataGridViewRow row = grid.Rows[idx];
             row.Tag = r;
+            string details = r.Info.Details;
+            foreach (DataGridViewCell c in row.Cells) c.ToolTipText = details;
             if (known)
             {
                 row.DefaultCellStyle.ForeColor = SystemColors.GrayText;
@@ -2875,7 +3151,7 @@ namespace PingMonitor
             uiTimer.Stop();
             UpdateProgress();
             btnScan.Text = "Scan starten";
-            cboRange.Enabled = numTimeout.Enabled = chkArp.Enabled = true;
+            cboRange.Enabled = numTimeout.Enabled = chkArp.Enabled = chkExtended.Enabled = true;
             grid.Sort(grid.Columns["Ip"], System.ComponentModel.ListSortDirection.Ascending);
             lblStatus.Text = (cancel ? "Abgebrochen" : "Fertig") + ": " + found + " Geräte gefunden, " + done + " von " + total +
                 " Adressen geprüft (" + (int)(DateTime.Now - started).TotalSeconds + " s). Herstellerliste: " + MacVendors.Source;
@@ -2925,10 +3201,9 @@ namespace PingMonitor
                 if (!(row.Cells["Take"].Value is bool) || !(bool)row.Cells["Take"].Value) continue;
                 ScanResult r = (ScanResult)row.Tag;
                 string name = Convert.ToString(row.Cells["Name"].Value).Trim();
-                ScanResult copy = new ScanResult();
-                copy.Ip = r.Ip; copy.HostName = name.Length > 0 ? name : r.SuggestedName;
-                copy.Mac = r.Mac; copy.Vendor = r.Vendor; copy.Rtt = r.Rtt;
-                Chosen.Add(copy);
+                r.Name = name.Length > 0 ? name : r.SuggestedName;
+                r.Comment = Convert.ToString(row.Cells["Comment"].Value).Trim();
+                Chosen.Add(r);
             }
             cancel = true;
             DialogResult = DialogResult.OK;
@@ -2964,6 +3239,609 @@ namespace PingMonitor
             });
             th.IsBackground = true;
             th.Start();
+        }
+    }
+
+    // =====================================================================
+    // Namensauflösung und Geräteinformationen
+    // =====================================================================
+
+    /// <summary>Minimaler DNS-Client (UDP), damit ein beliebiger DNS-Server gefragt werden kann.</summary>
+    static class DnsClient
+    {
+        public const ushort TypeA = 1, TypePtr = 12;
+        static readonly Random rnd = new Random();
+
+        public class Answer
+        {
+            public int Type;
+            public string Data;
+        }
+
+        /// <summary>Gibt null zurück, wenn der Server nicht antwortet. rcode 3 = Name unbekannt.</summary>
+        public static List<Answer> Query(IPAddress server, int port, string name, ushort qtype, int timeoutMs, out int rcode)
+        {
+            rcode = -1;
+            ushort id;
+            lock (rnd) id = (ushort)rnd.Next(1, 65535);
+            List<byte> q = new List<byte>();
+            q.Add((byte)(id >> 8)); q.Add((byte)id);
+            q.Add(0x01); q.Add(0x00);                 // Rekursion erwünscht
+            q.Add(0); q.Add(1); q.Add(0); q.Add(0); q.Add(0); q.Add(0); q.Add(0); q.Add(0);
+            foreach (string label in name.TrimEnd('.').Split('.'))
+            {
+                byte[] l = Encoding.ASCII.GetBytes(label);
+                q.Add((byte)l.Length);
+                q.AddRange(l);
+            }
+            q.Add(0);
+            q.Add((byte)(qtype >> 8)); q.Add((byte)qtype);
+            q.Add(0); q.Add(1);
+
+            byte[] resp;
+            try
+            {
+                using (System.Net.Sockets.UdpClient u = new System.Net.Sockets.UdpClient(server.AddressFamily))
+                {
+                    u.Client.ReceiveTimeout = timeoutMs;
+                    u.Send(q.ToArray(), q.Count, new IPEndPoint(server, port));
+                    DateTime end = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+                    while (true)
+                    {
+                        IPEndPoint from = null;
+                        resp = u.Receive(ref from);
+                        if (resp.Length >= 12 && (((resp[0] << 8) | resp[1]) == id || port == 5353)) break;
+                        if (DateTime.UtcNow > end) return null;
+                    }
+                }
+            }
+            catch (System.Net.Sockets.SocketException) { return null; }
+            catch (ObjectDisposedException) { return null; }
+
+            List<Answer> answers = new List<Answer>();
+            try
+            {
+                rcode = resp[3] & 0x0F;
+                int qd = U16(resp, 4), an = U16(resp, 6);
+                int pos = 12;
+                for (int i = 0; i < qd; i++) { ReadName(resp, ref pos); pos += 4; }
+                for (int i = 0; i < an; i++)
+                {
+                    ReadName(resp, ref pos);
+                    int type = U16(resp, pos);
+                    int rdlen = U16(resp, pos + 8);
+                    pos += 10;
+                    Answer a = new Answer();
+                    a.Type = type;
+                    if (type == TypeA && rdlen == 4)
+                        a.Data = resp[pos] + "." + resp[pos + 1] + "." + resp[pos + 2] + "." + resp[pos + 3];
+                    else if (type == TypePtr || type == 5)
+                    {
+                        int p = pos;
+                        a.Data = ReadName(resp, ref p);
+                    }
+                    if (a.Data != null) answers.Add(a);
+                    pos += rdlen;
+                }
+            }
+            catch (IndexOutOfRangeException) { }
+            return answers;
+        }
+
+        public static string ReverseName(IPAddress ip)
+        {
+            byte[] b = ip.GetAddressBytes();
+            return b[3] + "." + b[2] + "." + b[1] + "." + b[0] + ".in-addr.arpa";
+        }
+
+        static int U16(byte[] b, int pos) { return (b[pos] << 8) | b[pos + 1]; }
+
+        static string ReadName(byte[] b, ref int pos)
+        {
+            StringBuilder sb = new StringBuilder();
+            int p = pos;
+            bool jumped = false;
+            for (int guard = 0; guard < 128; guard++)
+            {
+                int len = b[p];
+                if (len == 0) { p++; break; }
+                if ((len & 0xC0) == 0xC0)
+                {
+                    int target = ((len & 0x3F) << 8) | b[p + 1];
+                    if (!jumped) pos = p + 2;
+                    jumped = true;
+                    p = target;
+                    continue;
+                }
+                if (sb.Length > 0) sb.Append('.');
+                sb.Append(Encoding.ASCII.GetString(b, p + 1, len));
+                p += len + 1;
+            }
+            if (!jumped) pos = p;
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>
+    /// Namensauflösung über den eingestellten DNS-Server. Antwortet er nicht oder kennt den Namen
+    /// nicht, werden nacheinander die DNS-Server aus den Netzwerkeinstellungen, das Gateway und
+    /// zuletzt die Windows-Namensauflösung (Hosts-Datei, LLMNR, NetBIOS) gefragt.
+    /// </summary>
+    static class Resolver
+    {
+        public const string Auto = "auto";
+        static string cachedSetting = Auto;
+        static DateTime settingRead = DateTime.MinValue;
+        static readonly object sync = new object();
+        static readonly Dictionary<string, KeyValuePair<IPAddress, DateTime>> hostCache =
+            new Dictionary<string, KeyValuePair<IPAddress, DateTime>>(StringComparer.OrdinalIgnoreCase);
+
+        public static string Setting
+        {
+            get
+            {
+                lock (sync)
+                {
+                    if (DateTime.UtcNow - settingRead > TimeSpan.FromSeconds(5))
+                    {
+                        cachedSetting = Config.Get(Config.LoadSettings(), "DNS.Server", Auto);
+                        settingRead = DateTime.UtcNow;
+                    }
+                    return cachedSetting;
+                }
+            }
+        }
+
+        public static void Save(string value)
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            d["DNS.Server"] = value;
+            Config.SaveSettings(d);
+            lock (sync) { cachedSetting = value; settingRead = DateTime.UtcNow; }
+        }
+
+        /// <summary>Alle IPv4-Adressen aus einem Text, z. B. "Google: 8.8.8.8, 8.8.4.4".</summary>
+        public static List<IPAddress> ParseServers(string text)
+        {
+            List<IPAddress> list = new List<IPAddress>();
+            foreach (System.Text.RegularExpressions.Match m in
+                System.Text.RegularExpressions.Regex.Matches(text ?? "", @"\b\d{1,3}(\.\d{1,3}){3}\b"))
+            {
+                IPAddress ip;
+                if (IPAddress.TryParse(m.Value, out ip) && !list.Contains(ip)) list.Add(ip);
+            }
+            return list;
+        }
+
+        public static List<IPAddress> SystemServers()
+        {
+            List<IPAddress> list = new List<IPAddress>();
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up || ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    foreach (IPAddress ip in ni.GetIPProperties().DnsAddresses)
+                        if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !list.Contains(ip)) list.Add(ip);
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        public static List<IPAddress> Gateways()
+        {
+            List<IPAddress> list = new List<IPAddress>();
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    foreach (GatewayIPAddressInformation g in ni.GetIPProperties().GatewayAddresses)
+                        if (g.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
+                            !g.Address.Equals(IPAddress.Any) && !list.Contains(g.Address)) list.Add(g.Address);
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        /// <summary>Reihenfolge der befragten DNS-Server.</summary>
+        public static List<IPAddress> Chain()
+        {
+            List<IPAddress> chain = new List<IPAddress>();
+            string s = Setting;
+            if (s != Auto) chain.AddRange(ParseServers(s));
+            foreach (IPAddress ip in SystemServers()) if (!chain.Contains(ip)) chain.Add(ip);
+            foreach (IPAddress ip in Gateways()) if (!chain.Contains(ip)) chain.Add(ip);
+            return chain;
+        }
+
+        /// <summary>DNS-Name zu einer IP. source = welcher Server geantwortet hat. "" wenn unbekannt.</summary>
+        public static string ReverseLookup(IPAddress ip, out string source)
+        {
+            source = "";
+            string rev = DnsClient.ReverseName(ip);
+            foreach (IPAddress server in Chain())
+            {
+                int rcode;
+                List<DnsClient.Answer> a = DnsClient.Query(server, 53, rev, DnsClient.TypePtr, 1000, out rcode);
+                if (a == null) continue;
+                foreach (DnsClient.Answer x in a)
+                    if (x.Type == DnsClient.TypePtr && x.Data.Length > 0) { source = server.ToString(); return x.Data; }
+            }
+            string name = NetTools.GetHostName(ip, 1500);
+            if (name.Length > 0) source = "Windows";
+            return name;
+        }
+
+        /// <summary>IPv4-Adresse zu einem Namen. null wenn nicht auflösbar.</summary>
+        public static IPAddress Lookup(string host, out string source)
+        {
+            source = "";
+            IPAddress ip;
+            if (IPAddress.TryParse(host, out ip)) return ip;
+            foreach (IPAddress server in Chain())
+            {
+                int rcode;
+                List<DnsClient.Answer> a = DnsClient.Query(server, 53, host, DnsClient.TypeA, 1000, out rcode);
+                if (a == null) continue;
+                foreach (DnsClient.Answer x in a)
+                    if (x.Type == DnsClient.TypeA && IPAddress.TryParse(x.Data, out ip)) { source = server.ToString(); return ip; }
+            }
+            try
+            {
+                foreach (IPAddress a in Dns.GetHostAddresses(host))
+                    if (a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork) { source = "Windows"; return a; }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>Für die Pings: Ergebnis 60 s zwischenspeichern; bei DNS-Fehler die letzte bekannte IP verwenden.</summary>
+        public static IPAddress ResolveForPing(string host)
+        {
+            IPAddress ip;
+            if (IPAddress.TryParse(host, out ip)) return ip;
+            KeyValuePair<IPAddress, DateTime> c;
+            lock (sync)
+                if (hostCache.TryGetValue(host, out c) && c.Value > DateTime.UtcNow) return c.Key;
+            string src;
+            ip = Lookup(host, out src);
+            lock (sync)
+            {
+                if (ip == null) return hostCache.TryGetValue(host, out c) ? c.Key : null;
+                hostCache[host] = new KeyValuePair<IPAddress, DateTime>(ip, DateTime.UtcNow.AddSeconds(60));
+            }
+            return ip;
+        }
+    }
+
+    /// <summary>NetBIOS-Namensabfrage (NBSTAT, UDP 137): Rechnername, Arbeitsgruppe, MAC.</summary>
+    static class NetBios
+    {
+        public static bool Query(IPAddress ip, int timeoutMs, out string name, out string group, out string mac)
+        {
+            name = ""; group = ""; mac = "";
+            byte[] req = new byte[50];
+            req[0] = 0x13; req[1] = 0x37; req[5] = 1;
+            req[12] = 0x20;
+            req[13] = (byte)'C'; req[14] = (byte)'K';
+            for (int i = 15; i < 45; i++) req[i] = (byte)'A';
+            req[46] = 0x00; req[47] = 0x21; req[48] = 0x00; req[49] = 0x01;
+            byte[] resp;
+            try
+            {
+                using (System.Net.Sockets.UdpClient u = new System.Net.Sockets.UdpClient())
+                {
+                    u.Client.ReceiveTimeout = timeoutMs;
+                    u.Send(req, req.Length, new IPEndPoint(ip, 137));
+                    IPEndPoint from = null;
+                    resp = u.Receive(ref from);
+                }
+            }
+            catch (System.Net.Sockets.SocketException) { return false; }
+
+            try
+            {
+                int count = resp[56];
+                int pos = 57;
+                for (int i = 0; i < count; i++, pos += 18)
+                {
+                    string n = Encoding.ASCII.GetString(resp, pos, 15).Trim().TrimEnd('\0');
+                    byte suffix = resp[pos + 15];
+                    bool isGroup = (resp[pos + 16] & 0x80) != 0;
+                    if (suffix == 0x00 && !isGroup && name.Length == 0) name = n;
+                    if (suffix == 0x00 && isGroup && group.Length == 0) group = n;
+                }
+                if (pos + 6 <= resp.Length)
+                {
+                    string m = BitConverter.ToString(resp, pos, 6);
+                    if (m != "00-00-00-00-00-00") mac = m;
+                }
+            }
+            catch (ArgumentException) { }
+            catch (IndexOutOfRangeException) { }
+            return name.Length > 0;
+        }
+    }
+
+    /// <summary>SNMP v2c GET für Systembeschreibung, -name und -standort (UDP 161).</summary>
+    static class Snmp
+    {
+        public const string SysDescr = "1.3.6.1.2.1.1.1.0", SysName = "1.3.6.1.2.1.1.5.0", SysLocation = "1.3.6.1.2.1.1.6.0";
+
+        public static Dictionary<string, string> Get(IPAddress ip, string community, int timeoutMs, params string[] oids)
+        {
+            Dictionary<string, string> result = new Dictionary<string, string>();
+            List<byte> binds = new List<byte>();
+            foreach (string oid in oids) binds.AddRange(Tlv(0x30, Concat(Tlv(0x06, EncodeOid(oid)), new byte[] { 0x05, 0x00 })));
+            byte[] pdu = Tlv(0xA0, Concat(Tlv(0x02, new byte[] { 0x01, 0x23 }), Tlv(0x02, new byte[] { 0 }), Tlv(0x02, new byte[] { 0 }),
+                                          Tlv(0x30, binds.ToArray())));
+            byte[] msg = Tlv(0x30, Concat(Tlv(0x02, new byte[] { 1 }), Tlv(0x04, Encoding.ASCII.GetBytes(community)), pdu));
+            byte[] resp;
+            try
+            {
+                using (System.Net.Sockets.UdpClient u = new System.Net.Sockets.UdpClient())
+                {
+                    u.Client.ReceiveTimeout = timeoutMs;
+                    u.Send(msg, msg.Length, new IPEndPoint(ip, 161));
+                    IPEndPoint from = null;
+                    resp = u.Receive(ref from);
+                }
+            }
+            catch (System.Net.Sockets.SocketException) { return result; }
+            try { Walk(resp, 0, resp.Length, result); }
+            catch (IndexOutOfRangeException) { }
+            return result;
+        }
+
+        // Sucht rekursiv nach Varbinds (SEQUENCE aus OID und Wert).
+        static void Walk(byte[] b, int start, int end, Dictionary<string, string> result)
+        {
+            int pos = start;
+            while (pos < end)
+            {
+                int tag = b[pos];
+                int len, hdr;
+                ReadLen(b, pos + 1, out len, out hdr);
+                int content = pos + 1 + hdr;
+                if (tag == 0x30 && content < end && b[content] == 0x06)
+                {
+                    int olen, ohdr;
+                    ReadLen(b, content + 1, out olen, out ohdr);
+                    string oid = DecodeOid(b, content + 1 + ohdr, olen);
+                    int vpos = content + 1 + ohdr + olen;
+                    if (vpos < content + len && b[vpos] == 0x04)
+                    {
+                        int vlen, vhdr;
+                        ReadLen(b, vpos + 1, out vlen, out vhdr);
+                        string v = Encoding.UTF8.GetString(b, vpos + 1 + vhdr, vlen).Replace('\0', ' ').Trim();
+                        if (v.Length > 0) result[oid] = v;
+                    }
+                }
+                else if ((tag & 0x20) != 0)
+                    Walk(b, content, content + len, result);
+                pos = content + len;
+            }
+        }
+
+        static void ReadLen(byte[] b, int pos, out int len, out int hdr)
+        {
+            if (b[pos] < 0x80) { len = b[pos]; hdr = 1; return; }
+            int n = b[pos] & 0x7F;
+            len = 0;
+            for (int i = 0; i < n; i++) len = (len << 8) | b[pos + 1 + i];
+            hdr = 1 + n;
+        }
+
+        static byte[] Tlv(byte tag, byte[] content)
+        {
+            List<byte> r = new List<byte>();
+            r.Add(tag);
+            int l = content.Length;
+            if (l < 0x80) r.Add((byte)l);
+            else if (l < 0x100) { r.Add(0x81); r.Add((byte)l); }
+            else { r.Add(0x82); r.Add((byte)(l >> 8)); r.Add((byte)l); }
+            r.AddRange(content);
+            return r.ToArray();
+        }
+
+        static byte[] Concat(params byte[][] parts)
+        {
+            List<byte> r = new List<byte>();
+            foreach (byte[] p in parts) r.AddRange(p);
+            return r.ToArray();
+        }
+
+        static byte[] EncodeOid(string oid)
+        {
+            string[] p = oid.Split('.');
+            List<byte> r = new List<byte>();
+            r.Add((byte)(int.Parse(p[0]) * 40 + int.Parse(p[1])));
+            for (int i = 2; i < p.Length; i++)
+            {
+                uint v = uint.Parse(p[i]);
+                List<byte> chunk = new List<byte>();
+                chunk.Insert(0, (byte)(v & 0x7F));
+                while ((v >>= 7) > 0) chunk.Insert(0, (byte)(0x80 | (v & 0x7F)));
+                r.AddRange(chunk);
+            }
+            return r.ToArray();
+        }
+
+        static string DecodeOid(byte[] b, int pos, int len)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append(b[pos] / 40).Append('.').Append(b[pos] % 40);
+            uint v = 0;
+            for (int i = pos + 1; i < pos + len; i++)
+            {
+                v = (v << 7) | (uint)(b[i] & 0x7F);
+                if ((b[i] & 0x80) == 0) { sb.Append('.').Append(v); v = 0; }
+            }
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>Alles, was sich über ein Gerät herausfinden lässt.</summary>
+    class DeviceInfo
+    {
+        public string DnsName = "", DnsSource = "";
+        public string NetBiosName = "", NetBiosGroup = "", NetBiosMac = "";
+        public string MdnsName = "";
+        public string SnmpName = "", SnmpDescr = "", SnmpLocation = "";
+        public string WebTitle = "", WebServer = "";
+        public string OsGuess = "";
+
+        /// <summary>Betriebssystem grob anhand der TTL der Ping-Antwort schätzen.</summary>
+        public static string GuessOs(int ttl)
+        {
+            if (ttl <= 0) return "";
+            if (ttl <= 64) return "vermutl. Linux/Unix/macOS/Android/IoT";
+            if (ttl <= 128) return "vermutl. Windows";
+            return "vermutl. Netzwerkgerät (Router/Switch/Drucker)";
+        }
+
+        public string DnsDisplay { get { return DnsName.Length > 0 ? DnsName : "-"; } }
+        public string NetBiosDisplay
+        {
+            get { return NetBiosName.Length == 0 ? "-" : NetBiosName + (NetBiosGroup.Length > 0 ? " (" + NetBiosGroup + ")" : ""); }
+        }
+
+        /// <summary>Kurzfassung für die Tabelle.</summary>
+        public string Summary
+        {
+            get
+            {
+                List<string> parts = new List<string>();
+                if (SnmpName.Length > 0) parts.Add("SNMP: " + SnmpName);
+                if (SnmpDescr.Length > 0) parts.Add(Short(SnmpDescr, 70));
+                if (MdnsName.Length > 0) parts.Add("mDNS: " + MdnsName);
+                if (WebTitle.Length > 0) parts.Add("Web: " + Short(WebTitle, 50));
+                else if (WebServer.Length > 0) parts.Add("Web: " + Short(WebServer, 40));
+                if (OsGuess.Length > 0) parts.Add(OsGuess);
+                return string.Join(" | ", parts.ToArray());
+            }
+        }
+
+        /// <summary>Ausführliche Fassung (Tooltip / Detailfenster).</summary>
+        public string Details
+        {
+            get
+            {
+                StringBuilder sb = new StringBuilder();
+                Line(sb, "DNS-Name", DnsName.Length > 0 ? DnsName + "  (Quelle: " + DnsSource + ")" : "-");
+                Line(sb, "NetBIOS", NetBiosDisplay);
+                Line(sb, "mDNS", MdnsName);
+                Line(sb, "SNMP-Name", SnmpName);
+                Line(sb, "SNMP-Beschreibung", SnmpDescr);
+                Line(sb, "SNMP-Standort", SnmpLocation);
+                Line(sb, "Webseite", WebTitle);
+                Line(sb, "Webserver", WebServer);
+                Line(sb, "Betriebssystem", OsGuess);
+                return sb.ToString().TrimEnd();
+            }
+        }
+
+        static void Line(StringBuilder sb, string label, string value)
+        {
+            if (!string.IsNullOrEmpty(value)) sb.AppendLine(label + ": " + value);
+        }
+
+        static string Short(string s, int max)
+        {
+            s = s.Replace("\r", " ").Replace("\n", " ");
+            return s.Length <= max ? s : s.Substring(0, max - 1) + "…";
+        }
+
+        /// <summary>Fragt alle Quellen parallel ab (dauert höchstens ca. 4 Sekunden).</summary>
+        public static DeviceInfo Gather(IPAddress ip, int ttl, bool extended, string snmpCommunity)
+        {
+            DeviceInfo d = new DeviceInfo();
+            d.OsGuess = GuessOs(ttl);
+            List<Thread> jobs = new List<Thread>();
+            jobs.Add(new Thread(delegate () { string src; d.DnsName = Resolver.ReverseLookup(ip, out src); d.DnsSource = src; }));
+            if (extended)
+            {
+                jobs.Add(new Thread(delegate ()
+                {
+                    string n, g, m;
+                    if (NetBios.Query(ip, 1000, out n, out g, out m)) { d.NetBiosName = n; d.NetBiosGroup = g; d.NetBiosMac = m; }
+                }));
+                jobs.Add(new Thread(delegate ()
+                {
+                    int rc;
+                    List<DnsClient.Answer> a = DnsClient.Query(ip, 5353, DnsClient.ReverseName(ip), DnsClient.TypePtr, 1000, out rc);
+                    if (a != null)
+                        foreach (DnsClient.Answer x in a)
+                            if (x.Type == DnsClient.TypePtr) { d.MdnsName = x.Data; break; }
+                }));
+                jobs.Add(new Thread(delegate ()
+                {
+                    Dictionary<string, string> s = Snmp.Get(ip, snmpCommunity, 1000, Snmp.SysName, Snmp.SysDescr, Snmp.SysLocation);
+                    string v;
+                    if (s.TryGetValue(Snmp.SysName, out v)) d.SnmpName = v;
+                    if (s.TryGetValue(Snmp.SysDescr, out v)) d.SnmpDescr = v;
+                    if (s.TryGetValue(Snmp.SysLocation, out v)) d.SnmpLocation = v;
+                }));
+                jobs.Add(new Thread(delegate () { WebInfo(d, "http://" + ip + "/"); }));
+                jobs.Add(new Thread(delegate () { WebInfo(d, "https://" + ip + "/"); }));
+            }
+            foreach (Thread t in jobs) { t.IsBackground = true; t.Start(); }
+            DateTime end = DateTime.UtcNow.AddSeconds(4);
+            foreach (Thread t in jobs)
+            {
+                TimeSpan left = end - DateTime.UtcNow;
+                if (left > TimeSpan.Zero) t.Join(left);
+            }
+            return d;
+        }
+
+        static void WebInfo(DeviceInfo d, string url)
+        {
+            try
+            {
+                ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+                req.Timeout = 2500;
+                req.ReadWriteTimeout = 2500;
+                req.Proxy = null;
+                req.UserAgent = "Mozilla/5.0 PingMonitor";
+                req.MaximumAutomaticRedirections = 3;
+                // Nur zum Auslesen des Seitentitels: selbstsignierte Zertifikate von Routern/Switches akzeptieren.
+                req.ServerCertificateValidationCallback = delegate { return true; };
+                HttpWebResponse resp;
+                try { resp = (HttpWebResponse)req.GetResponse(); }
+                catch (WebException ex)
+                {
+                    resp = ex.Response as HttpWebResponse;
+                    if (resp == null) return;
+                }
+                using (resp)
+                {
+                    string server = resp.Headers["Server"] ?? "";
+                    string title = "";
+                    using (Stream s = resp.GetResponseStream())
+                    {
+                        byte[] buf = new byte[65536];
+                        int total = 0, n;
+                        while (total < buf.Length && (n = s.Read(buf, total, buf.Length - total)) > 0) total += n;
+                        string html = Encoding.UTF8.GetString(buf, 0, total);
+                        System.Text.RegularExpressions.Match m = System.Text.RegularExpressions.Regex.Match(html,
+                            @"<title[^>]*>\s*(.*?)\s*</title>", System.Text.RegularExpressions.RegexOptions.IgnoreCase |
+                            System.Text.RegularExpressions.RegexOptions.Singleline);
+                        if (m.Success) title = WebUtility.HtmlDecode(m.Groups[1].Value).Replace("\r", " ").Replace("\n", " ").Trim();
+                    }
+                    if ((int)resp.StatusCode == 401 && title.Length == 0) title = "(Anmeldung erforderlich)";
+                    lock (d)
+                    {
+                        if (d.WebTitle.Length == 0 && title.Length > 0) d.WebTitle = title;
+                        if (d.WebServer.Length == 0 && server.Length > 0) d.WebServer = server;
+                    }
+                }
+            }
+            catch { }
         }
     }
 }

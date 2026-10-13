@@ -40,6 +40,29 @@ Schaltfläche "Netzwerk scannen ..." in der App.
 - Auch bei manuell hinzugefügten Geräten werden MAC und Hersteller automatisch ermittelt
   (sofern im eigenen Subnetz).
 
+Namensauflösung und Geräteinfos
+-------------------------------
+- DNS-Server (Hauptfenster): "Automatisch" nutzt die DNS-Server aus den Windows-Netzwerkeinstellungen.
+  Zur Auswahl stehen außerdem das Gateway/die Firewall, Google, Cloudflare, Quad9 - oder eigene
+  Adressen eintippen (mehrere mit Komma). Gilt für App, Dienst und Scanner.
+- Kennt der gewählte Server einen Namen nicht oder antwortet nicht, werden automatisch nacheinander
+  die Windows-DNS-Server, das Gateway und zuletzt die Windows-Namensauflösung (Hosts-Datei, LLMNR,
+  NetBIOS) gefragt. Findet niemand einen Namen, steht "-" in der Spalte.
+  Hinweis: Öffentliche DNS-Server (Google & Co.) kennen keine internen Namen - dafür die Firewall
+  bzw. den internen DNS-Server wählen.
+- "DNS testen" zeigt für jeden Server, ob er antwortet, wie schnell, und ob er interne Namen kennt.
+- Geräteinfos (Scanner und "Geräteinfo abrufen"): Es wird alles abgefragt, was das Gerät verrät:
+    DNS-Name     über die DNS-Server oben
+    NetBIOS      Windows-Rechnername + Arbeitsgruppe (UDP 137), liefert auch die MAC über Router hinweg
+    mDNS         Bonjour-Name (z. B. Drucker, Apple-Geräte, NAS, IoT)
+    SNMP         Gerätename, Beschreibung (Modell/Firmware), Standort - Switches, Drucker, USV, APs
+                 (Community "public"; andere in settings.txt: SNMP.Community=...)
+    Webseite     Titel der Weboberfläche und Webserver-Kennung (http und https)
+    TTL          grobe Schätzung des Betriebssystems (Windows / Linux / Netzwerkgerät)
+  Doppelklick auf ein Gerät bzw. Maus über der Zeile zeigt alle Infos.
+- Kommentar: Spalte "Kommentar" in der Geräteliste (und im Scanner) anklicken und lostippen,
+  z. B. "Router", "WLAN-AP Flur". Wird in hosts.txt gespeichert.
+
 Windows-Dienst (optional)
 -------------------------
 - In der App: "Dienst installieren" (Windows fragt nach Administratorrechten).
@@ -105,8 +128,8 @@ Protokoll
 
 Dateien
 -------
-hosts.txt          Geräteliste (Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller)
-settings.txt       Einstellungen inkl. Benachrichtigungen
+hosts.txt          Geräteliste (Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller;Kommentar;DNS-Name;NetBIOS;Geräteinfo)
+settings.txt       Einstellungen inkl. Benachrichtigungen, DNS-Server, SNMP-Community
 Logs\              Ausfallprotokolle
 oui.csv            aktualisierte Herstellerliste (optional, sonst eingebaute Liste)
 Dienst_Status.csv  aktueller Status des Dienstes (für die Anzeige in der App)
