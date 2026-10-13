@@ -5060,6 +5060,9 @@ namespace PingMonitor
             AcceptButton = add;
             input.Controls.Add(Btn("Entfernen", delegate { RemoveSwitch(); }));
             input.Controls.Add(Btn("Jetzt abfragen", delegate { PollNow(); }));
+            Button discover = Btn("Switches suchen ...", delegate { Discover(); });
+            discover.Font = new Font(Font, FontStyle.Bold);
+            input.Controls.Add(discover);
             input.Controls.Add(Lbl("Abfrage alle"));
             input.Controls.Add(numInterval);
             input.Controls.Add(Lbl("Sekunden"));
@@ -5190,6 +5193,26 @@ namespace PingMonitor
             txtAddress.Clear();
         }
 
+        void Discover()
+        {
+            List<SwitchState> list = SwitchMonitor.LoadConfig();
+            HashSet<string> known = new HashSet<string>();
+            List<string> comms = new List<string>();
+            foreach (SwitchState s in list)
+            {
+                known.Add(s.Address);
+                if (!comms.Contains(s.Community)) comms.Add(s.Community);
+            }
+            if (txtCommunity.Text.Trim().Length > 0 && !comms.Contains(txtCommunity.Text.Trim())) comms.Add(txtCommunity.Text.Trim());
+            using (SwitchDiscoverForm f = new SwitchDiscoverForm(known, comms))
+            {
+                if (f.ShowDialog(this) != DialogResult.OK || f.Chosen.Count == 0) return;
+                foreach (SwitchState s in f.Chosen)
+                    if (!known.Contains(s.Address)) list.Add(s);
+                Save(list);
+            }
+        }
+
         void RemoveSwitch()
         {
             if (gridSwitches.SelectedRows.Count == 0) return;
@@ -5278,6 +5301,316 @@ namespace PingMonitor
             lblSummary.Text = shown + " Ports angezeigt   ·   " + prob + " Probleme   ·   " + warn + " Warnungen" +
                 (svc ? "   ·   Daten vom Windows-Dienst" : SwitchMonitor.Running ? "   ·   Abfrage durch die App" : "");
             lblSummary.ForeColor = prob > 0 ? Color.DarkRed : warn > 0 ? Color.DarkOrange : Color.DarkGreen;
+        }
+    }
+
+    /// <summary>Sucht SNMP-fähige Geräte in einem Bereich und erkennt, welche davon Switches sind.</summary>
+    class SwitchDiscoverForm : Form
+    {
+        const string SysServices = "1.3.6.1.2.1.1.7.0", IfNumber = "1.3.6.1.2.1.2.1.0",
+                     BridgePorts = "1.3.6.1.2.1.17.1.2.0", PrinterName = "1.3.6.1.2.1.43.5.1.1.16.1";
+
+        class Found
+        {
+            public IPAddress Ip;
+            public string Community = "", SysName = "", SysDescr = "", Type = "";
+            public long Interfaces, Bridge;
+        }
+
+        readonly List<NetTools.Subnet> subnets = NetTools.LocalSubnets();
+        readonly HashSet<string> configured;
+        public readonly List<SwitchState> Chosen = new List<SwitchState>();
+
+        ComboBox cboRange;
+        TextBox txtCommunities;
+        Button btnSearch, btnTake;
+        ProgressBar progress;
+        Label lblStatus;
+        DataGridView grid;
+        System.Windows.Forms.Timer uiTimer;
+        volatile bool cancel;
+        int done, total, found, running;
+
+        public SwitchDiscoverForm(HashSet<string> alreadyConfigured, IEnumerable<string> knownCommunities)
+        {
+            configured = alreadyConfigured;
+            Text = "Switches suchen";
+            Font = new Font("Segoe UI", 9F);
+            Size = new Size(1100, 600);
+            MinimumSize = new Size(800, 400);
+            StartPosition = FormStartPosition.CenterParent;
+
+            FlowLayoutPanel top = new FlowLayoutPanel();
+            top.Dock = DockStyle.Top;
+            top.AutoSize = true;
+            top.Padding = new Padding(6);
+            cboRange = new ComboBox();
+            cboRange.Width = 300;
+            foreach (NetTools.Subnet s in subnets) cboRange.Items.Add(s.ToString());
+            if (cboRange.Items.Count > 0) cboRange.SelectedIndex = 0; else cboRange.Text = "192.168.1.0/24";
+            List<string> comms = new List<string>();
+            comms.Add("public");
+            foreach (string c in knownCommunities) if (!comms.Contains(c)) comms.Add(c);
+            txtCommunities = new TextBox();
+            txtCommunities.Width = 220;
+            txtCommunities.Text = string.Join(", ", comms.ToArray());
+            btnSearch = new Button();
+            btnSearch.Text = "Suchen";
+            btnSearch.AutoSize = true;
+            btnSearch.Click += delegate { if (running > 0) cancel = true; else Search(); };
+            top.Controls.Add(Lbl("Bereich:"));
+            top.Controls.Add(cboRange);
+            top.Controls.Add(Lbl("SNMP-Communities:"));
+            top.Controls.Add(txtCommunities);
+            top.Controls.Add(btnSearch);
+            Label hint = Lbl("Jede Adresse wird per SNMP (v2c) mit den angegebenen Communities gefragt (mehrere mit Komma trennen). " +
+                             "Ping ist nicht nötig. Erkannte Switches sind vorausgewählt.");
+            hint.ForeColor = SystemColors.GrayText;
+            top.SetFlowBreak(btnSearch, true);
+            top.Controls.Add(hint);
+
+            Panel prog = new Panel();
+            prog.Dock = DockStyle.Top;
+            prog.Height = 28;
+            prog.Padding = new Padding(8, 4, 8, 4);
+            progress = new ProgressBar();
+            progress.Dock = DockStyle.Left;
+            progress.Width = 260;
+            lblStatus = new Label();
+            lblStatus.Dock = DockStyle.Fill;
+            lblStatus.TextAlign = ContentAlignment.MiddleLeft;
+            lblStatus.Padding = new Padding(8, 0, 0, 0);
+            prog.Controls.Add(lblStatus);
+            prog.Controls.Add(progress);
+
+            grid = new DataGridView();
+            grid.Dock = DockStyle.Fill;
+            grid.AllowUserToAddRows = false;
+            grid.AllowUserToDeleteRows = false;
+            grid.RowHeadersVisible = false;
+            grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            grid.BackgroundColor = SystemColors.Window;
+            grid.ShowCellToolTips = true;
+            DataGridViewCheckBoxColumn chk = new DataGridViewCheckBoxColumn();
+            chk.Name = "Take"; chk.HeaderText = "Übernehmen"; chk.FillWeight = 40;
+            grid.Columns.Add(chk);
+            Col("Name", "Name", 90, false);
+            Col("Ip", "IP-Adresse", 60, true);
+            Col("Community", "Community", 50, true);
+            Col("Type", "Typ", 60, true);
+            Col("Ports", "Ports", 30, true);
+            Col("Descr", "Gerät (SNMP-Beschreibung)", 260, true);
+            Col("Note", "Hinweis", 70, true);
+            DataGridViewTextBoxColumn key = new DataGridViewTextBoxColumn();
+            key.Name = "Key"; key.Visible = false; key.ValueType = typeof(long);
+            grid.Columns.Add(key);
+            grid.CurrentCellDirtyStateChanged += delegate { if (grid.IsCurrentCellDirty) grid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
+            grid.SortCompare += delegate (object sender, DataGridViewSortCompareEventArgs e)
+            {
+                if (e.Column.Name != "Ip") return;
+                e.SortResult = ((long)grid.Rows[e.RowIndex1].Cells["Key"].Value).CompareTo((long)grid.Rows[e.RowIndex2].Cells["Key"].Value);
+                e.Handled = true;
+            };
+
+            FlowLayoutPanel bottom = new FlowLayoutPanel();
+            bottom.Dock = DockStyle.Bottom;
+            bottom.AutoSize = true;
+            bottom.Padding = new Padding(6);
+            btnTake = new Button();
+            btnTake.Text = "Ausgewählte übernehmen";
+            btnTake.AutoSize = true;
+            btnTake.Font = new Font(Font, FontStyle.Bold);
+            btnTake.Click += delegate { Take(); };
+            Button close = new Button();
+            close.Text = "Schließen";
+            close.AutoSize = true;
+            close.Click += delegate { Close(); };
+            bottom.Controls.Add(btnTake);
+            bottom.Controls.Add(close);
+            CancelButton = close;
+
+            Controls.Add(grid);
+            Controls.Add(bottom);
+            Controls.Add(prog);
+            Controls.Add(top);
+
+            uiTimer = new System.Windows.Forms.Timer();
+            uiTimer.Interval = 200;
+            uiTimer.Tick += delegate
+            {
+                progress.Value = Math.Min(progress.Maximum, done);
+                if (running > 0) lblStatus.Text = "Suche ... " + done + " / " + total + " Adressen, " + found + " SNMP-Geräte gefunden";
+            };
+            FormClosing += delegate { cancel = true; uiTimer.Stop(); };
+        }
+
+        static Label Lbl(string t)
+        {
+            Label l = new Label(); l.Text = t; l.AutoSize = true; l.Margin = new Padding(6, 7, 0, 3);
+            return l;
+        }
+
+        void Col(string name, string header, int weight, bool readOnly)
+        {
+            DataGridViewTextBoxColumn c = new DataGridViewTextBoxColumn();
+            c.Name = name; c.HeaderText = header; c.FillWeight = weight; c.ReadOnly = readOnly;
+            grid.Columns.Add(c);
+        }
+
+        void Search()
+        {
+            List<IPAddress> addresses;
+            try { addresses = NetTools.ParseRange(cboRange.Text); }
+            catch (FormatException ex)
+            {
+                MessageBox.Show(this, ex.Message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            List<string> comms = new List<string>();
+            foreach (string c in txtCommunities.Text.Split(new char[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+                if (c.Trim().Length > 0 && !comms.Contains(c.Trim())) comms.Add(c.Trim());
+            if (addresses.Count == 0 || comms.Count == 0) return;
+            if (addresses.Count > 4096 &&
+                MessageBox.Show(this, addresses.Count.ToString("N0") + " Adressen durchsuchen? Das kann einige Minuten dauern.", Text,
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                return;
+
+            grid.Rows.Clear();
+            cancel = false;
+            done = 0; found = 0; total = addresses.Count;
+            DateTime started = DateTime.Now;
+            progress.Maximum = total;
+            progress.Value = 0;
+            btnSearch.Text = "Abbrechen";
+            cboRange.Enabled = txtCommunities.Enabled = false;
+            uiTimer.Start();
+
+            int next = -1;
+            int threads = Math.Min(64, total);
+            running = threads;
+            for (int i = 0; i < threads; i++)
+            {
+                Thread th = new Thread(delegate ()
+                {
+                    int idx;
+                    while (!cancel && (idx = Interlocked.Increment(ref next)) < addresses.Count)
+                    {
+                        Found f = Probe(addresses[idx], comms);
+                        Interlocked.Increment(ref done);
+                        if (f == null) continue;
+                        Interlocked.Increment(ref found);
+                        try { BeginInvoke(new Action(delegate { AddRow(f); })); } catch (InvalidOperationException) { }
+                    }
+                    if (Interlocked.Decrement(ref running) == 0)
+                        try
+                        {
+                            BeginInvoke(new Action(delegate
+                            {
+                                uiTimer.Stop();
+                                progress.Value = Math.Min(progress.Maximum, done);
+                                btnSearch.Text = "Suchen";
+                                cboRange.Enabled = txtCommunities.Enabled = true;
+                                grid.Sort(grid.Columns["Ip"], System.ComponentModel.ListSortDirection.Ascending);
+                                int switches = 0;
+                                foreach (DataGridViewRow r in grid.Rows) if (Convert.ToString(r.Cells["Type"].Value) == "Switch") switches++;
+                                lblStatus.Text = (cancel ? "Abgebrochen" : "Fertig") + ": " + found + " SNMP-Geräte, davon " + switches +
+                                    " Switches (" + (int)(DateTime.Now - started).TotalSeconds + " s)." +
+                                    (found == 0 ? "  Keine Antwort: SNMP aktiviert? Community richtig? Firewall (UDP 161)?" : "");
+                            }));
+                        }
+                        catch (InvalidOperationException) { }
+                });
+                th.IsBackground = true;
+                th.Start();
+            }
+        }
+
+        static Found Probe(IPAddress ip, List<string> communities)
+        {
+            foreach (string c in communities)
+            {
+                Dictionary<string, SnmpValue> v = Snmp.GetValues(ip, c, 800, Snmp.SysDescr, Snmp.SysName, SysServices, IfNumber, BridgePorts, PrinterName);
+                if (v.Count == 0) continue;
+                Found f = new Found();
+                f.Ip = ip;
+                f.Community = c;
+                SnmpValue x;
+                if (v.TryGetValue(Snmp.SysDescr, out x)) f.SysDescr = x.Text.Replace("\r", " ").Replace("\n", " ");
+                if (v.TryGetValue(Snmp.SysName, out x)) f.SysName = x.Text;
+                if (v.TryGetValue(IfNumber, out x)) f.Interfaces = x.Number;
+                if (v.TryGetValue(BridgePorts, out x)) f.Bridge = x.Number;
+                long services = v.TryGetValue(SysServices, out x) ? x.Number : 0;
+                f.Type = Classify(f.SysDescr + " " + f.SysName, services, f.Interfaces, f.Bridge, v.ContainsKey(PrinterName));
+                return f;
+            }
+            return null;
+        }
+
+        static bool Has(string text, params string[] words)
+        {
+            foreach (string w in words) if (text.Contains(w)) return true;
+            return false;
+        }
+
+        /// <summary>Ordnet ein SNMP-Gerät grob einem Typ zu (Hersteller-Kennungen, Bridge-Ports, Drucker-MIB).</summary>
+        static string Classify(string text, long services, long interfaces, long bridgePorts, bool printerMib)
+        {
+            string d = " " + text.ToLowerInvariant() + " ";
+            if (printerMib || Has(d, "printer", "laserjet", "officejet", "brother", "kyocera", "ricoh", "lexmark", "xerox", "canon", "epson", "konica"))
+                return "Drucker";
+            if (Has(d, " uap", "u6-", "u7-", "uap-", "access point", " eap", "unifi ap", "aironet", "instant on ap"))
+                return "Access Point";
+            if (Has(d, "switch", "usw", " us-8", " us-16", " us-24", " us-48", "jetstream", "tl-sg", "tl-sx", "t1600", "t2600", "procurve",
+                       "aruba", "catalyst", "comware", "edgeswitch", "gs108", "gs110", "gs3", "gs7", "m4300", "sg350", "sg300", "cbs", "dgs-", "crs3"))
+                return "Switch";
+            if (Has(d, "router", "firewall", "fortigate", "pfsense", "opnsense", " usg", "udm", "gateway", "mikrotik", "routeros", "lancom", "draytek", "sophos", "fritz"))
+                return "Router / Firewall";
+            if (bridgePorts >= 5) return "Switch";
+            if (Has(d, "windows", "linux", "synology", "qnap", "freebsd", "vmware", "esxi", "diskstation"))
+                return "Server / NAS";
+            if ((services & 0x02) != 0 && interfaces >= 5) return "Switch";
+            return "Sonstiges";
+        }
+
+        void AddRow(Found f)
+        {
+            if (IsDisposed) return;
+            bool known = configured.Contains(f.Ip.ToString());
+            bool isSwitch = f.Type == "Switch";
+            string ports = f.Bridge > 0 ? f.Bridge.ToString() : f.Interfaces > 0 ? f.Interfaces.ToString() : "";
+            int i = grid.Rows.Add(!known && isSwitch, f.SysName.Length > 0 ? f.SysName : f.Ip.ToString(), f.Ip.ToString(), f.Community,
+                f.Type, ports, f.SysDescr, known ? "bereits eingetragen" : "", (long)NetTools.ToUInt(f.Ip));
+            DataGridViewRow row = grid.Rows[i];
+            row.Cells["Descr"].ToolTipText = f.SysDescr;
+            if (known)
+            {
+                row.DefaultCellStyle.ForeColor = SystemColors.GrayText;
+                row.Cells["Take"].ReadOnly = true;
+            }
+            else if (isSwitch) row.DefaultCellStyle.BackColor = Color.FromArgb(225, 245, 225);
+        }
+
+        void Take()
+        {
+            grid.EndEdit();
+            foreach (DataGridViewRow r in grid.Rows)
+            {
+                if (!(r.Cells["Take"].Value is bool) || !(bool)r.Cells["Take"].Value || r.Cells["Take"].ReadOnly) continue;
+                SwitchState s = new SwitchState();
+                s.Name = Convert.ToString(r.Cells["Name"].Value).Trim();
+                s.Address = Convert.ToString(r.Cells["Ip"].Value);
+                s.Community = Convert.ToString(r.Cells["Community"].Value);
+                if (s.Name.Length == 0) s.Name = s.Address;
+                Chosen.Add(s);
+            }
+            if (Chosen.Count == 0)
+            {
+                MessageBox.Show(this, "Bitte in der Spalte \"Übernehmen\" mindestens ein Gerät anhaken.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            cancel = true;
+            DialogResult = DialogResult.OK;
         }
     }
 }

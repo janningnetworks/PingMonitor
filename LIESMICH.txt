@@ -78,6 +78,12 @@ Spalte "Leitungsqualität" in der Geräteliste. Bewertet werden die letzten 900 
 Netzwerkfehler finden: Switch-Ports per SNMP (Stufe 2)
 -----------------------------------------------------
 Schaltfläche "Switches ...": Switches mit IP-Adresse und SNMP-Community eintragen.
+- Automatisch finden: "Switches suchen ..." fragt jede Adresse eines Bereichs (Vorschlag: eigenes Subnetz)
+  per SNMP mit den angegebenen Communities (z. B. "public, firma123"). Ping ist nicht nötig.
+  Gefundene Geräte werden eingeordnet (Switch, Access Point, Router/Firewall, Drucker, Server/NAS) -
+  anhand der SNMP-Beschreibung (UniFi, TP-Link JetStream, HP/Aruba, Netgear, Cisco ...), der Zahl der
+  Bridge-Ports und der Drucker-Kennung. Switches sind vorausgewählt; Name ist direkt änderbar.
+  Bereits eingetragene Switches werden grau angezeigt.
 - Voraussetzung: SNMP v1/v2c (nur lesend) am Switch aktiviert.
     UniFi:  in der UniFi Network-Anwendung in den Einstellungen SNMP aktivieren (je nach Version unter
             "System" bzw. "Dienste") und eine Community vergeben - gilt für alle adoptierten Switches.
