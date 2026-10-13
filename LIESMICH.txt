@@ -63,6 +63,44 @@ Namensauflösung und Geräteinfos
 - Kommentar: Spalte "Kommentar" in der Geräteliste (und im Scanner) anklicken und lostippen,
   z. B. "Router", "WLAN-AP Flur". Wird in hosts.txt gespeichert.
 
+Netzwerkfehler finden: Leitungsqualität (Stufe 1)
+------------------------------------------------
+Spalte "Leitungsqualität" in der Geräteliste. Bewertet werden die letzten 900 Pings je Gerät:
+- Häkchen "Leitungstest mit großen Paketen": Zusätzlich zu jedem erfolgreichen Ping wird ein volles
+  1500-Byte-Paket (nicht fragmentierbar) geschickt. Gehen große Pakete deutlich öfter verloren als
+  kleine, ist das typisch für Bitfehler auf der Leitung (Kabel, Stecker, Dose, SFP, Netzwerkkarte).
+- Erkannt werden außerdem: kurze Totalausfälle (mehrere Pings in Folge weg -> Wackelkontakt, Neustart,
+  PoE), einzelne Verluste (Überlast, WLAN, Bitfehler), stark schwankende Antwortzeiten (Jitter),
+  zu kleine MTU (VPN/DSL, kein Defekt) und blockierte große Pings (Firewall).
+- Ampel: ● OK · ⓘ Hinweis · ▲ Warnung · ✖ Problem. Maus über der Zelle bzw. Doppelklick auf das Gerät
+  zeigt Messwerte, Erklärung, mögliche Ursachen, Vorgehen und Links.
+
+Netzwerkfehler finden: Switch-Ports per SNMP (Stufe 2)
+-----------------------------------------------------
+Schaltfläche "Switches ...": Switches mit IP-Adresse und SNMP-Community eintragen.
+- Voraussetzung: SNMP v1/v2c (nur lesend) am Switch aktiviert.
+    UniFi:  in der UniFi Network-Anwendung in den Einstellungen SNMP aktivieren (je nach Version unter
+            "System" bzw. "Dienste") und eine Community vergeben - gilt für alle adoptierten Switches.
+    TP-Link (nur verwaltete Modelle, z. B. JetStream/"Smart"), HP/Aruba: Weboberfläche -> SNMP.
+    Nicht verwaltete Switches (ohne Weboberfläche) können kein SNMP.
+- Je Port: Link an/aus, Geschwindigkeit, Duplex, Empfangsfehler (CRC), Sendefehler, verworfene Pakete,
+  Link-Wechsel der letzten 24 h mit Uhrzeit, angeschlossenes Gerät (über die MAC-Adresstabelle).
+- Bewertung mit Klartext-Hinweisen, z. B.:
+    CRC-Fehler steigen   -> Patchkabel/Dose/Verlegekabel/SFP/Netzwerkkarte auf genau diesem Weg
+    Link-Wechsel         -> Wackelkontakt, Kabel, SFP, Gerät startet neu, PoE reicht nicht
+    nur 100 Mbit/s       -> bei Gigabit-Geräten: defektes Adernpaar oder altes Kabel
+    Halbduplex           -> Duplex-Fehlanpassung (beide Seiten auf "Automatisch" stellen)
+    Pakete verworfen     -> Überlast, kein Defekt
+  Doppelklick auf einen Port zeigt Erklärung, Vorgehen und Links.
+- Geräte der Liste werden ihrem Switch-Port zugeordnet (Spalte "Switch-Port" im Hauptfenster). Liegt
+  ein Ausfall zeitlich auf einem Link-Wechsel dieses Ports, ist das Kabel/der Port der Verdächtige.
+- Ereignisse (Link DOWN/UP, CRC-Fehler, Switch neu gestartet/nicht erreichbar) stehen im Protokoll
+  (Quelle "Switch"). Optional Benachrichtigung, wenn ein Port als Problem bewertet wird.
+- Läuft der Windows-Dienst, fragt er die Switches rund um die Uhr ab; sonst die App, solange sie offen ist.
+- Abfrage standardmäßig alle 60 Sekunden (einstellbar). Zähler gelten "seit Überwachungsbeginn".
+- Hinweis: Welche Werte ein Switch liefert, hängt vom Modell ab. Fehlende Werte (z. B. Duplex oder
+  CRC-Zähler bei manchen Geräten) werden durch allgemeine Fehlerzähler ersetzt bzw. leer gelassen.
+
 Windows-Dienst (optional)
 -------------------------
 - In der App: "Dienst installieren" (Windows fragt nach Administratorrechten).
@@ -131,5 +169,7 @@ Dateien
 hosts.txt          Geräteliste (Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller;Kommentar;DNS-Name;NetBIOS;Geräteinfo)
 settings.txt       Einstellungen inkl. Benachrichtigungen, DNS-Server, SNMP-Community
 Logs\              Ausfallprotokolle
+switches.txt       Switch-Liste (Name;IP;Community)
+Switch_Status.csv  aktueller Switch-Status des Dienstes (für die Anzeige in der App)
 oui.csv            aktualisierte Herstellerliste (optional, sonst eingebaute Liste)
 Dienst_Status.csv  aktueller Status des Dienstes (für die Anzeige in der App)

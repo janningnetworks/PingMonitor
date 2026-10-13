@@ -10,3 +10,6 @@ Dienst_Status.csv.tmp
 *.zip
 oui.csv
 oui.csv.tmp
+Switch_Status.csv
+Switch_Status.csv.tmp
+switches.txt
