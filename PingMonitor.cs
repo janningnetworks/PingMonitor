@@ -8052,17 +8052,17 @@ namespace PingMonitor
             return true;
         }
 
-        bool Visible(TopoNode n)
+        bool IsShown(TopoNode n)
         {
             if (n.Kind == "internet") return true;
             if (SelfVisible(n)) return true;
-            foreach (TopoNode c in n.Children) if (Visible(c)) return true;
+            foreach (TopoNode c in n.Children) if (IsShown(c)) return true;
             return false;
         }
 
         TreeNode Add(TreeNodeCollection parent, TopoNode n, ref int shown)
         {
-            if (!Visible(n)) return null;
+            if (!IsShown(n)) return null;
             string prefix, main;
             Split(n.Title, out prefix, out main);
             TreeNode node = parent.Add(main + "      ");
