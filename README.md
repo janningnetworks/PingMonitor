@@ -4,6 +4,7 @@ Windows-App (optional als Windows-Dienst), die mehrere Geräte parallel per Ping
 und jeden Ausfall mit Zeitstempel in eine tägliche CSV-Datei protokolliert.
 Mit Netzwerkscanner (wählbarer DNS-Server mit Ausweichservern, NetBIOS/mDNS/SNMP/Web-Geräteinfos, Kommentare, Subnetz/Bereich wählen, MAC-Adresse und Hersteller anzeigen, Geräte zur Überwachung auswählen).
 Fehlersuche im Netzwerk: Leitungsqualität je Gerät (große Pakete, Verlustmuster, Jitter) und Switch-Port-Überwachung per SNMP (CRC-Fehler, Link-Wechsel, Geschwindigkeit/Duplex, Geräte-Port-Zuordnung) mit Klartext-Hinweisen.
+Netzwerkplan (Internet -> Firewall -> Switches -> APs -> Geräte, per LLDP/MAC-Tabellen), WLAN-Erkennung, Suche/Filter, automatische Ausfall-Diagnose (aus / hängt / IP-Konflikt) - ausgeschaltete Geräte zählen nicht als Störung.
 Bei Ausfall und Wiederherstellung kann per Webhook (JSON) und/oder E-Mail (SMTP) benachrichtigt werden.
 
 - Kompilieren: `build.bat` ausführen (nutzt den in Windows enthaltenen .NET-Framework-4.x-Compiler, keine Installation nötig)

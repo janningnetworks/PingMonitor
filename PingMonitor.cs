@@ -77,6 +77,11 @@ namespace PingMonitor
         public string Info = "";         // Kurzfassung der Geräteinfos
         public string InfoDetails = "";  // ausführlich (nur zur Laufzeit)
         public readonly LineQuality Quality = new LineQuality();
+        public string Diagnosis = "";       // Ergebnis der Ausfall-Diagnose (kurz)
+        public string DiagnosisDetails = "";
+        public DeviceLink Link;             // LAN/WLAN-Zuordnung (nur in der Oberfläche)
+        public int QualityLevel = Finding.Unknown;
+        public bool OfflineMode;            // Gerät vermutlich ausgeschaltet - zählt nicht als Störung
         public Assessment ServiceQuality;   // vom Dienst gemeldete Bewertung (nur in der Oberfläche)
 
         public bool Running;
@@ -169,7 +174,7 @@ namespace PingMonitor
                     }
 
                     if (stop.WaitOne(0)) break;
-                    Quality.Add(ok, rtt, largeResult);
+                    if (ok || !OfflineMode) Quality.Add(ok, rtt, largeResult);   // ausgeschaltete Geräte verfälschen die Qualität nicht
                     Action<PingTarget, bool, long, string> handler = PingResult;
                     if (handler != null) handler(this, ok, rtt, info);
                 }
@@ -206,19 +211,82 @@ namespace PingMonitor
         public const string EvOutage = "Ausfall";
         public const string EvFailed = "Ping fehlgeschlagen";
         public const string EvRecovered = "Wieder erreichbar";
+        public const string EvDiagnosis = "Ausfall-Diagnose";
+        public const string EvOffline = "Offline";
+        public const string EvOnline = "Wieder online";
+
+        public static bool IsOfflineVerdict(string verdict)
+        {
+            return verdict.StartsWith("vermutlich aus") || verdict.StartsWith("nicht im Netz");
+        }
+
+        /// <summary>
+        /// Gerät gilt als ausgeschaltet: Die Fehlschläge seit Ausfallbeginn werden aus Statistik und Leitungsqualität
+        /// herausgerechnet, der Ausfall zählt nicht als Störung. Liefert den Protokolleintrag (oder null).
+        /// </summary>
+        public static LogEntry MarkOffline(PingTarget t)
+        {
+            if (t.OfflineMode || !t.OutageStart.HasValue) return null;
+            t.OfflineMode = true;
+            int n = t.FailStreak;
+            t.Lost = Math.Max(0, t.Lost - n);
+            t.Sent = Math.Max(0, t.Sent - n);
+            t.Outages = Math.Max(0, t.Outages - 1);
+            t.Quality.DropTrailingFailures(n);
+            t.Status = "OFFLINE";
+            return Entry(DateTime.Now, t, EvOffline, "Gerät vermutlich ausgeschaltet bzw. vom Netz getrennt (seit " +
+                t.OutageStart.Value.ToString(Fmt.Time) + ") - wird nicht als Störung gewertet. " + t.Diagnosis);
+        }
+
+        /// <summary>Wird ausgelöst, sobald ein Ausfall beginnt (für die automatische Diagnose).</summary>
+        public static event Action<PingTarget, string> OutageStarted;
+
+        /// <summary>
+        /// Diagnose nach 20 Sekunden Ausfall (kurze Aussetzer werden übersprungen, und Windows hat bis dahin
+        /// veraltete ARP-Einträge verworfen). done erhält den fertigen Protokolleintrag.
+        /// </summary>
+        public static void Diagnose(PingTarget t, Func<List<SwitchState>> switches, Action<PingTarget, LogEntry> done)
+        {
+            DateTime? since = t.OutageStart;
+            Thread th = new Thread(delegate ()
+            {
+                Thread.Sleep(20000);
+                if (!t.Running || t.OutageStart != since) return;
+                try
+                {
+                    string verdict, details;
+                    OutageDiagnosis.Run(t, switches(), out verdict, out details);
+                    if (t.OutageStart != since) return;
+                    t.Diagnosis = verdict;
+                    t.DiagnosisDetails = details;
+                    LogEntry e = Entry(DateTime.Now, t, EvDiagnosis, verdict + ": " + details.Replace("\r\n", " | "));
+                    done(t, e);
+                }
+                catch { }
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
 
         public static List<LogEntry> Process(PingTarget t, bool ok, long rtt, string info, bool logEachFailure, string source)
         {
             List<LogEntry> result = new List<LogEntry>();
             DateTime now = DateTime.Now;
             NotifyConfig cfg = NotifyConfig.Current;
+            if (!ok && t.OfflineMode)
+            {
+                // Ausgeschaltetes Gerät: nicht als Verlust zählen, nichts protokollieren - nur auf "wieder online" warten.
+                t.LastReply = "-";
+                t.Status = "OFFLINE";
+                return result;
+            }
             t.Sent++;
             if (ok)
             {
                 t.LastReply = rtt + " ms";
                 t.Status = "Erreichbar";
                 if (t.OutageStart.HasValue)
-                    result.Add(Close(t, now, EvRecovered));
+                    result.Add(Close(t, now, t.OfflineMode ? EvOnline : EvRecovered));
 
                 t.FailStreak = 0;
                 if (t.OkStreak++ == 0) t.OkSince = now;
@@ -241,6 +309,8 @@ namespace PingMonitor
                     t.LastOutage = now;
                     t.Outages++;
                     result.Add(Entry(now, t, EvOutage, info));
+                    Action<PingTarget, string> started = OutageStarted;
+                    if (started != null) started(t, source);
                 }
                 else if (logEachFailure)
                 {
@@ -267,6 +337,9 @@ namespace PingMonitor
             string info = "Ausfalldauer " + Duration(t.OutageStart.Value, now) +
                 " (seit " + t.OutageStart.Value.ToString(Fmt.Time) + ")";
             t.OutageStart = null;
+            t.OfflineMode = false;
+            t.Diagnosis = "";
+            t.DiagnosisDetails = "";
             return Entry(now, t, evt, info);
         }
 
@@ -1089,9 +1162,28 @@ namespace PingMonitor
             Reload();
             timer = new System.Threading.Timer(Tick, null, 2000, 2000);
             SwitchMonitor.Start(Source, true);
+            Outages.OutageStarted += OnOutageStarted;
         }
 
         protected override void OnStop() { Shutdown("Dienst gestoppt"); }
+
+        void OnOutageStarted(PingTarget t, string source)
+        {
+            if (source != Source) return;
+            Outages.Diagnose(t, delegate { return SwitchMonitor.Current(false); }, delegate (PingTarget x, LogEntry e)
+            {
+                lock (sync)
+                {
+                    Write(e);
+                    if (Outages.IsOfflineVerdict(x.Diagnosis))
+                    {
+                        LogEntry off = Outages.MarkOffline(x);
+                        if (off != null) Write(off);
+                    }
+                    dirty = true;
+                }
+            });
+        }
 
         protected override void OnShutdown() { Shutdown("Windows wird heruntergefahren"); }
 
@@ -1200,7 +1292,7 @@ namespace PingMonitor
                         Fmt.Csv(t.Name), Fmt.Csv(t.Host), Fmt.Csv(t.Status), Fmt.Csv(t.LastReply),
                         t.Sent.ToString(), t.Lost.ToString(), t.Outages.ToString(),
                         t.LastOutage.HasValue ? t.LastOutage.Value.ToString(Fmt.Time) : "",
-                        t.OutageStart.HasValue ? "1" : "0", t.IntervalMs.ToString(), Fmt.Csv(t.Quality.Evaluate().Encode()) }));
+                        t.OutageStart.HasValue ? "1" : "0", t.IntervalMs.ToString(), Fmt.Csv(t.Quality.Evaluate().Encode()), Fmt.Csv(t.Diagnosis), Fmt.Csv(t.DiagnosisDetails.Replace("\r\n", "\\n")), t.OfflineMode ? "1" : "0" }));
                     sb.Append("\r\n");
                 }
             }
@@ -1427,7 +1519,10 @@ namespace PingMonitor
         CheckBox chkEachFailure;
         Label lblLogPath, lblService;
         Button btnSvcInstall, btnSvcStart, btnSvcStop, btnSvcUninstall;
-        ComboBox cboDns;
+        ComboBox cboDns, cboFilter;
+        TextBox txtSearch;
+        CheckBox chkHideWlan;
+        Label lblCount;
         string lastDnsSaved;
         CheckBox chkLarge;
         Dictionary<string, KeyValuePair<SwitchState, PortState>> portByMac = new Dictionary<string, KeyValuePair<SwitchState, PortState>>();
@@ -1453,11 +1548,22 @@ namespace PingMonitor
             svcTimer = new System.Windows.Forms.Timer();
             svcTimer.Interval = 2000;
             svcTimer.Tick += delegate { RefreshService(); };
-            Shown += delegate { RefreshService(); svcTimer.Start(); LookupInfo(targets, false); };
+            Shown += delegate
+            {
+                RefreshService();
+                svcTimer.Start();
+                LookupInfo(targets, false);
+                UpdateCount();
+                Thread gw = new Thread(delegate () { Topology.GatewayMac(); });   // MAC des Gateways vorab ermitteln
+                gw.IsBackground = true;
+                gw.Start();
+            };
+            Outages.OutageStarted += OnOutageStarted;
 
             FormClosing += delegate
             {
                 svcTimer.Stop();
+                Outages.OutageStarted -= OnOutageStarted;
                 foreach (PingTarget t in targets) t.Stop();
                 Notifier.Flush(TimeSpan.FromSeconds(5));
             };
@@ -1521,6 +1627,13 @@ namespace PingMonitor
                 TrySave(delegate { Config.SaveSettings(d); });
             };
             actions.Controls.Add(chkLarge);
+            actions.Controls.Add(NewButton("Netzwerkplan ...", delegate
+            {
+                using (TopologyForm f = new TopologyForm(delegate { return SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running); },
+                    delegate { return new List<PingTarget>(targets); }, delegate (PingTarget t) { ShowDetails(t); }))
+                    f.ShowDialog(this);
+            }));
+            actions.Controls.Add(NewButton("Zurücksetzen ...", delegate { ResetAll(); }));
             actions.Controls.Add(NewButton("Switches ...", delegate
             {
                 using (SwitchForm f = new SwitchForm(delegate { return svcStatus == ServiceControllerStatus.Running; })) f.ShowDialog(this);
@@ -1575,6 +1688,7 @@ namespace PingMonitor
             AddTargetColumn("Mac", "MAC-Adresse", 100);
             AddTargetColumn("Vendor", "Hersteller", 110);
             AddTargetColumn("Port", "Switch-Port", 120);
+            AddTargetColumn("Conn", "Verbindung", 140);
             AddTargetColumn("Info", "Geräteinfo", 160);
             // Nur der Kommentar ist direkt in der Tabelle bearbeitbar.
             gridTargets.ReadOnly = false;
@@ -1608,6 +1722,34 @@ namespace PingMonitor
             grpTargets.Text = "Geräte";
             grpTargets.Dock = DockStyle.Fill;
             grpTargets.Controls.Add(gridTargets);
+            FlowLayoutPanel filter = NewFlow(new Padding(2, 2, 2, 4));
+            filter.Controls.Add(NewLabel("Suchen:"));
+            txtSearch = new TextBox();
+            txtSearch.Width = 260;
+            txtSearch.TextChanged += delegate { ApplyFilterAll(); };
+            filter.Controls.Add(txtSearch);
+            cboFilter = new ComboBox();
+            cboFilter.DropDownStyle = ComboBoxStyle.DropDownList;
+            cboFilter.Width = 230;
+            cboFilter.Items.AddRange(new object[] { "Alle Geräte", "Nur erreichbare", "Nur Ausfälle (aktuell oder heute)",
+                "Nur auffällige (Qualität / Port / Ausfall)", "Nur per LAN angeschlossen", "Nur WLAN (vermutet)", "Nur nicht zugeordnete",
+                "Nur offline (ausgeschaltet)" });
+            cboFilter.SelectedIndex = 0;
+            cboFilter.SelectedIndexChanged += delegate { ApplyFilterAll(); };
+            filter.Controls.Add(cboFilter);
+            chkHideWlan = new CheckBox();
+            chkHideWlan.Text = "WLAN-Geräte ausblenden";
+            chkHideWlan.AutoSize = true;
+            chkHideWlan.Margin = new Padding(12, 7, 3, 3);
+            chkHideWlan.CheckedChanged += delegate { ApplyFilterAll(); };
+            filter.Controls.Add(chkHideWlan);
+            lblCount = NewLabel("");
+            lblCount.ForeColor = SystemColors.GrayText;
+            filter.Controls.Add(lblCount);
+            Label searchHint = NewLabel("Sucht in allen Spalten (Name, Kommentar, IP, MAC, Hersteller, DNS, Port ...). Mehrere Begriffe = alle müssen passen.");
+            searchHint.ForeColor = SystemColors.GrayText;
+            filter.Controls.Add(searchHint);
+            grpTargets.Controls.Add(filter);
 
             GroupBox grpLog = new GroupBox();
             grpLog.Text = "Ausfallprotokoll (heute)";
@@ -1950,6 +2092,29 @@ namespace PingMonitor
             catch (InvalidOperationException) { }
         }
 
+        void OnOutageStarted(PingTarget t, string source)
+        {
+            if (source != LocalSource) return;
+            bool svc = svcStatus == ServiceControllerStatus.Running;
+            Outages.Diagnose(t, delegate { return SwitchMonitor.Current(svc); }, delegate (PingTarget x, LogEntry e)
+            {
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        AddLog(e);
+                        if (Outages.IsOfflineVerdict(x.Diagnosis))
+                        {
+                            LogEntry off = Outages.MarkOffline(x);
+                            if (off != null) AddLog(off);
+                        }
+                        if (targets.Contains(x)) RefreshRow(x);
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            });
+        }
+
         void HandleResult(PingTarget t, bool ok, long rtt, string info)
         {
             if (!t.Running || !targets.Contains(t)) return;
@@ -1994,6 +2159,10 @@ namespace PingMonitor
         {
             StringBuilder sb = new StringBuilder(DetailText(t));
             if (t.InfoDetails.Length == 0) sb.Append("\r\n(Tipp: \"Geräteinfo abrufen\" fragt DNS, NetBIOS, mDNS, SNMP und Webseite neu ab.)");
+            if (t.Link != null) sb.Append("\r\nVerbindung: " + t.Link.Text);
+            PingTarget sv = !t.Running && t.ServiceView != null ? t.ServiceView : t;
+            if (sv.OutageStart.HasValue)
+                sb.Append("\r\n\r\n=== AUSFALL-DIAGNOSE ===\r\n" + (sv.Diagnosis.Length > 0 ? sv.Diagnosis + "\r\n" + sv.DiagnosisDetails : "läuft (ca. 20 Sekunden nach Ausfallbeginn) ..."));
             Assessment q = t.Running ? t.Quality.Evaluate() : (t.ServiceView != null ? t.ServiceView.ServiceQuality : null);
             sb.Append("\r\n\r\n=== LEITUNGSQUALITÄT ===\r\n");
             sb.Append(q != null ? q.Details : "Keine Daten - Überwachung läuft nicht.");
@@ -2016,6 +2185,18 @@ namespace PingMonitor
                     foreach (string mac in p.DeviceMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
                         map[mac] = new KeyValuePair<SwitchState, PortState>(s, p);
             portByMac = map;
+            Dictionary<PingTarget, DeviceLink> links;
+            try { Topology.Build(SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running), new List<PingTarget>(targets), out links); }
+            catch { links = new Dictionary<PingTarget, DeviceLink>(); }
+            foreach (PingTarget t in targets)
+            {
+                DeviceLink link;
+                t.Link = links.TryGetValue(t, out link) ? link : null;
+                DataGridViewCell cc = t.Row.Cells["Conn"];
+                cc.Value = t.Link != null ? t.Link.Text : "";
+                cc.Style.ForeColor = t.Link != null && t.Link.Wlan ? Color.SteelBlue : Color.Empty;
+                ApplyFilter(t);
+            }
             foreach (PingTarget t in targets)
             {
                 DataGridViewCell c = t.Row.Cells["Port"];
@@ -2147,7 +2328,8 @@ namespace PingMonitor
             DataGridViewRow r = t.Row;
             r.Cells["Name"].Value = t.Name;
             r.Cells["Host"].Value = t.Host;
-            r.Cells["Status"].Value = (v == t ? "" : "Dienst: ") + v.Status;
+            r.Cells["Status"].Value = (v == t ? "" : "Dienst: ") + v.Status + (v.OutageStart.HasValue && v.Diagnosis.Length > 0 ? " - " + v.Diagnosis : "");
+            r.Cells["Status"].ToolTipText = v.OutageStart.HasValue && v.DiagnosisDetails.Length > 0 ? "Ausfall-Diagnose:\r\n" + v.DiagnosisDetails : "";
             r.Cells["Reply"].Value = v.LastReply;
             r.Cells["Sent"].Value = v.Sent;
             r.Cells["Lost"].Value = v.Lost;
@@ -2162,14 +2344,132 @@ namespace PingMonitor
             qc.Value = q == null ? "" : q.Short;
             qc.ToolTipText = q == null ? "" : q.Details;
             qc.Style.BackColor = q == null || q.Level <= Finding.Ok ? Color.Empty : Finding.Back(q.Level);
+            t.QualityLevel = q == null ? Finding.Unknown : q.Level;
 
             Color back;
             if (!active) back = SystemColors.Window;
+            else if (v.OutageStart.HasValue && v.OfflineMode) back = Color.FromArgb(222, 222, 222);
             else if (v.OutageStart.HasValue) back = Color.FromArgb(255, 205, 205);
             else if (v.Sent > 0) back = Color.FromArgb(205, 245, 205);
             else back = Color.FromArgb(255, 245, 200);
             r.DefaultCellStyle.BackColor = back;
             r.DefaultCellStyle.SelectionBackColor = ControlPaint.Dark(back, 0.3f);
+            ApplyFilter(t);
+        }
+
+        // ------------------------------------------------------------ Filter
+
+        bool IsWlan(PingTarget t)
+        {
+            if (t.Link != null) return t.Link.Wlan;
+            return Topology.RandomMac(t.Mac) || Topology.MobileVendor(t.Vendor);
+        }
+
+        bool Matches(PingTarget t)
+        {
+            string q = txtSearch.Text.Trim().ToLowerInvariant();
+            if (q.Length > 0)
+            {
+                StringBuilder hay = new StringBuilder(NetTools.MacHex(t.Mac).ToLowerInvariant());
+                foreach (DataGridViewCell c in t.Row.Cells) hay.Append(' ').Append(Convert.ToString(c.Value).ToLowerInvariant());
+                string h = hay.ToString();
+                foreach (string term in q.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries))
+                    if (!h.Contains(term)) return false;
+            }
+            PingTarget v = (!t.Running && t.ServiceView != null) ? t.ServiceView : t;
+            bool active = t.Running || t.ServiceView != null;
+            KeyValuePair<SwitchState, PortState> port;
+            bool portIssue = portByMac.TryGetValue(NetTools.MacHex(t.Mac), out port) && port.Value.Rating.Level >= Finding.Warning;
+            switch (cboFilter.SelectedIndex)
+            {
+                case 1: if (!active || v.OutageStart.HasValue) return false; break;
+                case 2: if (!(v.OutageStart.HasValue && !v.OfflineMode) && v.Outages == 0) return false; break;
+                case 3: if (!(v.OutageStart.HasValue && !v.OfflineMode) && t.QualityLevel < Finding.Warning && !portIssue) return false; break;
+                case 4: if (t.Link == null || !t.Link.Text.StartsWith("LAN")) return false; break;
+                case 5: if (!IsWlan(t)) return false; break;
+                case 6: if (t.Link != null && (t.Link.Text.StartsWith("LAN") || t.Link.Certain)) return false; break;
+                case 7: if (!(v.OutageStart.HasValue && v.OfflineMode)) return false; break;
+            }
+            if (chkHideWlan.Checked && IsWlan(t)) return false;
+            return true;
+        }
+
+        void ApplyFilter(PingTarget t)
+        {
+            if (txtSearch == null || t.Row == null || t.Row.Index < 0) return;
+            bool visible = Matches(t);
+            if (t.Row.Visible == visible) return;
+            if (!visible)
+            {
+                if (gridTargets.CurrentCell != null && gridTargets.CurrentCell.RowIndex == t.Row.Index) gridTargets.CurrentCell = null;
+                t.Row.Selected = false;
+            }
+            t.Row.Visible = visible;
+            UpdateCount();
+        }
+
+        void ApplyFilterAll()
+        {
+            foreach (PingTarget t in targets) ApplyFilter(t);
+            UpdateCount();
+        }
+
+        void UpdateCount()
+        {
+            int shown = 0;
+            foreach (PingTarget t in targets) if (t.Row.Visible) shown++;
+            lblCount.Text = shown == targets.Count ? targets.Count + " Geräte" : shown + " von " + targets.Count + " Geräten angezeigt";
+        }
+
+        // ------------------------------------------------------------ Zurücksetzen
+
+        void ResetAll()
+        {
+            using (ResetForm f = new ResetForm())
+            {
+                if (f.ShowDialog(this) != DialogResult.OK) return;
+                List<string> errors = new List<string>();
+                if (f.Hosts.Checked)
+                {
+                    foreach (PingTarget t in targets) { t.Stop(); t.PingResult -= OnPingResult; }
+                    targets.Clear();
+                    gridTargets.Rows.Clear();
+                    Delete(Config.HostsFile, errors);
+                }
+                if (f.Switches.Checked)
+                {
+                    SwitchMonitor.Stop();
+                    Delete(SwitchMonitor.ConfigFile, errors);
+                    Delete(SwitchMonitor.StatusFile, errors);
+                    Delete(SwitchMonitor.LastPortsFile, errors);
+                }
+                if (f.Logs.Checked)
+                {
+                    gridLog.Rows.Clear();
+                    tailFile = null;
+                    try
+                    {
+                        if (Directory.Exists(Config.LogDir))
+                            foreach (string file in Directory.GetFiles(Config.LogDir)) Delete(file, errors);
+                    }
+                    catch (Exception ex) { errors.Add(ex.Message); }
+                }
+                if (f.Settings.Checked)
+                {
+                    Delete(Config.SettingsFile, errors);
+                    Delete(MacVendors.DownloadedFile, errors);
+                }
+                RefreshPorts();
+                UpdateCount();
+                MessageBox.Show(this, errors.Count == 0 ? "Zurückgesetzt." : "Zurückgesetzt, aber nicht alles ließ sich löschen:\n" + string.Join("\n", errors.ToArray()),
+                    Text, MessageBoxButtons.OK, errors.Count == 0 ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+            }
+        }
+
+        static void Delete(string file, List<string> errors)
+        {
+            try { if (File.Exists(file)) File.Delete(file); }
+            catch (Exception ex) { errors.Add(Path.GetFileName(file) + ": " + ex.Message); }
         }
 
         // ------------------------------------------------------------- Log
@@ -2340,6 +2640,8 @@ namespace PingMonitor
                             if (f[8] == "1") v.OutageStart = DateTime.Now;
                             int.TryParse(f[9], out v.IntervalMs);
                             if (f.Count > 10) v.ServiceQuality = Assessment.Decode(f[10]);
+                            if (f.Count > 12) { v.Diagnosis = f[11]; v.DiagnosisDetails = f[12].Replace("\\n", "\r\n"); }
+                            if (f.Count > 13) v.OfflineMode = f[13] == "1";
                             views[v.Name + "|" + v.Host + "|" + v.IntervalMs] = v;
                         }
                     }
@@ -2977,7 +3279,30 @@ namespace PingMonitor
 
         ComboBox cboRange;
         NumericUpDown numTimeout;
-        CheckBox chkArp, chkExtended;
+        CheckBox chkArp, chkExtended, chkHideWlan;
+        TextBox txtFilter;
+
+        bool RowVisible(DataGridViewRow row)
+        {
+            ScanResult r = (ScanResult)row.Tag;
+            if (r == null) return true;
+            if (chkHideWlan.Checked && (Topology.RandomMac(r.Mac) || Topology.MobileVendor(r.Vendor))) return false;
+            string q = txtFilter.Text.Trim().ToLowerInvariant();
+            if (q.Length == 0) return true;
+            StringBuilder hay = new StringBuilder(NetTools.MacHex(r.Mac).ToLowerInvariant());
+            foreach (DataGridViewCell c in row.Cells) hay.Append(' ').Append(Convert.ToString(c.Value).ToLowerInvariant());
+            hay.Append(' ').Append(r.Info.Details.ToLowerInvariant());
+            string h = hay.ToString();
+            foreach (string term in q.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries))
+                if (!h.Contains(term)) return false;
+            return true;
+        }
+
+        void FilterRows()
+        {
+            grid.CurrentCell = null;
+            foreach (DataGridViewRow row in grid.Rows) row.Visible = RowVisible(row);
+        }
         Button btnScan, btnTake, btnVendors;
         ProgressBar progress;
         Label lblStatus;
@@ -3034,6 +3359,18 @@ namespace PingMonitor
                 "   ·   DNS: " + (Resolver.Setting == Resolver.Auto ? "automatisch" : Resolver.Setting) + " (+ Ausweichserver)");
             hint.ForeColor = SystemColors.GrayText;
             top.Controls.Add(hint);
+            top.SetFlowBreak(hint, true);
+            top.Controls.Add(Lbl("Ergebnis filtern:"));
+            txtFilter = new TextBox();
+            txtFilter.Width = 240;
+            txtFilter.TextChanged += delegate { FilterRows(); };
+            top.Controls.Add(txtFilter);
+            chkHideWlan = new CheckBox();
+            chkHideWlan.Text = "WLAN-Geräte ausblenden (zufällige MAC / Mobilgerät-Hersteller)";
+            chkHideWlan.AutoSize = true;
+            chkHideWlan.Margin = new Padding(12, 7, 3, 3);
+            chkHideWlan.CheckedChanged += delegate { FilterRows(); };
+            top.Controls.Add(chkHideWlan);
 
             // --- Fortschritt
             Panel prog = new Panel();
@@ -3264,6 +3601,7 @@ namespace PingMonitor
             row.Tag = r;
             string details = r.Info.Details;
             foreach (DataGridViewCell c in row.Cells) c.ToolTipText = details;
+            if (!RowVisible(row)) { if (grid.CurrentCell != null && grid.CurrentCell.RowIndex == idx) grid.CurrentCell = null; row.Visible = false; }
             if (known)
             {
                 row.DefaultCellStyle.ForeColor = SystemColors.GrayText;
@@ -4227,6 +4565,18 @@ namespace PingMonitor
 
         public void Reset() { lock (sync) samples.Clear(); }
 
+        /// <summary>Entfernt die letzten n Fehlschläge (Gerät war ausgeschaltet, keine Leitungsstörung).</summary>
+        public void DropTrailingFailures(int n)
+        {
+            lock (sync)
+            {
+                List<Sample> list = new List<Sample>(samples);
+                while (n-- > 0 && list.Count > 0 && !list[list.Count - 1].Ok) list.RemoveAt(list.Count - 1);
+                samples.Clear();
+                foreach (Sample x in list) samples.Enqueue(x);
+            }
+        }
+
         public Assessment Evaluate()
         {
             Sample[] a;
@@ -4350,6 +4700,8 @@ namespace PingMonitor
         public readonly List<DateTime> Flaps = new List<DateTime>();
         public DateTime? LastFlap;
         public readonly List<string> Macs = new List<string>();
+        public bool Wireless;            // WLAN-Schnittstelle eines Access Points
+        public string LldpName = "", LldpChassis = "", LldpPort = "";   // direkter Nachbar laut LLDP
         public string DeviceNames = "";  // überwachte Geräte an diesem Port
         public string DeviceMacs = "";
         public string Attached = "";
@@ -4402,6 +4754,8 @@ namespace PingMonitor
         public DateTime LastPoll;
         public int PollCount;
         public bool HasFdb;
+        public string OwnMacs = "";      // MAC-Adressen des Switches selbst (Bridge-Adresse, ARP)
+        public string Kind = "Switch";   // "Switch" oder "Access Point"
         public SortedDictionary<int, PortState> Ports = new SortedDictionary<int, PortState>();
 
         public string Key { get { return Address + "|" + Community; } }
@@ -4435,6 +4789,9 @@ namespace PingMonitor
         const string Dot3Align = "1.3.6.1.2.1.10.7.2.1.2", Dot3Fcs = "1.3.6.1.2.1.10.7.2.1.3",
                      Dot3Late = "1.3.6.1.2.1.10.7.2.1.8", Dot3Duplex = "1.3.6.1.2.1.10.7.2.1.19";
         // BRIDGE-MIB / Q-BRIDGE-MIB (MAC-Adresstabelle)
+        const string BridgeAddress = "1.3.6.1.2.1.17.1.1.0",
+                     LldpRemChassis = "1.0.8802.1.1.2.1.4.1.1.5", LldpRemPortId = "1.0.8802.1.1.2.1.4.1.1.7",
+                     LldpRemPortDesc = "1.0.8802.1.1.2.1.4.1.1.8", LldpRemSysName = "1.0.8802.1.1.2.1.4.1.1.9";
         const string BasePortIfIndex = "1.3.6.1.2.1.17.1.4.1.2", FdbPort = "1.3.6.1.2.1.17.4.3.1.2", QFdbPort = "1.3.6.1.2.1.17.7.1.2.2.1.2";
 
         public const string Source = "Switch";
@@ -4447,6 +4804,35 @@ namespace PingMonitor
         static string owner = "";
         static DateTime configStamp;
         static string snapshot = "";
+        // Zuletzt bekannter Port je Geräte-MAC (bleibt erhalten, wenn ein Gerät aus ist und aus der MAC-Tabelle fällt)
+        static Dictionary<string, string[]> lastPorts;
+        public static string LastPortsFile { get { return Path.Combine(Config.BaseDir, "mac_ports.txt"); } }
+
+        static void LoadLastPorts()
+        {
+            lastPorts = new Dictionary<string, string[]>();
+            try
+            {
+                if (File.Exists(LastPortsFile))
+                    foreach (string line in Config.ReadAllLinesShared(LastPortsFile))
+                    {
+                        string[] p = line.Split(';');
+                        if (p.Length >= 4 && p[0].Length == 12) lastPorts[p[0]] = new string[] { p[1], p[2], p[3] };
+                    }
+            }
+            catch { }
+        }
+
+        static void SaveLastPorts()
+        {
+            try
+            {
+                List<string> lines = new List<string>();
+                foreach (KeyValuePair<string, string[]> kv in lastPorts) lines.Add(kv.Key + ";" + string.Join(";", kv.Value));
+                File.WriteAllLines(LastPortsFile, lines.ToArray(), Encoding.UTF8);
+            }
+            catch { }
+        }
 
         public static string ConfigFile { get { return Path.Combine(Config.BaseDir, "switches.txt"); } }
         public static string StatusFile { get { return Path.Combine(Config.BaseDir, "Switch_Status.csv"); } }
@@ -4501,6 +4887,7 @@ namespace PingMonitor
                 if (running) return;
                 running = true;
                 snapshot = "";
+                lastPorts = null;   // nach "Zurücksetzen" neu aus der Datei laden
                 owner = ownerName;
                 writeStatus = writeStatusFile;
                 configStamp = DateTime.MinValue;
@@ -4623,6 +5010,16 @@ namespace PingMonitor
             SnmpValue v;
             if (sys.TryGetValue(Snmp.SysName, out v)) s.SysName = v.Text;
             if (sys.TryGetValue(Snmp.SysDescr, out v)) s.SysDescr = v.Text;
+            s.Kind = SwitchDiscoverForm.Classify(s.SysDescr + " " + s.SysName, 0, 0, 0, false) == "Access Point" ? "Access Point" : "Switch";
+            if (s.PollCount % 5 == 0)
+            {
+                List<string> own = new List<string>();
+                Dictionary<string, SnmpValue> ba = Snmp.GetValues(ip, s.Community, 2000, BridgeAddress);
+                if (ba.TryGetValue(BridgeAddress, out v) && v.Raw.Length == 6) own.Add(BitConverter.ToString(v.Raw));
+                string arpMac = NetTools.GetMac(ip);
+                if (arpMac.Length > 0 && !own.Contains(arpMac)) own.Add(arpMac);
+                if (own.Count > 0) s.OwnMacs = string.Join(",", own.ToArray());
+            }
             long up = sys[Snmp.SysUpTime].Number;
             bool rebooted = s.UpTime >= 0 && up < s.UpTime;
             s.UpTime = up;
@@ -4656,16 +5053,18 @@ namespace PingMonitor
                 {
                     int idx = t.Key;
                     long type = t.Value.Number;
-                    // Nur Ethernet-Ports (keine VLAN-, Loopback-, CPU- oder LAG-Schnittstellen)
-                    if (type != 6 && type != 62 && type != 69 && type != 117) continue;
+                    // Nur Ethernet- und WLAN-Ports (keine VLAN-, Loopback-, CPU- oder LAG-Schnittstellen)
                     string d = Txt(descr, idx);
-                    string lower = d.ToLowerInvariant();
+                    string lower = (Txt(names, idx) + " " + d).ToLowerInvariant().Trim();
+                    bool wireless = type == 71 || System.Text.RegularExpressions.Regex.IsMatch(lower, @"^(ath\d|wlan|wifi|wl\d|rai?\d|radio)");
+                    if (!wireless && type != 6 && type != 62 && type != 69 && type != 117) continue;
                     if (lower.Contains("loopback") || lower.Contains("cpu") || lower.StartsWith("vlan") || lower.StartsWith("switch0")) continue;
 
                     PortState p;
                     if (!s.Ports.TryGetValue(idx, out p)) { p = new PortState(); p.IfIndex = idx; s.Ports[idx] = p; }
                     p.Name = Txt(names, idx).Length > 0 ? Txt(names, idx) : d;
                     p.Alias = Txt(alias, idx);
+                    p.Wireless = wireless;
                     int oldOper = p.Oper;
                     p.Oper = (int)Num(oper, idx, 0);
                     long hs = Num(hspeed, idx, 0);
@@ -4705,9 +5104,10 @@ namespace PingMonitor
 
                     // Link-Wechsel: ifLastChange hat sich geändert
                     long lc = Num(change, idx, -1);
-                    if (p.LastChange >= 0 && lc >= 0 && lc != p.LastChange && !rebooted)
+                    bool operChanged = oldOper != 0 && p.Oper != 0 && (oldOper == 1) != (p.Oper == 1);
+                    if (!rebooted && (operChanged || p.LastChange >= 0 && lc >= 0 && lc != p.LastChange))
                     {
-                        DateTime when = now - TimeSpan.FromMilliseconds(Math.Max(0, up - lc) * 10);
+                        DateTime when = lc >= 0 && lc != p.LastChange ? now - TimeSpan.FromMilliseconds(Math.Max(0, up - lc) * 10) : now;
                         string what;
                         if (oldOper == 1 && p.Oper != 1) { what = "Link DOWN"; p.Flaps.Add(when); }
                         else if (oldOper != 1 && p.Oper == 1) what = "Link UP";
@@ -4756,6 +5156,48 @@ namespace PingMonitor
                 }
                 s.HasFdb = rows.Count > 0;
             }
+            ReadLldp(ip, s, bridge);
+        }
+
+        /// <summary>LLDP: Welcher Nachbar (Switch, AP, Router) hängt direkt an welchem Port?</summary>
+        static void ReadLldp(IPAddress ip, SwitchState s, Dictionary<int, SnmpValue> bridge)
+        {
+            List<KeyValuePair<string, SnmpValue>> names = Snmp.Walk(ip, s.Community, LldpRemSysName, 2000);
+            if (names == null) return;
+            List<KeyValuePair<string, SnmpValue>> chassis = Snmp.Walk(ip, s.Community, LldpRemChassis, 2000) ?? new List<KeyValuePair<string, SnmpValue>>();
+            List<KeyValuePair<string, SnmpValue>> ports = Snmp.Walk(ip, s.Community, LldpRemPortDesc, 2000) ?? new List<KeyValuePair<string, SnmpValue>>();
+            lock (sync)
+            {
+                foreach (PortState p in s.Ports.Values) { p.LldpName = ""; p.LldpChassis = ""; p.LldpPort = ""; }
+                foreach (KeyValuePair<string, SnmpValue> kv in names)
+                {
+                    PortState p = LldpPort(s, kv.Key, bridge);
+                    if (p != null) p.LldpName = kv.Value.Text;
+                }
+                foreach (KeyValuePair<string, SnmpValue> kv in chassis)
+                {
+                    PortState p = LldpPort(s, kv.Key, bridge);
+                    if (p != null && kv.Value.Raw.Length == 6) p.LldpChassis = BitConverter.ToString(kv.Value.Raw);
+                }
+                foreach (KeyValuePair<string, SnmpValue> kv in ports)
+                {
+                    PortState p = LldpPort(s, kv.Key, bridge);
+                    if (p != null) p.LldpPort = kv.Value.Text;
+                }
+            }
+        }
+
+        // Index der LLDP-Tabelle: timeMark.localPortNum.index - localPortNum ist je nach Hersteller ifIndex oder Bridge-Port.
+        static PortState LldpPort(SwitchState s, string index, Dictionary<int, SnmpValue> bridge)
+        {
+            string[] parts = index.Split('.');
+            int local;
+            if (parts.Length < 3 || !int.TryParse(parts[1], out local)) return null;
+            PortState p;
+            if (s.Ports.TryGetValue(local, out p)) return p;
+            SnmpValue v;
+            if (bridge.TryGetValue(local, out v) && s.Ports.TryGetValue((int)v.Number, out p)) return p;
+            return null;
         }
 
         /// <summary>Ordnet die überwachten Geräte (per MAC) dem Switch-Port zu, an dem sie direkt hängen.</summary>
@@ -4763,8 +5205,10 @@ namespace PingMonitor
         {
             List<PingTarget> hosts;
             try { hosts = Config.LoadHosts(); } catch { return; }
+            bool changed = false;
             lock (sync)
             {
+                if (lastPorts == null) LoadLastPorts();
                 foreach (SwitchState s in switches)
                     foreach (PortState p in s.Ports.Values) { p.DeviceNames = ""; p.DeviceMacs = ""; p.Attached = ""; }
                 foreach (PingTarget t in hosts)
@@ -4775,9 +5219,25 @@ namespace PingMonitor
                     foreach (SwitchState s in switches)
                         foreach (PortState p in s.Ports.Values)
                             foreach (string m in p.Macs)
-                                if (NetTools.MacHex(m) == mac && (best == null || p.Macs.Count < best.Macs.Count)) best = p;
-                    if (best == null) continue;
-                    best.DeviceNames += (best.DeviceNames.Length > 0 ? ", " : "") + t.Name;
+                                if (NetTools.MacHex(m) == mac && (best == null || Weight(p) < Weight(best))) best = p;
+                    string suffix = "";
+                    if (best != null)
+                    {
+                        SwitchState home = switches.Find(delegate (SwitchState x) { return x.Ports.ContainsValue(best); });
+                        lastPorts[mac] = new string[] { home.Address, best.IfIndex.ToString(), DateTime.Now.ToString(Fmt.Time) };
+                        changed = true;
+                    }
+                    else
+                    {
+                        // Gerät gerade nicht in der MAC-Tabelle (z. B. ausgeschaltet): zuletzt bekannten Port verwenden
+                        string[] last;
+                        if (!lastPorts.TryGetValue(mac, out last)) continue;
+                        SwitchState home = switches.Find(delegate (SwitchState x) { return x.Address == last[0]; });
+                        int idx;
+                        if (home == null || !int.TryParse(last[1], out idx) || !home.Ports.TryGetValue(idx, out best)) continue;
+                        suffix = " (zuletzt gesehen " + last[2] + ")";
+                    }
+                    best.DeviceNames += (best.DeviceNames.Length > 0 ? ", " : "") + t.Name + suffix;
                     best.DeviceMacs += (best.DeviceMacs.Length > 0 ? "," : "") + mac;
                 }
                 foreach (SwitchState s in switches)
@@ -4791,14 +5251,28 @@ namespace PingMonitor
                         else if (p.Macs.Count > 1)
                             p.Attached = p.Macs.Count + " Geräte" + (p.Macs.Count > 5 ? " (Uplink / weiterer Switch?)" : "");
                     }
+                if (changed && writeStatus || changed && owner == "App") SaveLastPorts();
             }
         }
+
+        // Verbindungen zu anderen Switches (LLDP) sind nie der "eigene" Port eines Endgeräts.
+        static int Weight(PortState p) { return p.Macs.Count + (p.LldpName.Length > 0 || p.LldpChassis.Length > 0 ? 100000 : 0); }
 
         // ------------------------------------------------------------ Bewertung
 
         static void Evaluate(SwitchState s, PortState p)
         {
             Assessment before = p.Rating;
+            if (p.Wireless)
+            {
+                Assessment w = new Assessment();
+                w.Level = Finding.Ok;
+                w.Short = "WLAN" + (p.Macs.Count > 0 ? " (" + p.Macs.Count + " Clients)" : "");
+                w.Details = "WLAN-Schnittstelle des Access Points. Angemeldete Geräte: " + p.Macs.Count +
+                    (p.ConnectedText.Length > 0 ? "\r\nÜberwacht: " + p.ConnectedText : "");
+                p.Rating = w;
+                return;
+            }
             List<Finding> f = new List<Finding>();
             long recentErr = 0, recentDisc = 0;
             foreach (long x in p.RecentErr) recentErr += x;
@@ -4889,13 +5363,16 @@ namespace PingMonitor
                 {
                     sb.Append(string.Join(";", new string[] { "S", Fmt.Csv(s.Name), Fmt.Csv(s.Address), Fmt.Csv(s.Community),
                         s.Polled ? "1" : "0", s.Reachable ? "1" : "0", Fmt.Csv(s.Error), Fmt.Csv(s.SysName), Fmt.Csv(s.SysDescr),
-                        s.LastPoll == DateTime.MinValue ? "" : s.LastPoll.ToString(Fmt.Time), s.HasFdb ? "1" : "0" })).Append("\r\n");
+                        s.LastPoll == DateTime.MinValue ? "" : s.LastPoll.ToString(Fmt.Time), s.HasFdb ? "1" : "0",
+                        Fmt.Csv(s.OwnMacs), Fmt.Csv(s.Kind) })).Append("\r\n");
                     foreach (PortState p in s.Ports.Values)
                         sb.Append(string.Join(";", new string[] { "P", Fmt.Csv(s.Address), p.IfIndex.ToString(), Fmt.Csv(p.Name), Fmt.Csv(p.Alias),
                             p.Oper.ToString(), p.SpeedMbps.ToString(), p.Duplex.ToString(), p.RxErrors.ToString(), p.TxErrors.ToString(),
                             p.Discards.ToString(), p.FlapsSince(TimeSpan.FromDays(1)).ToString(),
                             p.LastFlap.HasValue ? p.LastFlap.Value.ToString(Fmt.Time) : "", p.Macs.Count.ToString(),
-                            Fmt.Csv(p.DeviceNames), Fmt.Csv(p.DeviceMacs), Fmt.Csv(p.Attached), Fmt.Csv(p.Rating.Encode()) })).Append("\r\n");
+                            Fmt.Csv(p.DeviceNames), Fmt.Csv(p.DeviceMacs), Fmt.Csv(p.Attached), Fmt.Csv(p.Rating.Encode()),
+                            p.Wireless ? "1" : "0", Fmt.Csv(p.LldpName), Fmt.Csv(p.LldpChassis), Fmt.Csv(p.LldpPort),
+                            string.Join(",", p.Macs.ToArray()) })).Append("\r\n");
                 }
             }
             return sb.ToString();
@@ -4915,6 +5392,7 @@ namespace PingMonitor
                     DateTime d;
                     if (DateTime.TryParseExact(f[9], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out d)) s.LastPoll = d;
                     s.HasFdb = f[10] == "1";
+                    if (f.Count >= 13) { s.OwnMacs = f[11]; s.Kind = f[12]; }
                     list.Add(s);
                 }
                 else if (f.Count >= 18 && f[0] == "P" && list.Count > 0)
@@ -4934,9 +5412,17 @@ namespace PingMonitor
                     for (int i = 0; i < flaps; i++) p.Flaps.Add(DateTime.Now);
                     DateTime d;
                     if (DateTime.TryParseExact(f[12], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out d)) p.LastFlap = d;
-                    int macs;
-                    int.TryParse(f[13], out macs);
-                    for (int i = 0; i < macs; i++) p.Macs.Add("");
+                    if (f.Count >= 23)
+                    {
+                        p.Wireless = f[18] == "1"; p.LldpName = f[19]; p.LldpChassis = f[20]; p.LldpPort = f[21];
+                        foreach (string m in f[22].Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) p.Macs.Add(m);
+                    }
+                    else
+                    {
+                        int macs;
+                        int.TryParse(f[13], out macs);
+                        for (int i = 0; i < macs; i++) p.Macs.Add("");
+                    }
                     p.DeviceNames = f[14]; p.DeviceMacs = f[15]; p.Attached = f[16];
                     p.Rating = Assessment.Decode(f[17]);
                     s.Ports[p.IfIndex] = p;
@@ -5554,7 +6040,7 @@ namespace PingMonitor
         }
 
         /// <summary>Ordnet ein SNMP-Gerät grob einem Typ zu (Hersteller-Kennungen, Bridge-Ports, Drucker-MIB).</summary>
-        static string Classify(string text, long services, long interfaces, long bridgePorts, bool printerMib)
+        public static string Classify(string text, long services, long interfaces, long bridgePorts, bool printerMib)
         {
             string d = " " + text.ToLowerInvariant() + " ";
             if (printerMib || Has(d, "printer", "laserjet", "officejet", "brother", "kyocera", "ricoh", "lexmark", "xerox", "canon", "epson", "konica"))
@@ -5611,6 +6097,603 @@ namespace PingMonitor
             }
             cancel = true;
             DialogResult = DialogResult.OK;
+        }
+    }
+
+    // =====================================================================
+    // Netzwerkplan (Topologie), WLAN-Erkennung und Ausfall-Diagnose
+    // =====================================================================
+
+    class TopoNode
+    {
+        public string Kind = "";        // internet, gateway, switch, ap, device, group
+        public string Title = "";
+        public string Tip = "";
+        public int Level = Finding.Ok;  // für die Einfärbung
+        public bool Offline;
+        public bool Off;                // ausgeschaltet (kein Fehler)
+        public bool Wlan;
+        public PingTarget Target;
+        public readonly List<TopoNode> Children = new List<TopoNode>();
+    }
+
+    /// <summary>Wie ist ein überwachtes Gerät angeschlossen?</summary>
+    class DeviceLink
+    {
+        public string Text = "";
+        public bool Wlan;               // WLAN sicher oder vermutet
+        public bool Certain;
+    }
+
+    static class Topology
+    {
+        static readonly string[] MobileVendors = { "apple", "samsung", "xiaomi", "huawei", "oneplus", "google", "motorola", "oppo", "vivo",
+            "realme", "honor", "espressif", "murata", "amazon", "nintendo", "azurewave", "hon hai", "liteon", "lite-on", "intel corporate" };
+
+        public static bool RandomMac(string mac)
+        {
+            string hex = NetTools.MacHex(mac);
+            return hex.Length >= 2 && (Convert.ToInt32(hex.Substring(0, 2), 16) & 0x02) != 0;
+        }
+
+        public static bool MobileVendor(string vendor)
+        {
+            string v = (vendor ?? "").ToLowerInvariant();
+            foreach (string m in MobileVendors) if (v.Contains(m)) return true;
+            return false;
+        }
+
+        /// <summary>Ist das Gerät ein Access Point? (SNMP-Kennung, Geräteinfo, Name oder Kommentar)</summary>
+        public static bool LooksLikeAp(PingTarget t)
+        {
+            string x = " " + (t.Name + " " + t.Comment + " " + t.Info).ToLowerInvariant() + " ";
+            return x.Contains("access point") || x.Contains("accesspoint") || x.Contains(" ap ") || x.Contains("wlan-ap") || x.Contains("wlan ap") ||
+                   x.Contains("wifi-ap") || x.Contains(" uap") || x.Contains("u6-") || x.Contains("u7-") || x.Contains(" eap") || x.Contains("repeater");
+        }
+
+        static readonly object gwSync = new object();
+        static string gwMacCache = "";
+        static DateTime gwMacAt;
+
+        public static IPAddress Gateway()
+        {
+            List<IPAddress> g = Resolver.Gateways();
+            return g.Count > 0 ? g[0] : null;
+        }
+
+        public static string GatewayMac()
+        {
+            lock (gwSync)
+            {
+                if (DateTime.UtcNow - gwMacAt < TimeSpan.FromMinutes(5)) return gwMacCache;
+                IPAddress gw = Gateway();
+                gwMacCache = gw != null ? NetTools.MacHex(NetTools.GetMac(gw)) : "";
+                gwMacAt = DateTime.UtcNow;
+                return gwMacCache;
+            }
+        }
+
+        class Seen { public SwitchState Switch; public PortState Port; }
+
+        static List<Seen> Find(List<SwitchState> sw, string macHex)
+        {
+            List<Seen> r = new List<Seen>();
+            if (macHex.Length != 12) return r;
+            foreach (SwitchState s in sw)
+                foreach (PortState p in s.Ports.Values)
+                {
+                    bool hit = ("," + p.DeviceMacs + ",").Contains("," + macHex + ",");
+                    foreach (string m in p.Macs) if (NetTools.MacHex(m) == macHex) hit = true;
+                    if (hit) { Seen x = new Seen(); x.Switch = s; x.Port = p; r.Add(x); }
+                }
+            return r;
+        }
+
+        static bool IsLinkPort(PortState p) { return p.LldpName.Length > 0 || p.LldpChassis.Length > 0; }
+
+        /// <summary>
+        /// Baut den Netzwerkplan: Internet - Gateway - Switches (über LLDP bzw. MAC-Tabellen) - Access Points - Geräte.
+        /// links: für jedes Gerät, wie es angeschlossen ist (LAN/WLAN).
+        /// </summary>
+        public static TopoNode Build(List<SwitchState> switches, List<PingTarget> devices, out Dictionary<PingTarget, DeviceLink> links)
+        {
+            links = new Dictionary<PingTarget, DeviceLink>();
+            List<SwitchState> sw = switches.FindAll(delegate (SwitchState s) { return s.Reachable; });
+            IPAddress gwIp = Gateway();
+            string gwMac = "";
+            PingTarget gwDevice = null;
+            foreach (PingTarget t in devices)
+                if (gwIp != null && t.Host == gwIp.ToString()) { gwDevice = t; gwMac = NetTools.MacHex(t.Mac); }
+            if (gwMac.Length != 12) gwMac = GatewayMac();
+
+            // Uplink jedes Switches = Port, an dem das Gateway gesehen wird (sonst Port mit den meisten MACs)
+            Dictionary<SwitchState, PortState> uplink = new Dictionary<SwitchState, PortState>();
+            foreach (SwitchState s in sw)
+            {
+                PortState up = null;
+                foreach (Seen x in Find(sw, gwMac)) if (x.Switch == s) up = x.Port;
+                if (up == null)
+                    foreach (PortState p in s.Ports.Values) if (up == null || p.Macs.Count > up.Macs.Count) up = p;
+                if (up != null && up.Macs.Count > 0) uplink[s] = up;
+            }
+
+            // Vorfahren eines Switches: alle Switches, die ihn auf einem Nicht-Uplink-Port sehen
+            Dictionary<SwitchState, List<SwitchState>> ancestors = new Dictionary<SwitchState, List<SwitchState>>();
+            foreach (SwitchState b in sw)
+            {
+                List<SwitchState> anc = new List<SwitchState>();
+                foreach (string mac in b.OwnMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                    foreach (Seen x in Find(sw, NetTools.MacHex(mac)))
+                    {
+                        PortState up;
+                        if (x.Switch == b || anc.Contains(x.Switch)) continue;
+                        if (uplink.TryGetValue(x.Switch, out up) && up == x.Port) continue;
+                        anc.Add(x.Switch);
+                    }
+                ancestors[b] = anc;
+            }
+
+            Dictionary<SwitchState, SwitchState> parent = new Dictionary<SwitchState, SwitchState>();
+            Dictionary<SwitchState, string> parentPort = new Dictionary<SwitchState, string>();
+            foreach (SwitchState b in sw)
+            {
+                SwitchState best = null;
+                // 1. LLDP: Nachbar am Uplink-Port von b
+                PortState bUp;
+                if (uplink.TryGetValue(b, out bUp) && IsLinkPort(bUp))
+                    foreach (SwitchState a in sw)
+                        if (a != b && (Same(a, bUp.LldpName) || a.OwnMacs.Contains(bUp.LldpChassis) && bUp.LldpChassis.Length > 0)) best = a;
+                // 2. MAC-Tabellen: der "tiefste" Vorfahre ist der direkte Vorgänger
+                if (best == null)
+                    foreach (SwitchState a in ancestors[b])
+                        if (best == null || ancestors[a].Count > ancestors[best].Count) best = a;
+                if (best == null) continue;
+                parent[b] = best;
+                foreach (string mac in b.OwnMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                    foreach (Seen x in Find(sw, NetTools.MacHex(mac)))
+                        if (x.Switch == best) parentPort[b] = x.Port.DisplayName;
+            }
+
+            TopoNode root = new TopoNode();
+            root.Kind = "internet";
+            root.Title = "Internet";
+            TopoNode gwNode = new TopoNode();
+            gwNode.Kind = "gateway";
+            gwNode.Title = (gwDevice != null ? gwDevice.Name : "Gateway / Firewall") + (gwIp != null ? "  (" + gwIp + ")" : "") + "  [Gateway]";
+            gwNode.Tip = "Standard-Gateway dieses PCs" + (gwMac.Length == 12 ? ", MAC " + gwMac : "");
+            if (gwDevice != null) { gwNode.Target = gwDevice; Status(gwNode, gwDevice); links[gwDevice] = Link("Gateway", false, true); }
+            root.Children.Add(gwNode);
+
+            Dictionary<SwitchState, TopoNode> swNodes = new Dictionary<SwitchState, TopoNode>();
+            foreach (SwitchState s in sw)
+            {
+                TopoNode n = new TopoNode();
+                n.Kind = s.Kind == "Access Point" ? "ap" : "switch";
+                n.Title = s.Name + "  (" + s.Address + ")  [" + (s.Kind == "Access Point" ? "Access Point" : "Switch") + "]";
+                n.Tip = s.SysDescr;
+                int worst = Finding.Ok;
+                foreach (PortState p in s.Ports.Values) if (p.Rating.Level > worst) worst = p.Rating.Level;
+                n.Level = worst;
+                swNodes[s] = n;
+            }
+            foreach (SwitchState s in sw)
+            {
+                SwitchState par;
+                TopoNode n = swNodes[s];
+                if (parent.TryGetValue(s, out par))
+                {
+                    string pp;
+                    if (parentPort.TryGetValue(s, out pp)) n.Title = pp + "  →  " + n.Title;
+                    swNodes[par].Children.Add(n);
+                }
+                else gwNode.Children.Add(n);
+            }
+            foreach (SwitchState s in switches)
+                if (!s.Reachable)
+                {
+                    TopoNode n = new TopoNode();
+                    n.Kind = "switch";
+                    n.Title = s.Name + "  (" + s.Address + ")  [Switch - KEINE SNMP-ANTWORT]";
+                    n.Offline = true;
+                    gwNode.Children.Add(n);
+                }
+
+            // Geräte
+            List<PingTarget> aps = devices.FindAll(delegate (PingTarget t) { return LooksLikeAp(t); });
+            Dictionary<PingTarget, TopoNode> devNodes = new Dictionary<PingTarget, TopoNode>();
+            TopoNode unassigned = new TopoNode();
+            unassigned.Kind = "group";
+            unassigned.Title = "Nicht zugeordnet (kein verwalteter Switch / MAC unbekannt / anderes Netz)";
+            List<KeyValuePair<PingTarget, PingTarget>> behindAp = new List<KeyValuePair<PingTarget, PingTarget>>();
+
+            foreach (PingTarget t in devices)
+            {
+                if (t == gwDevice) continue;
+                TopoNode n = DeviceNode(t);
+                devNodes[t] = n;
+                string mac = NetTools.MacHex(t.Mac);
+                Seen best = null;
+                foreach (Seen x in Find(sw, mac))
+                {
+                    PortState up;
+                    bool isUplink = uplink.TryGetValue(x.Switch, out up) && up == x.Port;
+                    int w = x.Port.Macs.Count + (IsLinkPort(x.Port) ? 100000 : 0) + (isUplink ? 50000 : 0);
+                    int wb = best == null ? int.MaxValue : best.Port.Macs.Count + (IsLinkPort(best.Port) ? 100000 : 0) +
+                        (uplink.TryGetValue(best.Switch, out up) && up == best.Port ? 50000 : 0);
+                    if (w < wb) best = x;
+                }
+
+                if (best == null)
+                {
+                    bool random = RandomMac(t.Mac);
+                    bool mobile = MobileVendor(t.Vendor);
+                    links[t] = random ? Link("WLAN? (zufällige MAC)", true, false)
+                             : mobile ? Link("WLAN? (Mobilgerät-Hersteller)", true, false)
+                             : mac.Length != 12 ? Link("unbekannt (keine MAC)", false, false)
+                             : Link("unbekannt (an keinem Switch gefunden)", false, false);
+                    n.Wlan = links[t].Wlan;
+                    unassigned.Children.Add(n);
+                    continue;
+                }
+
+                if (best.Port.Wireless)
+                {
+                    links[t] = Link("WLAN: " + best.Switch.Name + " (" + best.Port.DisplayName + ")", true, true);
+                    n.Wlan = true;
+                    n.Title = "WLAN  →  " + n.Title;
+                    swNodes[best.Switch].Children.Add(n);
+                    continue;
+                }
+
+                // Hängt am selben Switch-Port wie ein Access Point -> vermutlich WLAN-Client dieses APs
+                PingTarget ap = null;
+                foreach (PingTarget a in aps)
+                    if (a != t && best.Port.Macs.Exists(delegate (string m) { return NetTools.MacHex(m) == NetTools.MacHex(a.Mac); })) ap = a;
+                if (ap != null && !LooksLikeAp(t) && best.Port.Macs.Count > 1)
+                {
+                    behindAp.Add(new KeyValuePair<PingTarget, PingTarget>(t, ap));
+                    links[t] = Link("WLAN? hinter " + ap.Name + " (" + best.Switch.Name + " / " + best.Port.DisplayName + ")", true, false);
+                    n.Wlan = true;
+                    continue;
+                }
+
+                bool rnd = RandomMac(t.Mac);
+                links[t] = Link("LAN: " + best.Switch.Name + " / " + best.Port.DisplayName + (rnd ? " (zufällige MAC - evtl. WLAN über AP ohne SNMP)" : ""), rnd, !rnd);
+                n.Wlan = rnd;
+                n.Title = best.Port.DisplayName + "  →  " + n.Title;
+                if (best.Port.Rating.Level > n.Level) { n.Level = best.Port.Rating.Level; n.Tip += "\r\nPort: " + best.Port.Rating.Short; }
+                swNodes[best.Switch].Children.Add(n);
+            }
+            foreach (KeyValuePair<PingTarget, PingTarget> kv in behindAp)
+            {
+                TopoNode n = devNodes[kv.Key];
+                n.Title = "WLAN?  →  " + n.Title;
+                TopoNode apNode;
+                if (devNodes.TryGetValue(kv.Value, out apNode)) apNode.Children.Add(n);
+                else unassigned.Children.Add(n);
+            }
+            if (unassigned.Children.Count > 0) root.Children.Add(unassigned);
+            Sort(root);
+            return root;
+        }
+
+        static bool Same(SwitchState a, string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            return string.Equals(a.SysName, name, StringComparison.OrdinalIgnoreCase) || string.Equals(a.Name, name, StringComparison.OrdinalIgnoreCase);
+        }
+
+        static DeviceLink Link(string text, bool wlan, bool certain)
+        {
+            DeviceLink l = new DeviceLink();
+            l.Text = text; l.Wlan = wlan; l.Certain = certain;
+            return l;
+        }
+
+        static TopoNode DeviceNode(PingTarget t)
+        {
+            TopoNode n = new TopoNode();
+            n.Kind = LooksLikeAp(t) ? "ap" : "device";
+            n.Target = t;
+            n.Title = t.Name + "  (" + t.Host + ")" + (t.Comment.Length > 0 ? "  - " + t.Comment : "") + (n.Kind == "ap" ? "  [Access Point]" : "");
+            n.Tip = (t.Mac.Length > 0 ? "MAC " + t.Mac + "  " + t.Vendor : "") + (t.Info.Length > 0 ? "\r\n" + t.Info : "");
+            Status(n, t);
+            return n;
+        }
+
+        static void Status(TopoNode n, PingTarget t)
+        {
+            PingTarget v = !t.Running && t.ServiceView != null ? t.ServiceView : t;
+            if (v.OutageStart.HasValue && v.OfflineMode) { n.Off = true; n.Title += "   ○ OFFLINE (vermutlich ausgeschaltet)"; return; }
+            n.Offline = v.OutageStart.HasValue;
+            if (n.Offline) n.Title += "   ✖ AUSFALL" + (v.Diagnosis.Length > 0 ? " - " + v.Diagnosis : "");
+        }
+
+        static void Sort(TopoNode n)
+        {
+            n.Children.Sort(delegate (TopoNode a, TopoNode b)
+            {
+                int ka = a.Kind == "group" ? 3 : a.Kind == "switch" || a.Kind == "ap" ? 1 : 2;
+                int kb = b.Kind == "group" ? 3 : b.Kind == "switch" || b.Kind == "ap" ? 1 : 2;
+                return ka != kb ? ka.CompareTo(kb) : string.Compare(a.Title, b.Title, StringComparison.OrdinalIgnoreCase);
+            });
+            foreach (TopoNode c in n.Children) Sort(c);
+        }
+
+        public static string ToText(TopoNode n)
+        {
+            StringBuilder sb = new StringBuilder();
+            Write(sb, n, "", true, true);
+            return sb.ToString();
+        }
+
+        static void Write(StringBuilder sb, TopoNode n, string indent, bool last, bool root)
+        {
+            sb.Append(indent).Append(root ? "" : last ? "└─ " : "├─ ").Append(n.Title).Append("\r\n");
+            string next = indent + (root ? "" : last ? "   " : "│  ");
+            for (int i = 0; i < n.Children.Count; i++) Write(sb, n.Children[i], next, i == n.Children.Count - 1, false);
+        }
+    }
+
+    /// <summary>
+    /// Bei einem Ausfall: Ist das Gerät aus, hängt es, hat es eine neue IP - oder liegt es an der eigenen Verbindung?
+    /// </summary>
+    static class OutageDiagnosis
+    {
+        public static void Run(PingTarget t, List<SwitchState> switches, out string verdict, out string details)
+        {
+            List<string> lines = new List<string>();
+            verdict = "";
+            IPAddress ip = Resolver.ResolveForPing(t.Host);
+            if (ip == null)
+            {
+                verdict = "Name nicht auflösbar";
+                details = "Der Name \"" + t.Host + "\" lässt sich nicht auflösen - eher ein DNS-Problem als ein Geräteausfall.";
+                return;
+            }
+
+            // Eigene Verbindung: antwortet das Gateway?
+            IPAddress gw = Topology.Gateway();
+            bool gwOk = true;
+            if (gw != null && !gw.Equals(ip))
+            {
+                try { using (Ping p = new Ping()) gwOk = p.Send(gw, 1500).Status == IPStatus.Success; }
+                catch { gwOk = false; }
+                if (!gwOk)
+                {
+                    lines.Add("✖ Auch das Gateway (" + gw + ") antwortet nicht: Wahrscheinlich ist die EIGENE Netzwerkverbindung dieses PCs " +
+                              "oder das Gateway gestört - der Ausfall betrifft dann vermutlich viele Geräte gleichzeitig.");
+                    verdict = "eigene Verbindung/Gateway gestört?";
+                }
+            }
+
+            bool local = false;
+            foreach (NetTools.Subnet s in NetTools.LocalSubnets()) if (s.Contains(ip)) local = true;
+
+            // Switch-Port des Geräts
+            string mac = NetTools.MacHex(t.Mac);
+            SwitchState sw = null;
+            PortState port = null;
+            foreach (SwitchState s in switches)
+                foreach (PortState p in s.Ports.Values)
+                    if (("," + p.DeviceMacs + ",").Contains("," + mac + ",") && mac.Length == 12) { sw = s; port = p; }
+            if (port != null)
+            {
+                bool macSeen = port.Macs.Exists(delegate (string m) { return NetTools.MacHex(m) == mac; });
+                if (!port.Up)
+                {
+                    lines.Add("● Switch-Port " + sw.Name + " / " + port.DisplayName + " hat KEINEN LINK: Das Gerät ist ausgeschaltet, das Netzteil bzw. " +
+                              "die PoE-Versorgung fehlt, oder das Kabel ist abgezogen/defekt.");
+                    if (verdict.Length == 0) verdict = "vermutlich aus / Kabel ab (kein Link am Switch)";
+                }
+                else if (macSeen)
+                {
+                    lines.Add("● Am Switch-Port " + sw.Name + " / " + port.DisplayName + " ist der Link da und die MAC des Geräts noch bekannt: " +
+                              "Das Gerät ist eingeschaltet und verbunden, antwortet aber nicht (abgestürzt/hängt, Ping-Sperre, neue IP-Adresse?).");
+                    if (verdict.Length == 0) verdict = "eingeschaltet, antwortet nicht";
+                }
+                else
+                    lines.Add("● Am Switch-Port " + sw.Name + " / " + port.DisplayName + " ist ein Link, die MAC des Geräts aber nicht mehr bekannt " +
+                              "(Standby oder anderes Gerät eingesteckt).");
+                if (port.Rating.Level >= Finding.Warning)
+                    lines.Add("▲ Dieser Switch-Port ist auffällig: " + port.Rating.Short + " - siehe Switch-Ansicht.");
+            }
+
+            // ARP: Ist unter der IP überhaupt ein Gerät im lokalen Netz?
+            if (local)
+            {
+                string arp = NetTools.MacHex(NetTools.GetMac(ip));
+                if (arp.Length == 12 && mac.Length == 12 && arp != mac)
+                {
+                    lines.Add("✖ Unter der IP " + ip + " meldet sich ein ANDERES Gerät (MAC " + arp + ", " + MacVendors.Lookup(arp) + "): IP-Adress-Konflikt " +
+                              "oder das Gerät hat per DHCP eine neue Adresse bekommen.");
+                    if (verdict.Length == 0 || verdict.StartsWith("eingeschaltet")) verdict = "IP-Konflikt / neue IP?";
+                }
+                else if (arp.Length == 12)
+                {
+                    lines.Add("● Das Gerät antwortet auf ARP (ist im Netz), aber nicht auf Ping: Firewall/Ping-Sperre, überlastet oder abgestürzt. " +
+                              "(Hinweis: Windows kann die ARP-Antwort kurz zwischenspeichern.)");
+                    if (verdict.Length == 0) verdict = "im Netz, antwortet nicht auf Ping";
+                }
+                else
+                {
+                    lines.Add("● Keine ARP-Antwort: Unter dieser IP ist im lokalen Netz kein Gerät erreichbar - ausgeschaltet, Kabel ab, WLAN getrennt oder Standby.");
+                    if (verdict.Length == 0) verdict = "nicht im Netz (aus / getrennt)";
+                }
+            }
+            else
+                lines.Add("● Das Gerät liegt in einem anderen Netz (hinter einem Router) - ARP und MAC-Prüfung sind von hier nicht möglich.");
+
+            if (Topology.RandomMac(t.Mac) || Topology.MobileVendor(t.Vendor))
+                lines.Add("ⓘ Vermutlich ein WLAN-/Mobilgerät: Smartphones und Tablets trennen im Standby das WLAN oder antworten nicht auf Ping - meist kein Fehler.");
+            if (verdict.Length == 0) verdict = "Ursache unklar";
+            details = string.Join("\r\n", lines.ToArray());
+        }
+    }
+
+    /// <summary>Netzwerkplan als Baum: Internet - Gateway - Switches - Access Points - Geräte.</summary>
+    class TopologyForm : Form
+    {
+        readonly Func<List<SwitchState>> switchData;
+        readonly Func<List<PingTarget>> deviceData;
+        readonly Action<PingTarget> showDevice;
+        TreeView tree;
+        CheckBox chkHideWlan;
+        Label lblInfo;
+        TopoNode current;
+
+        public TopologyForm(Func<List<SwitchState>> switches, Func<List<PingTarget>> devices, Action<PingTarget> show)
+        {
+            switchData = switches;
+            deviceData = devices;
+            showDevice = show;
+            Text = "Netzwerkplan";
+            Font = new Font("Segoe UI", 9.5F);
+            Size = new Size(1000, 760);
+            StartPosition = FormStartPosition.CenterParent;
+
+            FlowLayoutPanel top = new FlowLayoutPanel();
+            top.Dock = DockStyle.Top;
+            top.AutoSize = true;
+            top.Padding = new Padding(6);
+            top.Controls.Add(Btn("Aktualisieren", delegate { Rebuild(); }));
+            top.Controls.Add(Btn("Alles aufklappen", delegate { tree.ExpandAll(); }));
+            top.Controls.Add(Btn("Alles zuklappen", delegate { tree.CollapseAll(); if (tree.Nodes.Count > 0) tree.Nodes[0].Expand(); }));
+            top.Controls.Add(Btn("Als Text kopieren", delegate
+            {
+                if (current == null) return;
+                try { Clipboard.SetText(Topology.ToText(current)); MessageBox.Show(this, "Netzwerkplan als Text in die Zwischenablage kopiert.", Text); }
+                catch (Exception ex) { MessageBox.Show(this, ex.Message, Text); }
+            }));
+            chkHideWlan = new CheckBox();
+            chkHideWlan.Text = "WLAN-Geräte ausblenden";
+            chkHideWlan.AutoSize = true;
+            chkHideWlan.Margin = new Padding(12, 7, 3, 3);
+            chkHideWlan.CheckedChanged += delegate { Render(); };
+            top.Controls.Add(chkHideWlan);
+            lblInfo = new Label();
+            lblInfo.AutoSize = true;
+            lblInfo.Margin = new Padding(12, 7, 3, 3);
+            lblInfo.ForeColor = SystemColors.GrayText;
+            lblInfo.MaximumSize = new Size(960, 0);
+            lblInfo.Text = "Switch-Verbindungen aus LLDP bzw. den MAC-Tabellen der Switches (\"Switches ...\" müssen eingetragen sein). " +
+                "Rot = Ausfall, grau = offline/ausgeschaltet, farbig hinterlegt = auffälliger Port, blau = WLAN (vermutet). Doppelklick auf ein Gerät zeigt Details.";
+            top.SetFlowBreak(chkHideWlan, true);
+            top.Controls.Add(lblInfo);
+
+            tree = new TreeView();
+            tree.Dock = DockStyle.Fill;
+            tree.ShowNodeToolTips = true;
+            tree.HideSelection = false;
+            tree.FullRowSelect = true;
+            tree.ItemHeight = 22;
+            tree.NodeMouseDoubleClick += delegate (object sender, TreeNodeMouseClickEventArgs e)
+            {
+                TopoNode n = e.Node.Tag as TopoNode;
+                if (n != null && n.Target != null) showDevice(n.Target);
+            };
+            Controls.Add(tree);
+            Controls.Add(top);
+            Shown += delegate { Rebuild(); };
+        }
+
+        static Button Btn(string t, EventHandler click)
+        {
+            Button b = new Button(); b.Text = t; b.AutoSize = true; b.Click += click;
+            return b;
+        }
+
+        void Rebuild()
+        {
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                Dictionary<PingTarget, DeviceLink> links;
+                current = Topology.Build(switchData(), deviceData(), out links);
+            }
+            finally { Cursor = Cursors.Default; }
+            Render();
+        }
+
+        void Render()
+        {
+            if (current == null) return;
+            tree.BeginUpdate();
+            tree.Nodes.Clear();
+            TreeNode root = Add(tree.Nodes, current);
+            tree.EndUpdate();
+            if (root != null) root.ExpandAll();
+        }
+
+        TreeNode Add(TreeNodeCollection parent, TopoNode n)
+        {
+            if (chkHideWlan.Checked && n.Wlan && n.Children.Count == 0) return null;
+            TreeNode node = parent.Add(n.Title);
+            node.Tag = n;
+            node.ToolTipText = n.Tip;
+            if (n.Offline) { node.ForeColor = Color.DarkRed; node.NodeFont = new Font(tree.Font, FontStyle.Bold); }
+            else if (n.Off || n.Kind == "group") node.ForeColor = SystemColors.GrayText;
+            else if (n.Wlan) node.ForeColor = Color.SteelBlue;
+            else if (n.Kind == "switch" || n.Kind == "gateway" || n.Kind == "internet" || n.Kind == "ap") node.NodeFont = new Font(tree.Font, FontStyle.Bold);
+            if (n.Level >= Finding.Warning) node.BackColor = Finding.Back(n.Level);
+            foreach (TopoNode c in n.Children) Add(node.Nodes, c);
+            return node;
+        }
+    }
+
+    /// <summary>Daten zurücksetzen (Geräteliste, Switches, Protokolle, Einstellungen).</summary>
+    class ResetForm : Form
+    {
+        public CheckBox Hosts, Switches, Logs, Settings;
+
+        public ResetForm()
+        {
+            Text = "Zurücksetzen";
+            Font = new Font("Segoe UI", 9.5F);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+
+            FlowLayoutPanel p = new FlowLayoutPanel();
+            p.FlowDirection = FlowDirection.TopDown;
+            p.AutoSize = true;
+            p.Padding = new Padding(14);
+            Label l = new Label();
+            l.Text = "Was soll gelöscht werden? Das kann nicht rückgängig gemacht werden.";
+            l.AutoSize = true;
+            l.Font = new Font(Font, FontStyle.Bold);
+            l.Margin = new Padding(0, 0, 0, 10);
+            p.Controls.Add(l);
+            Hosts = Chk(p, "Geräteliste (hosts.txt) inkl. Kommentaren", true);
+            Switches = Chk(p, "Switch-Liste (switches.txt)", true);
+            Logs = Chk(p, "Alle Protokolle (Ordner Logs)", true);
+            Settings = Chk(p, "Einstellungen (DNS, Benachrichtigungen, Passwörter, Herstellerliste)", false);
+            Label hint = new Label();
+            hint.Text = "Läuft der Windows-Dienst, übernimmt er die leere Geräte- und Switch-Liste automatisch.";
+            hint.AutoSize = true;
+            hint.ForeColor = SystemColors.GrayText;
+            hint.Margin = new Padding(0, 10, 0, 10);
+            p.Controls.Add(hint);
+
+            FlowLayoutPanel b = new FlowLayoutPanel();
+            b.AutoSize = true;
+            Button ok = new Button(); ok.Text = "Jetzt löschen"; ok.AutoSize = true; ok.DialogResult = DialogResult.OK;
+            Button cancel = new Button(); cancel.Text = "Abbrechen"; cancel.AutoSize = true; cancel.DialogResult = DialogResult.Cancel;
+            b.Controls.Add(ok);
+            b.Controls.Add(cancel);
+            p.Controls.Add(b);
+            Controls.Add(p);
+            CancelButton = cancel;
+        }
+
+        static CheckBox Chk(Control parent, string text, bool value)
+        {
+            CheckBox c = new CheckBox();
+            c.Text = text; c.Checked = value; c.AutoSize = true;
+            parent.Controls.Add(c);
+            return c;
         }
     }
 }

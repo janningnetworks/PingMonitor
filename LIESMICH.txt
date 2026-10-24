@@ -107,6 +107,50 @@ Schaltfläche "Switches ...": Switches mit IP-Adresse und SNMP-Community eintrag
 - Hinweis: Welche Werte ein Switch liefert, hängt vom Modell ab. Fehlende Werte (z. B. Duplex oder
   CRC-Zähler bei manchen Geräten) werden durch allgemeine Fehlerzähler ersetzt bzw. leer gelassen.
 
+Suchen, Filtern, WLAN-Geräte
+----------------------------
+- Suchfeld über der Geräteliste: durchsucht alle Spalten (Name, Kommentar, IP, MAC, Hersteller, DNS,
+  NetBIOS, Switch-Port, Verbindung ...). Mehrere Begriffe = alle müssen passen (z. B. "og drucker").
+- Auswahlliste: alle / nur erreichbare / nur Ausfälle / nur auffällige / nur LAN / nur WLAN /
+  nur nicht zugeordnete / nur offline (ausgeschaltet).
+- "WLAN-Geräte ausblenden" (auch im Scanner und im Netzwerkplan). Als WLAN gilt ein Gerät, wenn
+  * es an der WLAN-Schnittstelle eines per SNMP abgefragten Access Points hängt (sicher),
+  * es am selben Switch-Port wie ein Access Point hängt (vermutet). Access Points erkennt die App an
+    der SNMP-/Geräteinfo (UAP, U6, EAP ...) oder am Namen/Kommentar ("AP", "Access Point", "WLAN-AP"),
+  * es eine zufällige/private MAC hat (Smartphones, Tablets) oder von einem typischen
+    Mobilgeräte-/WLAN-Modul-Hersteller stammt (nur wenn es an keinem Switch-Port gefunden wird).
+- Spalte "Verbindung": LAN: Switch / Port, WLAN: Access Point, WLAN? (vermutet) oder unbekannt.
+
+Netzwerkplan
+------------
+Schaltfläche "Netzwerkplan ...": Baum Internet -> Gateway/Firewall -> Switches -> Access Points -> Geräte.
+- Verbindungen zwischen Switches über LLDP (direkte Nachbarn), sonst aus den MAC-Tabellen abgeleitet.
+- Geräte erscheinen an ihrem Port; WLAN-Geräte (vermutet) unter dem Access Point.
+- Farben: rot = Ausfall, grau = offline/ausgeschaltet, hinterlegt = auffälliger Port, blau = WLAN.
+- "Als Text kopieren" für Dokumentation/E-Mail. Doppelklick auf ein Gerät zeigt alle Details.
+- Voraussetzung: Switches unter "Switches ..." eingetragen (SNMP). Ohne verwaltete Switches landen
+  Geräte unter "Nicht zugeordnet".
+
+Ausgeschaltete Geräte / Ausfall-Diagnose
+----------------------------------------
+20 Sekunden nach Beginn eines Ausfalls prüft die App automatisch die Ursache:
+- Switch-Port ohne Link             -> Gerät ausgeschaltet, Netzteil/PoE fehlt oder Kabel ab
+- Link da, MAC noch bekannt          -> Gerät eingeschaltet, antwortet aber nicht (hängt, Ping-Sperre)
+- Antwort auf ARP, nicht auf Ping    -> im Netz, aber Firewall/überlastet/abgestürzt
+- ANDERE MAC unter der IP            -> IP-Konflikt oder neue IP per DHCP
+- keine ARP-Antwort                  -> nicht im Netz (aus, Kabel ab, WLAN getrennt)
+- Gateway antwortet auch nicht       -> eigene Verbindung dieses PCs/Gateway gestört
+Den zuletzt bekannten Switch-Port merkt sich die App (mac_ports.txt) - auch wenn ein ausgeschaltetes
+Gerät aus der MAC-Tabelle des Switches gefallen ist.
+Ist ein Gerät vermutlich AUSGESCHALTET, wird es als "OFFLINE" (grau) geführt und NICHT als Störung
+gewertet: Die Fehlschläge werden aus Verlust-Statistik und Leitungsqualität herausgerechnet.
+Im Protokoll stehen nur "Offline" und später "Wieder online" mit Zeitraum und Dauer.
+
+Zurücksetzen
+------------
+"Zurücksetzen ..." löscht wahlweise Geräteliste (hosts.txt), Switch-Liste (switches.txt, mac_ports.txt),
+alle Protokolle und optional die Einstellungen. Nicht rückgängig zu machen.
+
 Windows-Dienst (optional)
 -------------------------
 - In der App: "Dienst installieren" (Windows fragt nach Administratorrechten).
@@ -176,6 +220,7 @@ hosts.txt          Geräteliste (Name;Host;Intervall_ms;Timeout_ms;MAC;Herstelle
 settings.txt       Einstellungen inkl. Benachrichtigungen, DNS-Server, SNMP-Community
 Logs\              Ausfallprotokolle
 switches.txt       Switch-Liste (Name;IP;Community)
+mac_ports.txt      zuletzt bekannter Switch-Port je Geräte-MAC
 Switch_Status.csv  aktueller Switch-Status des Dienstes (für die Anzeige in der App)
 oui.csv            aktualisierte Herstellerliste (optional, sonst eingebaute Liste)
 Dienst_Status.csv  aktueller Status des Dienstes (für die Anzeige in der App)
