@@ -178,6 +178,44 @@ Geräte werden bevorzugt Endgeräte-Ports zugeordnet. Wird ein Gerät nur an Swi
 steht dort "nur an Switch-Verbindung gesehen - hängt an einem nicht eingetragenen Switch/AP".
 Tipp: Alle verwalteten Switches eintragen und LLDP an den Switches eingeschaltet lassen (UniFi: Standard).
 
+Liefert ein Switch per SNMP keine MAC-Tabelle (bei manchen UniFi-Modellen/Firmwares der Fall), sieht nur der
+vorgelagerte Switch das Gerät - an seinem Verbindungsport. Der Netzwerkplan schließt dann auf den Nachbarn:
+"LAN: Büro-Switch / Port ? (Büro-Switch liefert keine MAC-Tabelle; gesehen an Keller-Switch / Port 8)".
+Ein AP, der zusammen mit so einem Switch am selben Port gesehen wird, wird unter diesen Switch gehängt.
+Den genauen Port kennt in diesem Fall nur der UniFi-Controller (siehe unten).
+
+WLAN-Erkennung
+--------------
+Sicher erkannt (Spalte "Verbindung" ohne Fragezeichen):
+  - UniFi-Controller eingerichtet: AP, SSID und Signalstärke je Gerät (Signal <= -80 dBm wird markiert)
+  - AP liefert per SNMP seine WLAN-Clients (MAC-Tabelle auf WLAN-Schnittstellen)
+Vermutet ("WLAN?"):
+  - zufällige/private MAC (Android/iOS/Windows verwenden je WLAN eine eigene, zufällige MAC - der Hersteller
+    ist dann nicht erkennbar, z. B. beim Pixel) und das Gerät wird nur hinter einem Switch/AP gesehen
+  - Hersteller typischer Mobilgeräte an einem Port mit mehreren MACs
+UniFi-APs geben ihre WLAN-Clients per SNMP NICHT heraus - für sichere Erkennung den UniFi-Controller einrichten.
+
+UniFi-Controller (genaue Zuordnung LAN-Port und WLAN)
+------------------------------------------------------
+"Switches ..." -> "UniFi-Controller ...": Adresse (UDM/UDR/Cloud Key/UniFi OS Server: einfach die IP,
+klassischer Controller: https://name:8443), Benutzer, Passwort, Site (Standard "default").
+  - Im Controller einen eigenen LOKALEN Benutzer anlegen (Admins -> Benutzer hinzufügen, "Restrict to local
+    access only"), Rolle "View Only" bzw. "Nur lesen". UI-Cloud-Konten mit Zwei-Faktor gehen nicht.
+  - PingMonitor liest nur (Geräte- und Clientliste), ändert nichts. Das Passwort wird verschlüsselt
+    (Windows-DPAPI) in settings.txt gespeichert. Das selbstsignierte Zertifikat des Controllers wird akzeptiert.
+  - Abgefragt wird bei jeder Switch-Abfragerunde (Dienst bzw. App). Nicht erreichbar / wieder erreichbar
+    wird im Ausfallprotokoll vermerkt.
+Ergebnis: Geräte stehen am richtigen Switch-Port ("LAN: USW Büro / Port 3"), WLAN-Geräte am richtigen AP
+("WLAN: U6-Pro Büro · SSID · -58 dBm"), die UniFi-Switches/APs sind laut Controller verkabelt (Uplink-Port),
+auch UniFi-Geräte ohne SNMP-Eintrag erscheinen im Netzwerkplan (offline beim Controller wird markiert).
+
+Diagnosedaten speichern
+-----------------------
+"Switches ..." -> "Diagnosedaten speichern ..." schreibt eine Textdatei mit allem, was die Zuordnung
+bestimmt: je Switch Typ, eigene MACs, ob eine MAC-Tabelle geliefert wird, je Port Rolle/Nachbarn/LLDP/MACs,
+die UniFi-Daten, die Zuordnung jedes Geräts und den Netzwerkplan. Enthält IP-/MAC-Adressen und Namen,
+aber keine Passwörter oder Communities. Hilfreich, wenn ein Gerät falsch zugeordnet wird.
+
 Mitschnitt analysieren (pcap / pcapng)
 --------------------------------------
 Schaltfläche "Mitschnitt analysieren ..." (Datei öffnen oder ins Fenster ziehen), oder direkt:

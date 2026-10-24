@@ -704,7 +704,7 @@ namespace PingMonitor
         // nicht im Klartext in settings.txt steht und der Dienst (LocalSystem) es trotzdem lesen kann.
         static readonly byte[] Entropy = Encoding.UTF8.GetBytes("PingMonitor");
 
-        static string Protect(string plain)
+        public static string Protect(string plain)
         {
             if (string.IsNullOrEmpty(plain)) return "";
             try
@@ -718,7 +718,7 @@ namespace PingMonitor
             }
         }
 
-        static string Unprotect(string stored)
+        public static string Unprotect(string stored)
         {
             try
             {
@@ -914,6 +914,124 @@ namespace PingMonitor
 
     static class Json
     {
+        /// <summary>Kleiner JSON-Leser: Objekte -> Dictionary, Arrays -> List, Zahlen -> double.</summary>
+        public static object Parse(string s)
+        {
+            int i = 0;
+            return Value(s, ref i);
+        }
+
+        static void Ws(string s, ref int i) { while (i < s.Length && char.IsWhiteSpace(s[i])) i++; }
+
+        static object Value(string s, ref int i)
+        {
+            Ws(s, ref i);
+            if (i >= s.Length) throw new FormatException("JSON unvollständig");
+            char c = s[i];
+            if (c == '{')
+            {
+                Dictionary<string, object> d = new Dictionary<string, object>();
+                i++;
+                Ws(s, ref i);
+                if (i < s.Length && s[i] == '}') { i++; return d; }
+                while (true)
+                {
+                    Ws(s, ref i);
+                    string key = Text(s, ref i);
+                    Ws(s, ref i);
+                    if (i >= s.Length || s[i] != ':') throw new FormatException("':' erwartet");
+                    i++;
+                    d[key] = Value(s, ref i);
+                    Ws(s, ref i);
+                    if (i < s.Length && s[i] == ',') { i++; continue; }
+                    if (i < s.Length && s[i] == '}') { i++; return d; }
+                    throw new FormatException("',' oder '}' erwartet");
+                }
+            }
+            if (c == '[')
+            {
+                List<object> l = new List<object>();
+                i++;
+                Ws(s, ref i);
+                if (i < s.Length && s[i] == ']') { i++; return l; }
+                while (true)
+                {
+                    l.Add(Value(s, ref i));
+                    Ws(s, ref i);
+                    if (i < s.Length && s[i] == ',') { i++; continue; }
+                    if (i < s.Length && s[i] == ']') { i++; return l; }
+                    throw new FormatException("',' oder ']' erwartet");
+                }
+            }
+            if (c == '"') return Text(s, ref i);
+            if (s.Substring(i).StartsWith("true")) { i += 4; return true; }
+            if (s.Substring(i, Math.Min(5, s.Length - i)).StartsWith("false")) { i += 5; return false; }
+            if (s.Substring(i, Math.Min(4, s.Length - i)).StartsWith("null")) { i += 4; return null; }
+            int start = i;
+            while (i < s.Length && "+-0123456789.eE".IndexOf(s[i]) >= 0) i++;
+            if (i == start) throw new FormatException("Unerwartetes Zeichen '" + c + "'");
+            return double.Parse(s.Substring(start, i - start), System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        static string Text(string s, ref int i)
+        {
+            if (s[i] != '"') throw new FormatException("Text erwartet");
+            i++;
+            StringBuilder sb = new StringBuilder();
+            while (i < s.Length && s[i] != '"')
+            {
+                char c = s[i++];
+                if (c != '\\') { sb.Append(c); continue; }
+                char e = s[i++];
+                switch (e)
+                {
+                    case 'n': sb.Append('\n'); break;
+                    case 'r': sb.Append('\r'); break;
+                    case 't': sb.Append('\t'); break;
+                    case 'b': sb.Append('\b'); break;
+                    case 'f': sb.Append('\f'); break;
+                    case 'u': sb.Append((char)Convert.ToInt32(s.Substring(i, 4), 16)); i += 4; break;
+                    default: sb.Append(e); break;
+                }
+            }
+            i++;
+            return sb.ToString();
+        }
+
+        public static string S(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (d == null || !d.TryGetValue(key, out v) || v == null) return "";
+            return v is double ? ((double)v).ToString(System.Globalization.CultureInfo.InvariantCulture) : v.ToString();
+        }
+
+        public static double N(Dictionary<string, object> d, string key, double def)
+        {
+            object v;
+            if (d == null || !d.TryGetValue(key, out v) || v == null) return def;
+            if (v is double) return (double)v;
+            double r;
+            return double.TryParse(v.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out r) ? r : def;
+        }
+
+        public static bool B(Dictionary<string, object> d, string key)
+        {
+            object v;
+            return d != null && d.TryGetValue(key, out v) && v is bool && (bool)v;
+        }
+
+        public static Dictionary<string, object> Obj(Dictionary<string, object> d, string key)
+        {
+            object v;
+            return d != null && d.TryGetValue(key, out v) ? v as Dictionary<string, object> : null;
+        }
+
+        public static List<object> Arr(Dictionary<string, object> d, string key)
+        {
+            object v;
+            return d != null && d.TryGetValue(key, out v) && v is List<object> ? (List<object>)v : new List<object>();
+        }
+
         public static string Str(string s)
         {
             if (s == null) return "null";
@@ -1638,7 +1756,8 @@ namespace PingMonitor
             actions.Controls.Add(NewButton("Netzwerkplan ...", delegate
             {
                 using (TopologyForm f = new TopologyForm(delegate { return SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running); },
-                    delegate { return new List<PingTarget>(targets); }, delegate (PingTarget t) { ShowDetails(t); }))
+                    delegate { return new List<PingTarget>(targets); },
+                    delegate { return SwitchMonitor.CurrentUniFi(svcStatus == ServiceControllerStatus.Running); }, delegate (PingTarget t) { ShowDetails(t); }))
                     f.ShowDialog(this);
             }));
             actions.Controls.Add(NewButton("Mitschnitt analysieren ...", delegate
@@ -2198,7 +2317,8 @@ namespace PingMonitor
                         map[mac] = new KeyValuePair<SwitchState, PortState>(s, p);
             portByMac = map;
             Dictionary<PingTarget, DeviceLink> links;
-            try { Topology.Build(SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running), new List<PingTarget>(targets), out links); }
+            try { Topology.Build(SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running), new List<PingTarget>(targets),
+                SwitchMonitor.CurrentUniFi(svcStatus == ServiceControllerStatus.Running), out links); }
             catch { links = new Dictionary<PingTarget, DeviceLink>(); }
             foreach (PingTarget t in targets)
             {
@@ -2618,7 +2738,7 @@ namespace PingMonitor
             // Switch-Abfrage: übernimmt der Dienst, wenn er läuft - sonst die App.
             bool svcRunning = svcStatus == ServiceControllerStatus.Running;
             if (svcRunning && SwitchMonitor.Running) SwitchMonitor.Stop();
-            else if (!svcRunning && !SwitchMonitor.Running && File.Exists(SwitchMonitor.ConfigFile)) SwitchMonitor.Start(LocalSource, false);
+            else if (!svcRunning && !SwitchMonitor.Running && (File.Exists(SwitchMonitor.ConfigFile) || UniFi.Configured)) SwitchMonitor.Start(LocalSource, false);
             if (++portRefresh % 5 == 1) RefreshPorts();
         }
 
@@ -4740,6 +4860,7 @@ namespace PingMonitor
         public int LldpCaps;             // LLDP-Fähigkeiten des Nachbarn (Bridge 0x20, WLAN-AP 0x10, Router 0x08, Telefon 0x04)
         public string Role = "";         // "" = Endgerät, "uplink" = Richtung Gateway, "switch" = Verbindung zu anderem Switch, "ap" = Access Point
         public string RoleInfo = "";
+        public string RoleTarget = "";   // Nachbarn hinter diesem Port (kommagetrennt): Adresse eines eingetragenen Switches oder "mac:<UniFi-Gerät>"
 
         public bool IsInfrastructure { get { return Role == "uplink" || Role == "switch"; } }
         public string DeviceNames = "";  // überwachte Geräte an diesem Port
@@ -4873,6 +4994,52 @@ namespace PingMonitor
         static string owner = "";
         static DateTime configStamp;
         static string snapshot = "";
+        static UniFiSnapshot unifi = new UniFiSnapshot();
+
+        static void LogUniFi(string evt, string info)
+        {
+            LogEntry e = new LogEntry();
+            e.Time = DateTime.Now; e.Name = "UniFi-Controller"; e.Host = Config.Cached("UniFi.Url", ""); e.Event = evt; e.Info = info;
+            e.Source = Source + " (" + owner + ")";
+            try { CsvLog.Write(e); } catch { }
+        }
+
+        public static UniFiSnapshot CurrentUniFi(bool fromService)
+        {
+            try { return UniFiSnapshot.Parse(SnapshotLines(fromService)); }
+            catch { return new UniFiSnapshot(); }
+        }
+
+        static string[] SnapshotLines(bool fromService)
+        {
+            if (fromService) return File.Exists(StatusFile) ? Config.ReadAllLinesShared(StatusFile) : new string[0];
+            string snap;
+            lock (sync) snap = running ? snapshot : "";
+            return snap.Split(new string[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries);
+        }
+
+        /// <summary>Gehört dieser UniFi-Eintrag zu einem per SNMP abgefragten Switch? (IP, MAC oder Name)</summary>
+        public static bool Matches(SwitchState s, UniFiDeviceInfo d)
+        {
+            if (d.Ip.Length > 0 && s.Address == d.Ip) return true;
+            foreach (string m in s.OwnMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                if (d.Mac.Length == 12 && NetTools.MacHex(m) == d.Mac) return true;
+            return d.Name.Length > 0 && (string.Equals(s.SysName, d.Name, StringComparison.OrdinalIgnoreCase) || string.Equals(s.Name, d.Name, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>Port eines Switches anhand der UniFi-Portnummer finden (Name "Port N" oder ifIndex N).</summary>
+        public static PortState PortByNumber(SwitchState s, int n)
+        {
+            if (n <= 0) return null;
+            foreach (PortState p in s.Ports.Values)
+            {
+                string name = p.Name.Trim().ToLowerInvariant();
+                if (name == "port " + n || name == "port" + n || name.EndsWith("/" + n) || name == n.ToString()) return p;
+            }
+            PortState byIndex;
+            return s.Ports.TryGetValue(n, out byIndex) ? byIndex : null;
+        }
+
         // Zuletzt bekannter Port je Geräte-MAC (bleibt erhalten, wenn ein Gerät aus ist und aus der MAC-Tabelle fällt)
         static Dictionary<string, string[]> lastPorts;
         public static string LastPortsFile { get { return Path.Combine(Config.BaseDir, "mac_ports.txt"); } }
@@ -5000,11 +5167,21 @@ namespace PingMonitor
                         jobs.Add(t);
                     }
                     foreach (Thread t in jobs) t.Join(TimeSpan.FromMinutes(2));
+                    if (UniFi.Configured)
+                    {
+                        UniFiSnapshot u = UniFi.Fetch();
+                        if (u.Error.Length > 0 && u.Error != unifi.Error)
+                            LogUniFi("UniFi-Controller nicht erreichbar", u.Error);
+                        else if (u.Valid && unifi.Error.Length > 0)
+                            LogUniFi("UniFi-Controller wieder erreichbar", u.Devices.Count + " Geräte, " + u.Clients.Count + " Clients");
+                        lock (sync) unifi = u;
+                    }
+                    else lock (sync) unifi = new UniFiSnapshot();
                     AssignRoles();
                     MapDevices();
                     lock (sync) foreach (SwitchState s in switches) foreach (PortState p in s.Ports.Values) Evaluate(s, p);
                     // Anzeige und Statusdatei sehen nur vollständig abgeschlossene Abfragerunden.
-                    string snap = Serialize();
+                    string snap = Serialize() + unifi.Serialize();
                     lock (sync) snapshot = snap;
                     if (writeStatus) WriteStatus(snap);
                 }
@@ -5221,6 +5398,10 @@ namespace PingMonitor
                 }
             }
 
+            // Hat das Gerät WLAN-Schnittstellen, ist es ein Access Point
+            if (s.Kind == "Switch")
+                lock (sync) foreach (PortState wp in s.Ports.Values) if (wp.Wireless) { s.Kind = "Access Point"; break; }
+
             // MAC-Adresstabelle (welches Gerät hängt an welchem Port) - nur jede 5. Abfrage, sie ist aufwändiger
             if (s.PollCount % 5 == 0) ReadFdb(ip, s);
             s.PollCount++;
@@ -5381,24 +5562,44 @@ namespace PingMonitor
                 Dictionary<string, SwitchState> switchMacs = new Dictionary<string, SwitchState>();
                 foreach (SwitchState s in switches)
                     foreach (string m in s.OwnMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                    {
                         switchMacs[NetTools.MacHex(m)] = s;
+                        if (s.Kind == "Access Point") { apMacs.Add(NetTools.MacHex(m)); apNames[NetTools.MacHex(m)] = s.Name; }
+                    }
+                // UniFi-Geräte (Switches, APs, Gateways): ihre MACs kennzeichnen Verbindungs-Ports - auch wenn der Switch
+                // selbst per SNMP keine eigene MAC verrät.
+                Dictionary<string, UniFiDeviceInfo> unifiMacs = new Dictionary<string, UniFiDeviceInfo>();
+                foreach (UniFiDeviceInfo d in unifi.Devices)
+                {
+                    if (d.Mac.Length != 12) continue;
+                    SwitchState match = switches.Find(delegate (SwitchState x) { return Matches(x, d); });
+                    if (match != null && !switchMacs.ContainsKey(d.Mac)) switchMacs[d.Mac] = match;
+                    else if (match == null) unifiMacs[d.Mac] = d;
+                    if (d.IsAp) { apMacs.Add(d.Mac); apNames[d.Mac] = d.Name; }
+                }
 
                 foreach (SwitchState s in switches)
                     foreach (PortState p in s.Ports.Values)
                     {
-                        p.Role = ""; p.RoleInfo = "";
+                        p.Role = ""; p.RoleInfo = ""; p.RoleTarget = "";
                         if (s.Kind == "Firewall" || p.Wireless) continue;
                         bool seesGw = false;
                         List<string> otherSwitches = new List<string>();
+                        List<string> targets = new List<string>();
                         string apSeen = "";
                         foreach (string m in p.Macs)
                         {
                             string h = NetTools.MacHex(m);
                             if (h == gw) seesGw = true;
                             SwitchState o;
-                            if (switchMacs.TryGetValue(h, out o) && o != s && !otherSwitches.Contains(o.Name)) otherSwitches.Add(o.Name);
+                            UniFiDeviceInfo ud;
+                            if (switchMacs.TryGetValue(h, out o) && o != s && !otherSwitches.Contains(o.Name)) { otherSwitches.Add(o.Name); targets.Add(o.Address); }
+                            else if (unifiMacs.TryGetValue(h, out ud) && !ud.IsAp && !otherSwitches.Contains(ud.Name)) { otherSwitches.Add(ud.Name); targets.Add("mac:" + ud.Mac); }
                             if (apMacs.Contains(h)) apSeen = apNames[h];
                         }
+                        // Ein UniFi-AP ist ein Endgerät des Switches (Rolle "ap"), aber kein weiterer Switch.
+                        // Alle Nachbarn hinter dem Port merken - welcher der direkte ist, entscheidet der Netzwerkplan.
+                        p.RoleTarget = string.Join(",", targets.ToArray());
                         bool lldp = p.LldpName.Length > 0 || p.LldpChassis.Length > 0;
                         bool phone = (p.LldpCaps & 0x04) != 0;
                         bool lldpInfra = lldp && !phone && ((p.LldpCaps & 0x28) != 0 ||
@@ -5451,11 +5652,32 @@ namespace PingMonitor
                     string mac = NetTools.MacHex(t.Mac);
                     if (mac.Length != 12) continue;
                     PortState best = null;
+                    string suffix = "";
+                    // 1. UniFi-Controller weiß es genau (Switch + Port bzw. Access Point)
+                    UniFiClientInfo uc = unifi.Valid ? unifi.Client(mac, t.Host) : null;
+                    if (uc != null)
+                    {
+                        UniFiDeviceInfo ud = unifi.Device(uc.Wired ? uc.SwMac : uc.ApMac);
+                        SwitchState home = ud == null ? null : switches.Find(delegate (SwitchState x) { return Matches(x, ud); });
+                        if (home != null)
+                        {
+                            if (uc.Wired) best = PortByNumber(home, uc.SwPort);
+                            else foreach (PortState wp in home.Ports.Values) if (wp.Wireless) { best = wp; break; }
+                        }
+                        if (best != null)
+                        {
+                            best.DeviceNames += (best.DeviceNames.Length > 0 ? ", " : "") + t.Name;
+                            best.DeviceMacs += (best.DeviceMacs.Length > 0 ? "," : "") + mac;
+                            if (uc.Wired) { lastPorts[mac] = new string[] { home.Address, best.IfIndex.ToString(), DateTime.Now.ToString(Fmt.Time) }; changed = true; }
+                            continue;
+                        }
+                        if (uc.Wired && ud != null || !uc.Wired) continue;   // UniFi kennt den Platz, nur kein passender SNMP-Port
+                    }
+                    // 2. MAC-Tabellen der Switches
                     foreach (SwitchState s in switches)
                         foreach (PortState p in s.Ports.Values)
                             foreach (string m in p.Macs)
                                 if (NetTools.MacHex(m) == mac && (best == null || PortScore(p) < PortScore(best))) best = p;
-                    string suffix = "";
                     string[] known;
                     if (best != null && best.IsInfrastructure && lastPorts.TryGetValue(mac, out known))
                     {
@@ -5645,7 +5867,7 @@ namespace PingMonitor
                             string.Join(",", p.Macs.ToArray()), p.IsWan ? "1" : "0",
                             p.InMbps.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
                             p.OutMbps.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
-                            p.OctetsAt == DateTime.MinValue ? "" : p.OctetsAt.ToString(Fmt.Time), p.LldpCaps.ToString(), p.Role, Fmt.Csv(p.RoleInfo) })).Append("\r\n");
+                            p.OctetsAt == DateTime.MinValue ? "" : p.OctetsAt.ToString(Fmt.Time), p.LldpCaps.ToString(), p.Role, Fmt.Csv(p.RoleInfo), Fmt.Csv(p.RoleTarget) })).Append("\r\n");
                 }
             }
             return sb.ToString();
@@ -5701,6 +5923,7 @@ namespace PingMonitor
                             DateTime at;
                             if (DateTime.TryParseExact(f[26], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out at)) p.OctetsAt = at;
                             if (f.Count >= 30) { int.TryParse(f[27], out p.LldpCaps); p.Role = f[28]; p.RoleInfo = f[29]; }
+                            if (f.Count >= 31) p.RoleTarget = f[30];
                         }
                         foreach (string m in f[22].Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) p.Macs.Add(m);
                     }
@@ -5839,6 +6062,12 @@ namespace PingMonitor
             input.Controls.Add(Lbl("Abfrage alle"));
             input.Controls.Add(numInterval);
             input.Controls.Add(Lbl("Sekunden"));
+            input.Controls.Add(Btn("UniFi-Controller ...", delegate
+            {
+                using (UniFiForm f = new UniFiForm())
+                    if (f.ShowDialog(this) == DialogResult.OK) PollNow();
+            }));
+            input.Controls.Add(Btn("Diagnosedaten speichern ...", delegate { SaveDiagnostics(); }));
             Label hint = Lbl("SNMP (v1/v2c, nur lesend) muss am Switch aktiviert sein. UniFi: in der Network-Anwendung unter den Einstellungen " +
                 "(je nach Version \"System\" bzw. \"Dienste\") SNMP aktivieren und Community vergeben - gilt dann für alle UniFi-Switches. " +
                 "TP-Link (verwaltete Modelle) / HP / Aruba: Weboberfläche -> SNMP. Nicht verwaltete Switches können kein SNMP.");
@@ -5948,6 +6177,25 @@ namespace PingMonitor
         }
 
         // ------------------------------------------------------------ Verwaltung
+
+        void SaveDiagnostics()
+        {
+            using (SaveFileDialog d = new SaveFileDialog())
+            {
+                d.Filter = "Textdatei (*.txt)|*.txt";
+                d.FileName = "PingMonitor_Diagnose_" + DateTime.Now.ToString("yyyy-MM-dd_HHmm") + ".txt";
+                if (d.ShowDialog(this) != DialogResult.OK) return;
+                try
+                {
+                    List<PingTarget> hosts;
+                    try { hosts = Config.LoadHosts(); } catch { hosts = new List<PingTarget>(); }
+                    bool svc = serviceRunning();
+                    File.WriteAllText(d.FileName, Diagnostics.Build(SwitchMonitor.Current(svc), SwitchMonitor.CurrentUniFi(svc), hosts), Encoding.UTF8);
+                    MessageBox.Show(this, "Gespeichert:\n" + d.FileName, "Diagnosedaten", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex) { MessageBox.Show(this, ex.Message, "Diagnosedaten", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            }
+        }
 
         void AddSwitch()
         {
@@ -6487,9 +6735,10 @@ namespace PingMonitor
         /// Baut den Netzwerkplan: Internet - Gateway - Switches (über LLDP bzw. MAC-Tabellen) - Access Points - Geräte.
         /// links: für jedes Gerät, wie es angeschlossen ist (LAN/WLAN).
         /// </summary>
-        public static TopoNode Build(List<SwitchState> switches, List<PingTarget> devices, out Dictionary<PingTarget, DeviceLink> links)
+        public static TopoNode Build(List<SwitchState> switches, List<PingTarget> devices, UniFiSnapshot uf, out Dictionary<PingTarget, DeviceLink> links)
         {
             links = new Dictionary<PingTarget, DeviceLink>();
+            if (uf == null || !uf.Valid) uf = new UniFiSnapshot();
             List<SwitchState> sw = switches.FindAll(delegate (SwitchState s) { return s.Reachable; });
             IPAddress gwIp = Gateway();
             string gwMac = "";
@@ -6545,6 +6794,24 @@ namespace PingMonitor
                     foreach (Seen x in Find(sw, NetTools.MacHex(mac)))
                         if (x.Switch == best) parentPort[b] = x.Port.DisplayName;
             }
+            // Sieht ein Switch einen Access Point und einen weiteren Switch ohne MAC-Tabelle am selben Port,
+            // hängt der AP (fast immer) an diesem weiteren Switch - an einem Port führt nur ein Kabel weiter.
+            foreach (SwitchState b in sw)
+            {
+                SwitchState pa;
+                string pp;
+                if (b.Kind != "Access Point" || !parent.TryGetValue(b, out pa) || !parentPort.TryGetValue(b, out pp)) continue;
+                List<SwitchState> mid = sw.FindAll(delegate (SwitchState c)
+                {
+                    SwitchState cp;
+                    string cpp;
+                    return c != b && c.Kind != "Access Point" && !c.HasFdb && parent.TryGetValue(c, out cp) && cp == pa &&
+                           parentPort.TryGetValue(c, out cpp) && cpp == pp;
+                });
+                if (mid.Count != 1) continue;
+                parent[b] = mid[0];
+                parentPort[b] = "Port ?";
+            }
 
             TopoNode root = new TopoNode();
             root.Kind = "internet";
@@ -6589,17 +6856,80 @@ namespace PingMonitor
                 n.Level = worst;
                 swNodes[s] = n;
             }
+            Dictionary<TopoNode, string> nodeName = new Dictionary<TopoNode, string>();
+            foreach (SwitchState s in sw) nodeName[swNodes[s]] = s.Name;
+
+            // UniFi-Geräte: zu den per SNMP abgefragten Switches/APs zuordnen, sonst eigene Knoten
+            Dictionary<UniFiDeviceInfo, TopoNode> ufNodes = new Dictionary<UniFiDeviceInfo, TopoNode>();
+            Dictionary<UniFiDeviceInfo, SwitchState> ufSwitch = new Dictionary<UniFiDeviceInfo, SwitchState>();
+            foreach (UniFiDeviceInfo d in uf.Devices)
+            {
+                UniFiDeviceInfo dd = d;
+                SwitchState m = sw.Find(delegate (SwitchState x) { return SwitchMonitor.Matches(x, dd); });
+                if (m != null) { ufSwitch[d] = m; ufNodes[d] = swNodes[m]; continue; }
+                if (d.IsGateway || fw != null && SwitchMonitor.Matches(fw, d) || gwIp != null && d.Ip == gwIp.ToString() || d.Mac.Length == 12 && d.Mac == gwMac)
+                {
+                    ufNodes[d] = gwNode;
+                    continue;
+                }
+                TopoNode n = new TopoNode();
+                n.Kind = d.IsAp ? "ap" : "switch";
+                n.Title = d.Name + (d.Ip.Length > 0 ? "  (" + d.Ip + ")" : "") + "  [" + d.KindText + (d.Model.Length > 0 ? " " + d.Model : "") + ", UniFi]";
+                n.Tip = "Vom UniFi-Controller gemeldet" + (d.Mac.Length == 12 ? ", MAC " + d.Mac : "");
+                if (!d.Online) { n.Offline = true; n.Title += "   ✖ beim Controller offline"; }
+                ufNodes[d] = n;
+                nodeName[n] = d.Name;
+            }
+
+            Dictionary<TopoNode, string> upText = new Dictionary<TopoNode, string>();   // Anschluss eines Switches/APs ("Büro / Port 3")
+            HashSet<TopoNode> placed = new HashSet<TopoNode>();
+            foreach (KeyValuePair<UniFiDeviceInfo, TopoNode> kv in ufNodes)
+            {
+                UniFiDeviceInfo d = kv.Key;
+                TopoNode n = kv.Value;
+                if (n == gwNode || placed.Contains(n) || d.UplinkMac.Length != 12) continue;
+                UniFiDeviceInfo up = uf.Device(d.UplinkMac);
+                TopoNode pn = null;
+                if (up == null || !ufNodes.TryGetValue(up, out pn)) pn = d.UplinkMac == gwMac ? gwNode : null;
+                if (pn == null || pn == n || Contains(n, pn)) continue;
+                string pName = pn == gwNode ? "Gateway" : nodeName.ContainsKey(pn) ? nodeName[pn] : up.Name;
+                if (d.UplinkPort > 0) n.Title = "Port " + d.UplinkPort + "  →  " + n.Title;
+                upText[n] = pName + (d.UplinkPort > 0 ? " / Port " + d.UplinkPort : "");
+                n.Tip += (n.Tip.Length > 0 ? "\r\n" : "") + "Uplink laut UniFi-Controller: " + upText[n];
+                pn.Children.Add(n);
+                placed.Add(n);
+            }
             foreach (SwitchState s in sw)
             {
                 SwitchState par;
                 TopoNode n = swNodes[s];
-                if (parent.TryGetValue(s, out par))
+                if (placed.Contains(n)) continue;
+                placed.Add(n);
+                if (parent.TryGetValue(s, out par) && !Contains(n, swNodes[par]))
                 {
                     string pp;
                     if (parentPort.TryGetValue(s, out pp)) n.Title = pp + "  →  " + n.Title;
+                    upText[n] = par.Name + (pp != null && pp.Length > 0 ? " / " + pp : "");
                     swNodes[par].Children.Add(n);
                 }
                 else gwNode.Children.Add(n);
+            }
+            foreach (TopoNode n in ufNodes.Values)
+                if (n != gwNode && !placed.Contains(n)) { placed.Add(n); gwNode.Children.Add(n); }
+
+            // Infrastruktur-Geräte, die auch in der Geräteliste stehen, nicht doppelt anzeigen
+            Dictionary<string, TopoNode> infraByIp = new Dictionary<string, TopoNode>();
+            Dictionary<string, TopoNode> infraByMac = new Dictionary<string, TopoNode>();
+            foreach (SwitchState s in sw)
+            {
+                infraByIp[s.Address] = swNodes[s];
+                foreach (string m in s.OwnMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) infraByMac[NetTools.MacHex(m)] = swNodes[s];
+            }
+            foreach (KeyValuePair<UniFiDeviceInfo, TopoNode> kv in ufNodes)
+            {
+                if (kv.Value == gwNode) continue;
+                if (kv.Key.Ip.Length > 0 && !infraByIp.ContainsKey(kv.Key.Ip)) infraByIp[kv.Key.Ip] = kv.Value;
+                if (kv.Key.Mac.Length == 12) infraByMac[kv.Key.Mac] = kv.Value;
             }
             foreach (SwitchState s in switches)
                 if (!s.Reachable)
@@ -6622,9 +6952,55 @@ namespace PingMonitor
             foreach (PingTarget t in devices)
             {
                 if (t == gwDevice) continue;
+                string mac = NetTools.MacHex(t.Mac);
+                TopoNode infra;
+                if ((infraByIp.TryGetValue(t.Host, out infra) || mac.Length == 12 && infraByMac.TryGetValue(mac, out infra)) && infra.Target == null)
+                {
+                    infra.Target = t;
+                    Status(infra, t);
+                    devNodes[t] = infra;
+                    string ut;
+                    links[t] = upText.TryGetValue(infra, out ut) ? Link("LAN: " + ut + (infra.Kind == "ap" ? " (Access Point)" : " (Switch)"), false, true)
+                                                                 : Link(infra.Kind == "ap" ? "Access Point (siehe Netzwerkplan)" : "Switch (siehe Netzwerkplan)", false, false);
+                    continue;
+                }
                 TopoNode n = DeviceNode(t);
                 devNodes[t] = n;
-                string mac = NetTools.MacHex(t.Mac);
+
+                // 1. UniFi-Controller: weiß genau, an welchem Switch-Port bzw. Access Point ein Gerät hängt
+                UniFiClientInfo uc = uf.Client(t.Mac, t.Host);
+                if (uc != null)
+                {
+                    UniFiDeviceInfo ud = uf.Device(uc.Wired ? uc.SwMac : uc.ApMac);
+                    TopoNode home = null;
+                    if (ud != null) ufNodes.TryGetValue(ud, out home);
+                    string where = ud != null ? ud.Name : uc.Wired ? "Switch " + uc.SwMac : "AP " + uc.ApMac;
+                    if (!uc.Wired)
+                    {
+                        string extra = (uc.Essid.Length > 0 ? " · " + uc.Essid : "") + (uc.SignalText.Length > 0 ? " · " + uc.SignalText : "");
+                        links[t] = Link("WLAN: " + where + extra, true, true);
+                        n.Wlan = true;
+                        n.Title = "WLAN" + extra + "  →  " + n.Title;
+                        if (uc.Signal != 0 && uc.Signal <= -80 && n.Level < Finding.Warning)
+                        {
+                            n.Level = Finding.Warning;
+                            n.Tip += "\r\nSehr schwaches WLAN-Signal (" + uc.SignalText + ") - Abbrüche wahrscheinlich.";
+                        }
+                    }
+                    else
+                    {
+                        links[t] = Link("LAN: " + where + (uc.SwPort > 0 ? " / Port " + uc.SwPort : ""), false, true);
+                        n.Title = (uc.SwPort > 0 ? "Port " + uc.SwPort : "Port ?") + "  →  " + n.Title;
+                        SwitchState hs;
+                        PortState hp = ud != null && ufSwitch.TryGetValue(ud, out hs) ? SwitchMonitor.PortByNumber(hs, uc.SwPort) : null;
+                        if (hp != null && hp.Rating.Level > n.Level) { n.Level = hp.Rating.Level; n.Tip += "\r\nPort: " + hp.Rating.Short; }
+                    }
+                    n.Tip += "\r\nQuelle: UniFi-Controller";
+                    (home != null ? home : unassigned).Children.Add(n);
+                    continue;
+                }
+
+                // 2. MAC-Tabellen der Switches
                 Seen best = null;
                 foreach (Seen x in Find(sw, mac))
                 {
@@ -6670,6 +7046,37 @@ namespace PingMonitor
                 }
 
                 bool rnd = RandomMac(t.Mac);
+                // Nur an einer Verbindung zu einem bekannten Switch gesehen, der selbst keine MAC-Tabelle liefert
+                // (oder das Gerät dort nicht sieht): Das Gerät hängt hinter diesem Nachbarn, nicht am beobachtenden Switch.
+                TopoNode nb = best.Port.Role == "switch" ? Neighbor(best.Port.RoleTarget, swNodes[best.Switch], sw, swNodes, infraByMac) : null;
+                if (nb != null)
+                {
+                    string nbName = nodeName.ContainsKey(nb) ? nodeName[nb] : "Nachbar-Switch";
+                    SwitchState nbs = sw.Find(delegate (SwitchState x) { return swNodes[x] == nb; });
+                    bool noFdb = nbs == null || !nbs.HasFdb;
+                    bool mobile = MobileVendor(t.Vendor);
+                    List<TopoNode> nbAps = new List<TopoNode>();
+                    CollectAps(nb, nbAps);
+                    TopoNode place = nb;
+                    string how = noFdb ? nbName + " liefert keine MAC-Tabelle; gesehen an " + best.Switch.Name + " / " + best.Port.DisplayName
+                                       : "gesehen an " + best.Switch.Name + " / " + best.Port.DisplayName;
+                    if (rnd || mobile)
+                    {
+                        if (nbAps.Count == 1) place = nbAps[0];
+                        string apName = nbAps.Count == 1 && nodeName.ContainsKey(nbAps[0]) ? nodeName[nbAps[0]] : "";
+                        links[t] = Link("WLAN? (" + (rnd ? "zufällige MAC" : "Mobilgerät") + ") über " + (apName.Length > 0 ? apName : nbName), true, false);
+                        n.Wlan = true;
+                        n.Title = "WLAN?  →  " + n.Title;
+                    }
+                    else
+                    {
+                        links[t] = Link("LAN: " + nbName + " / Port ? (" + how + ")", false, false);
+                        n.Title = "Port ?  →  " + n.Title;
+                    }
+                    n.Tip += "\r\n" + how;
+                    place.Children.Add(n);
+                    continue;
+                }
                 if (best.Port.IsInfrastructure)
                 {
                     links[t] = Link("LAN? hinter " + best.Switch.Name + " / " + best.Port.DisplayName + " (nicht eingetragener Switch/AP)", rnd, false);
@@ -6678,8 +7085,12 @@ namespace PingMonitor
                     swNodes[best.Switch].Children.Add(n);
                     continue;
                 }
-                links[t] = Link("LAN: " + best.Switch.Name + " / " + best.Port.DisplayName + (rnd ? " (zufällige MAC - evtl. WLAN über AP ohne SNMP)" : ""), rnd, !rnd);
-                n.Wlan = rnd;
+                bool mob = MobileVendor(t.Vendor) && best.Port.Macs.Count > 1;
+                string many = best.Port.Macs.Count >= 3 && !rnd && !mob ? " (" + best.Port.Macs.Count + " Geräte am Port - dahinter vermutlich weiterer Switch/AP)" : "";
+                links[t] = Link("LAN: " + best.Switch.Name + " / " + best.Port.DisplayName +
+                    (rnd ? " (zufällige MAC - vermutlich WLAN über AP ohne SNMP)" : mob ? " (Mobilgerät - vermutlich WLAN über AP ohne SNMP)" : many), rnd || mob, !rnd && !mob && many.Length == 0);
+                bool rndOrMob = rnd || mob;
+                n.Wlan = rndOrMob;
                 n.Title = best.Port.DisplayName + "  →  " + n.Title;
                 if (best.Port.Rating.Level > n.Level) { n.Level = best.Port.Rating.Level; n.Tip += "\r\nPort: " + best.Port.Rating.Short; }
                 swNodes[best.Switch].Children.Add(n);
@@ -6695,6 +7106,45 @@ namespace PingMonitor
             if (unassigned.Children.Count > 0) root.Children.Add(unassigned);
             Sort(root);
             return root;
+        }
+
+        /// <summary>Ist x im Teilbaum von root enthalten?</summary>
+        static bool Contains(TopoNode root, TopoNode x)
+        {
+            if (root == x) return true;
+            foreach (TopoNode c in root.Children) if (Contains(c, x)) return true;
+            return false;
+        }
+
+        static void CollectAps(TopoNode n, List<TopoNode> aps)
+        {
+            if (n.Kind == "ap") aps.Add(n);
+            foreach (TopoNode c in n.Children) CollectAps(c, aps);
+        }
+
+        /// <summary>
+        /// Direkter Nachbar hinter einem Switch-Verbindungsport: aus den dort gesehenen Switches/UniFi-Geräten der,
+        /// über den alle anderen erreicht werden (nicht in Richtung Gateway).
+        /// </summary>
+        static TopoNode Neighbor(string roleTarget, TopoNode self, List<SwitchState> sw, Dictionary<SwitchState, TopoNode> swNodes, Dictionary<string, TopoNode> byMac)
+        {
+            List<TopoNode> cand = new List<TopoNode>();
+            foreach (string t in roleTarget.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                TopoNode n = null;
+                if (t.StartsWith("mac:")) byMac.TryGetValue(t.Substring(4), out n);
+                else
+                {
+                    SwitchState s = sw.Find(delegate (SwitchState x) { return x.Address == t; });
+                    if (s != null) n = swNodes[s];
+                }
+                // Nur Nachbarn "unterhalb" des beobachtenden Switches (nicht Richtung Gateway)
+                if (n != null && n != self && !Contains(n, self) && !cand.Contains(n)) cand.Add(n);
+            }
+            foreach (TopoNode c in cand)
+                if (cand.TrueForAll(delegate (TopoNode o) { return Contains(c, o); })) return c;
+            List<TopoNode> sws = cand.FindAll(delegate (TopoNode c) { return c.Kind != "ap"; });
+            return sws.Count == 1 ? sws[0] : null;
         }
 
         static bool Same(SwitchState a, string name)
@@ -6856,15 +7306,17 @@ namespace PingMonitor
     {
         readonly Func<List<SwitchState>> switchData;
         readonly Func<List<PingTarget>> deviceData;
+        readonly Func<UniFiSnapshot> unifiData;
         readonly Action<PingTarget> showDevice;
         TreeView tree;
         CheckBox chkHideWlan;
         Label lblInfo;
         TopoNode current;
 
-        public TopologyForm(Func<List<SwitchState>> switches, Func<List<PingTarget>> devices, Action<PingTarget> show)
+        public TopologyForm(Func<List<SwitchState>> switches, Func<List<PingTarget>> devices, Func<UniFiSnapshot> unifi, Action<PingTarget> show)
         {
             switchData = switches;
+            unifiData = unifi;
             deviceData = devices;
             showDevice = show;
             Text = "Netzwerkplan";
@@ -6929,7 +7381,7 @@ namespace PingMonitor
             try
             {
                 Dictionary<PingTarget, DeviceLink> links;
-                current = Topology.Build(switchData(), deviceData(), out links);
+                current = Topology.Build(switchData(), deviceData(), unifiData(), out links);
             }
             finally { Cursor = Cursors.Default; }
             Render();
@@ -8215,4 +8667,454 @@ namespace PingMonitor
             txtOverview.Text = a.Overview;
         }
     }
+
+    // =====================================================================
+    // UniFi Network Controller (nur lesend): exakte WLAN-/LAN-Zuordnung und Verkabelung
+    // =====================================================================
+
+    class UniFiClientInfo
+    {
+        public string Mac = "", Ip = "", Name = "", ApMac = "", Essid = "", SwMac = "", Radio = "";
+        public bool Wired;
+        public int Signal, SwPort, Channel;
+
+        public string SignalText
+        {
+            get
+            {
+                if (Signal == 0) return "";
+                return Signal + " dBm" + (Signal <= -80 ? " (sehr schwach)" : Signal <= -72 ? " (schwach)" : Signal >= -60 ? " (gut)" : "");
+            }
+        }
+    }
+
+    class UniFiDeviceInfo
+    {
+        public string Mac = "", Ip = "", Name = "", Model = "", Type = "", UplinkMac = "";
+        public int UplinkPort;
+        public bool Online = true;
+
+        public bool IsAp { get { return Type == "uap"; } }
+        public bool IsGateway { get { return Type == "ugw" || Type == "udm" || Type == "uxg"; } }
+        public string KindText { get { return IsAp ? "Access Point" : IsGateway ? "Gateway" : Type == "usw" ? "Switch" : Type; } }
+    }
+
+    class UniFiSnapshot
+    {
+        public readonly List<UniFiClientInfo> Clients = new List<UniFiClientInfo>();
+        public readonly List<UniFiDeviceInfo> Devices = new List<UniFiDeviceInfo>();
+        public string Error = "";
+        public DateTime Fetched = DateTime.MinValue;
+
+        public bool Valid { get { return Fetched != DateTime.MinValue && Error.Length == 0; } }
+
+        public UniFiClientInfo Client(string mac, string ip)
+        {
+            string h = NetTools.MacHex(mac);
+            foreach (UniFiClientInfo c in Clients) if (h.Length == 12 && NetTools.MacHex(c.Mac) == h) return c;
+            foreach (UniFiClientInfo c in Clients) if (ip.Length > 0 && c.Ip == ip) return c;
+            return null;
+        }
+
+        public UniFiDeviceInfo Device(string mac)
+        {
+            string h = NetTools.MacHex(mac);
+            foreach (UniFiDeviceInfo d in Devices) if (h.Length == 12 && NetTools.MacHex(d.Mac) == h) return d;
+            return null;
+        }
+
+        public UniFiDeviceInfo DeviceByIp(string ip)
+        {
+            foreach (UniFiDeviceInfo d in Devices) if (ip.Length > 0 && d.Ip == ip) return d;
+            return null;
+        }
+
+        public string Serialize()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("UE;" + Fmt.Csv(Error) + ";" + (Fetched == DateTime.MinValue ? "" : Fetched.ToString(Fmt.Time)) + "\r\n");
+            foreach (UniFiDeviceInfo d in Devices)
+                sb.Append(string.Join(";", new string[] { "UD", d.Mac, d.Ip, Fmt.Csv(d.Name), Fmt.Csv(d.Model), d.Type, d.UplinkMac, d.UplinkPort.ToString(), d.Online ? "1" : "0" })).Append("\r\n");
+            foreach (UniFiClientInfo c in Clients)
+                sb.Append(string.Join(";", new string[] { "UC", c.Mac, c.Ip, Fmt.Csv(c.Name), c.Wired ? "1" : "0", c.ApMac, Fmt.Csv(c.Essid), c.Signal.ToString(),
+                    c.SwMac, c.SwPort.ToString(), c.Radio, c.Channel.ToString() })).Append("\r\n");
+            return sb.ToString();
+        }
+
+        public static UniFiSnapshot Parse(string[] lines)
+        {
+            UniFiSnapshot u = new UniFiSnapshot();
+            foreach (string line in lines)
+            {
+                if (!line.StartsWith("U")) continue;
+                List<string> f = Fmt.ParseCsv(line.TrimEnd());
+                if (f[0] == "UE" && f.Count >= 3)
+                {
+                    u.Error = f[1];
+                    DateTime t;
+                    if (DateTime.TryParseExact(f[2], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out t)) u.Fetched = t;
+                }
+                else if (f[0] == "UD" && f.Count >= 9)
+                {
+                    UniFiDeviceInfo d = new UniFiDeviceInfo();
+                    d.Mac = f[1]; d.Ip = f[2]; d.Name = f[3]; d.Model = f[4]; d.Type = f[5]; d.UplinkMac = f[6];
+                    int.TryParse(f[7], out d.UplinkPort); d.Online = f[8] == "1";
+                    u.Devices.Add(d);
+                }
+                else if (f[0] == "UC" && f.Count >= 12)
+                {
+                    UniFiClientInfo c = new UniFiClientInfo();
+                    c.Mac = f[1]; c.Ip = f[2]; c.Name = f[3]; c.Wired = f[4] == "1"; c.ApMac = f[5]; c.Essid = f[6];
+                    int.TryParse(f[7], out c.Signal); c.SwMac = f[8]; int.TryParse(f[9], out c.SwPort); c.Radio = f[10]; int.TryParse(f[11], out c.Channel);
+                    u.Clients.Add(c);
+                }
+            }
+            return u;
+        }
+    }
+
+    /// <summary>
+    /// Liest Geräte und Clients aus dem UniFi Network Controller (UniFi OS: UDM, Cloud Key Gen2+, UniFi OS Server -
+    /// oder klassischer Controller). Nur lesende Abfragen; empfohlen ist ein eigener Benutzer mit "View Only"-Rechten.
+    /// </summary>
+    static class UniFi
+    {
+        public static bool Configured { get { return Config.Cached("UniFi.Url", "").Length > 0; } }
+
+        public static UniFiSnapshot Fetch()
+        {
+            Dictionary<string, string> d = Config.LoadSettings();
+            return Fetch(Config.Get(d, "UniFi.Url", ""), Config.Get(d, "UniFi.Benutzer", ""),
+                NotifyConfig.Unprotect(Config.Get(d, "UniFi.Passwort", "")), Config.Get(d, "UniFi.Site", "default"));
+        }
+
+        public static UniFiSnapshot Fetch(string url, string user, string password, string site)
+        {
+            UniFiSnapshot snap = new UniFiSnapshot();
+            url = url.Trim().TrimEnd('/');
+            if (url.Length == 0) { snap.Error = "Keine Controller-Adresse eingetragen."; return snap; }
+            if (!url.Contains("://")) url = "https://" + url;
+            if (site.Trim().Length == 0) site = "default";
+            List<string> bases = new List<string>();
+            bases.Add(url);
+            try { if (new Uri(url).IsDefaultPort) bases.Add(url + ":8443"); } catch (UriFormatException) { snap.Error = "Ungültige Adresse: " + url; return snap; }
+
+            string body = "{\"username\":" + Json.Str(user) + ",\"password\":" + Json.Str(password) + ",\"remember\":false}";
+            List<string> errors = new List<string>();
+            foreach (string b in bases)
+            {
+                CookieContainer cookies = new CookieContainer();
+                string csrf = "", prefix;
+                int status;
+                string resp;
+                WebHeaderCollection headers;
+                // UniFi OS (UDM, Cloud Key Gen2+, UniFi OS Server)
+                bool os = Http("POST", b + "/api/auth/login", body, cookies, "", out status, out resp, out headers);
+                if (os && status == 200)
+                {
+                    prefix = "/proxy/network";
+                    csrf = headers["X-CSRF-Token"] ?? headers["X-Updated-CSRF-Token"] ?? "";
+                }
+                else if (os && (status == 400 || status == 401 || status == 403))
+                {
+                    errors.Add(b + ": Anmeldung abgelehnt (Benutzer/Passwort prüfen; lokales Konto verwenden, kein UI-Cloud-Konto mit 2FA)");
+                    continue;
+                }
+                // klassischer Controller
+                else if (Http("POST", b + "/api/login", body, cookies, "", out status, out resp, out headers) && status == 200)
+                    prefix = "";
+                else
+                {
+                    errors.Add(b + ": " + (status == 0 ? resp : status == 400 || status == 401 || status == 403 ? "Anmeldung abgelehnt (Benutzer/Passwort prüfen)" : "HTTP " + status));
+                    continue;
+                }
+
+                string api = b + prefix + "/api/s/" + Uri.EscapeDataString(site.Trim());
+                string devJson, staJson;
+                if (!Http("GET", api + "/stat/device", null, cookies, csrf, out status, out devJson, out headers) || status != 200)
+                {
+                    errors.Add(b + ": Geräteliste nicht lesbar (HTTP " + status + ") - Site-Name richtig? (Standard: default)");
+                    continue;
+                }
+                if (!Http("GET", api + "/stat/sta", null, cookies, csrf, out status, out staJson, out headers) || status != 200)
+                {
+                    errors.Add(b + ": Clientliste nicht lesbar (HTTP " + status + ")");
+                    continue;
+                }
+                try
+                {
+                    ParseDevices(devJson, snap);
+                    ParseClients(staJson, snap);
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(b + ": Antwort nicht verständlich (" + ex.Message + ")");
+                    continue;
+                }
+                snap.Fetched = DateTime.Now;
+                return snap;
+            }
+            snap.Error = string.Join(" | ", errors.ToArray());
+            return snap;
+        }
+
+        static List<object> Data(string json)
+        {
+            Dictionary<string, object> root = Json.Parse(json) as Dictionary<string, object>;
+            if (root == null) throw new FormatException("kein JSON-Objekt");
+            return Json.Arr(root, "data");
+        }
+
+        static void ParseDevices(string json, UniFiSnapshot snap)
+        {
+            foreach (object o in Data(json))
+            {
+                Dictionary<string, object> d = o as Dictionary<string, object>;
+                if (d == null) continue;
+                UniFiDeviceInfo x = new UniFiDeviceInfo();
+                x.Mac = NetTools.MacHex(Json.S(d, "mac"));
+                x.Ip = Json.S(d, "ip");
+                x.Model = Json.S(d, "model");
+                x.Name = Json.S(d, "name").Length > 0 ? Json.S(d, "name") : x.Model + " " + x.Ip;
+                x.Type = Json.S(d, "type");
+                x.Online = Json.N(d, "state", 1) == 1;
+                Dictionary<string, object> up = Json.Obj(d, "uplink") ?? Json.Obj(d, "last_uplink");
+                if (up != null)
+                {
+                    x.UplinkMac = NetTools.MacHex(Json.S(up, "uplink_mac"));
+                    x.UplinkPort = (int)Json.N(up, "uplink_remote_port", 0);
+                }
+                snap.Devices.Add(x);
+            }
+        }
+
+        static void ParseClients(string json, UniFiSnapshot snap)
+        {
+            foreach (object o in Data(json))
+            {
+                Dictionary<string, object> c = o as Dictionary<string, object>;
+                if (c == null) continue;
+                UniFiClientInfo x = new UniFiClientInfo();
+                x.Mac = NetTools.MacHex(Json.S(c, "mac"));
+                x.Ip = Json.S(c, "ip").Length > 0 ? Json.S(c, "ip") : Json.S(c, "last_ip");
+                x.Name = Json.S(c, "name").Length > 0 ? Json.S(c, "name") : Json.S(c, "hostname");
+                x.Wired = Json.B(c, "is_wired");
+                x.ApMac = NetTools.MacHex(Json.S(c, "ap_mac"));
+                x.Essid = Json.S(c, "essid");
+                x.Signal = (int)Json.N(c, "signal", 0);
+                if (x.Signal == 0 && Json.N(c, "rssi", 0) > 0) x.Signal = (int)Json.N(c, "rssi", 0) - 95;
+                x.SwMac = NetTools.MacHex(Json.S(c, "sw_mac"));
+                x.SwPort = (int)Json.N(c, "sw_port", 0);
+                x.Radio = Json.S(c, "radio");
+                x.Channel = (int)Json.N(c, "channel", 0);
+                snap.Clients.Add(x);
+            }
+        }
+
+        static bool Http(string method, string url, string body, CookieContainer cookies, string csrf,
+                         out int status, out string response, out WebHeaderCollection headers)
+        {
+            status = 0; response = ""; headers = new WebHeaderCollection();
+            try
+            {
+                ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = method;
+                req.CookieContainer = cookies;
+                req.Accept = "application/json";
+                req.UserAgent = "PingMonitor";
+                req.Timeout = 10000;
+                req.ReadWriteTimeout = 15000;
+                req.Proxy = null;
+                req.AllowAutoRedirect = false;
+                // Controller haben fast immer ein selbstsigniertes Zertifikat - nur für diese Verbindung akzeptieren.
+                req.ServerCertificateValidationCallback = delegate { return true; };
+                if (csrf.Length > 0) req.Headers["X-CSRF-Token"] = csrf;
+                if (body != null)
+                {
+                    byte[] data = Encoding.UTF8.GetBytes(body);
+                    req.ContentType = "application/json";
+                    req.ContentLength = data.Length;
+                    using (Stream s = req.GetRequestStream()) s.Write(data, 0, data.Length);
+                }
+                HttpWebResponse resp;
+                try { resp = (HttpWebResponse)req.GetResponse(); }
+                catch (WebException ex)
+                {
+                    resp = ex.Response as HttpWebResponse;
+                    if (resp == null) { response = ex.Message; return false; }
+                }
+                using (resp)
+                {
+                    status = (int)resp.StatusCode;
+                    headers = resp.Headers;
+                    using (StreamReader r = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) response = r.ReadToEnd();
+                }
+                return true;
+            }
+            catch (Exception ex) { response = ex.Message; return false; }
+        }
+    }
+
+    /// <summary>Textauszug aller Erkennungsdaten (Switches, Ports, UniFi, Zuordnung) - zur Fehlersuche bei falscher Zuordnung.</summary>
+    static class Diagnostics
+    {
+        public static string Build(List<SwitchState> switches, UniFiSnapshot uf, List<PingTarget> hosts)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("PingMonitor - Diagnosedaten " + DateTime.Now.ToString(Fmt.Time) + "\r\n");
+            sb.Append("Enthält IP-/MAC-Adressen und Gerätenamen, aber keine Passwörter oder Communities.\r\n\r\n");
+            IPAddress gw = Topology.Gateway();
+            sb.Append("Gateway: " + (gw != null ? gw.ToString() : "-") + "  MAC " + Topology.GatewayMac() + "\r\n\r\n");
+            foreach (SwitchState s in switches)
+            {
+                sb.Append("=== " + s.Name + " (" + s.Address + ")  Typ " + s.Kind + "  " + (s.Reachable ? "erreichbar" : "NICHT erreichbar " + s.Error) + "\r\n");
+                sb.Append("    sysName " + s.SysName + " | " + s.SysDescr + "\r\n");
+                sb.Append("    eigene MACs: " + (s.OwnMacs.Length > 0 ? s.OwnMacs : "-") + " | MAC-Tabelle per SNMP: " + (s.HasFdb ? "ja" : "NEIN") + "\r\n");
+                List<PortState> ports = new List<PortState>(s.Ports.Values);
+                ports.Sort(delegate (PortState a, PortState b) { return a.IfIndex.CompareTo(b.IfIndex); });
+                foreach (PortState p in ports)
+                {
+                    if (!p.Up && p.Macs.Count == 0 && p.LldpName.Length == 0) continue;
+                    sb.Append("    [" + p.IfIndex + "] " + p.DisplayName + (p.Up ? "" : " (down)") + (p.Wireless ? " WLAN" : "") +
+                        "  Rolle=" + (p.Role.Length > 0 ? p.Role : "Endgerät") + (p.RoleTarget.Length > 0 ? " -> " + p.RoleTarget : "") +
+                        (p.LldpName.Length > 0 || p.LldpChassis.Length > 0 ? "  LLDP=" + p.LldpName + "/" + p.LldpChassis + " caps " + p.LldpCaps : "") +
+                        "  MACs(" + p.Macs.Count + ")=" + string.Join(",", p.Macs.ToArray()) + "\r\n");
+                }
+                sb.Append("\r\n");
+            }
+            sb.Append("=== UniFi-Controller: " + (uf.Fetched == DateTime.MinValue ? "nicht eingerichtet/abgefragt" : uf.Valid ? "OK " + uf.Fetched.ToString(Fmt.Time) : "Fehler: " + uf.Error) + "\r\n");
+            foreach (UniFiDeviceInfo d in uf.Devices)
+                sb.Append("    Gerät " + d.Name + " " + d.Type + " " + d.Model + " " + d.Ip + " " + d.Mac + " Uplink " + d.UplinkMac + " Port " + d.UplinkPort + (d.Online ? "" : " OFFLINE") + "\r\n");
+            foreach (UniFiClientInfo c in uf.Clients)
+                sb.Append("    Client " + c.Name + " " + c.Ip + " " + c.Mac + (c.Wired ? " LAN " + c.SwMac + " Port " + c.SwPort : " WLAN AP " + c.ApMac + " " + c.Essid + " " + c.SignalText) + "\r\n");
+            sb.Append("\r\n=== Überwachte Geräte\r\n");
+            Dictionary<PingTarget, DeviceLink> links;
+            TopoNode root = Topology.Build(switches, hosts, uf, out links);
+            foreach (PingTarget t in hosts)
+            {
+                DeviceLink l;
+                links.TryGetValue(t, out l);
+                sb.Append("    " + t.Name + " " + t.Host + " " + t.Mac + " " + t.Vendor + (Topology.RandomMac(t.Mac) ? " (zufällige MAC)" : "") +
+                    "  =>  " + (l != null ? l.Text + (l.Certain ? "" : " [vermutet]") : "-") + "\r\n");
+            }
+            sb.Append("\r\n=== Netzwerkplan\r\n").Append(Topology.ToText(root));
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>Zugangsdaten für den UniFi-Controller.</summary>
+    class UniFiForm : Form
+    {
+        TextBox txtUrl, txtUser, txtPassword, txtSite;
+        Button btnTest;
+
+        public UniFiForm()
+        {
+            Text = "UniFi-Controller";
+            Font = new Font("Segoe UI", 9.5F);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+
+            TableLayoutPanel t = new TableLayoutPanel();
+            t.ColumnCount = 2;
+            t.AutoSize = true;
+            t.Padding = new Padding(12);
+            Label intro = new Label();
+            intro.AutoSize = true;
+            intro.MaximumSize = new Size(560, 0);
+            intro.Text = "Der UniFi-Controller weiß genau, welches Gerät per WLAN an welchem Access Point (mit SSID und Signalstärke) " +
+                "und per Kabel an welchem Switch-Port hängt - und wie die UniFi-Geräte untereinander verkabelt sind. " +
+                "PingMonitor liest diese Daten nur (keine Änderungen). Empfehlung: im Controller einen eigenen lokalen Benutzer " +
+                "mit der Rolle \"View Only\" (nur lesen) anlegen.";
+            t.Controls.Add(intro, 0, 0);
+            t.SetColumnSpan(intro, 2);
+            Dictionary<string, string> d = Config.LoadSettings();
+            txtUrl = Row(t, 1, "Adresse:", Config.Get(d, "UniFi.Url", ""), 330);
+            Label urlHint = new Label();
+            urlHint.AutoSize = true;
+            urlHint.ForeColor = SystemColors.GrayText;
+            urlHint.Text = "z. B. 192.168.1.1 (UDM/Cloud Key/UniFi OS) oder https://controller:8443 (klassischer Controller)";
+            t.Controls.Add(urlHint, 1, 2);
+            txtUser = Row(t, 3, "Benutzer:", Config.Get(d, "UniFi.Benutzer", ""), 200);
+            txtPassword = Row(t, 4, "Passwort:", NotifyConfig.Unprotect(Config.Get(d, "UniFi.Passwort", "")), 200);
+            txtPassword.UseSystemPasswordChar = true;
+            txtSite = Row(t, 5, "Site:", Config.Get(d, "UniFi.Site", "default"), 120);
+
+            FlowLayoutPanel b = new FlowLayoutPanel();
+            b.AutoSize = true;
+            b.Margin = new Padding(0, 10, 0, 0);
+            btnTest = new Button(); btnTest.Text = "Verbindung testen"; btnTest.AutoSize = true;
+            btnTest.Click += delegate { Test(); };
+            Button save = new Button(); save.Text = "Speichern"; save.AutoSize = true;
+            save.Click += delegate { Save(); };
+            Button off = new Button(); off.Text = "UniFi nicht verwenden"; off.AutoSize = true;
+            off.Click += delegate { txtUrl.Text = ""; Save(); };
+            Button cancel = new Button(); cancel.Text = "Abbrechen"; cancel.AutoSize = true; cancel.DialogResult = DialogResult.Cancel;
+            b.Controls.Add(btnTest); b.Controls.Add(save); b.Controls.Add(off); b.Controls.Add(cancel);
+            t.Controls.Add(b, 0, 6);
+            t.SetColumnSpan(b, 2);
+            Controls.Add(t);
+            CancelButton = cancel;
+        }
+
+        static TextBox Row(TableLayoutPanel t, int row, string label, string value, int width)
+        {
+            Label l = new Label(); l.Text = label; l.AutoSize = true; l.Margin = new Padding(3, 7, 3, 3);
+            TextBox x = new TextBox(); x.Text = value; x.Width = width;
+            t.Controls.Add(l, 0, row);
+            t.Controls.Add(x, 1, row);
+            return x;
+        }
+
+        void Test()
+        {
+            btnTest.Enabled = false;
+            Cursor = Cursors.WaitCursor;
+            string url = txtUrl.Text, user = txtUser.Text, pw = txtPassword.Text, site = txtSite.Text;
+            Thread th = new Thread(delegate ()
+            {
+                UniFiSnapshot s = UniFi.Fetch(url, user, pw, site);
+                string msg;
+                if (s.Valid)
+                {
+                    int wlan = 0, aps = 0, sw = 0;
+                    foreach (UniFiClientInfo c in s.Clients) if (!c.Wired) wlan++;
+                    foreach (UniFiDeviceInfo d in s.Devices) { if (d.IsAp) aps++; else if (d.Type == "usw") sw++; }
+                    msg = "Verbindung OK.\n\n" + s.Devices.Count + " UniFi-Geräte (" + sw + " Switches, " + aps + " Access Points)\n" +
+                          s.Clients.Count + " Clients, davon " + wlan + " per WLAN";
+                }
+                else msg = "Keine Verbindung:\n" + s.Error.Replace(" | ", "\n");
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        Cursor = Cursors.Default;
+                        btnTest.Enabled = true;
+                        MessageBox.Show(this, msg, Text, MessageBoxButtons.OK, s.Valid ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        void Save()
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            d["UniFi.Url"] = txtUrl.Text.Trim();
+            d["UniFi.Benutzer"] = txtUser.Text.Trim();
+            d["UniFi.Passwort"] = NotifyConfig.Protect(txtPassword.Text);
+            d["UniFi.Site"] = txtSite.Text.Trim().Length > 0 ? txtSite.Text.Trim() : "default";
+            try { Config.SaveSettings(d); }
+            catch (Exception ex) { MessageBox.Show(this, ex.Message, Text); return; }
+            SwitchMonitor.PollNow();
+            DialogResult = DialogResult.OK;
+        }
+    }
+
 }
