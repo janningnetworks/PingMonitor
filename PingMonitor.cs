@@ -1653,6 +1653,7 @@ namespace PingMonitor
         CheckBox chkLarge;
         Dictionary<string, KeyValuePair<SwitchState, PortState>> portByMac = new Dictionary<string, KeyValuePair<SwitchState, PortState>>();
         System.Windows.Forms.Timer svcTimer;
+        WorkflowPanel workflow;
 
         ServiceControllerStatus? svcStatus;
         string tailFile;
@@ -1715,9 +1716,6 @@ namespace PingMonitor
             Button btnAdd = NewButton("Hinzufügen", delegate { AddFromInput(); });
             input.Controls.Add(btnAdd);
             AcceptButton = btnAdd;
-            Button btnScan = NewButton("Netzwerk scannen ...", delegate { ScanNetwork(); });
-            btnScan.Margin = new Padding(12, 3, 3, 3);
-            input.Controls.Add(btnScan);
 
             FlowLayoutPanel actions = NewFlow(new Padding(6, 0, 6, 6));
             actions.Controls.Add(NewButton("Start", delegate { StartTargets(Selected()); }));
@@ -1753,28 +1751,11 @@ namespace PingMonitor
                 TrySave(delegate { Config.SaveSettings(d); });
             };
             actions.Controls.Add(chkLarge);
-            actions.Controls.Add(NewButton("Netzwerkplan ...", delegate
-            {
-                using (TopologyForm f = new TopologyForm(delegate { return SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running); },
-                    delegate { return new List<PingTarget>(targets); },
-                    delegate { return SwitchMonitor.CurrentUniFi(svcStatus == ServiceControllerStatus.Running); }, delegate (PingTarget t) { ShowDetails(t); }))
-                    f.ShowDialog(this);
-            }));
-            actions.Controls.Add(NewButton("Dokumentation ...", delegate
-            {
-                bool svc = svcStatus == ServiceControllerStatus.Running;
-                DocExport.Run(this, SwitchMonitor.Current(svc), SwitchMonitor.CurrentUniFi(svc), new List<PingTarget>(targets));
-            }));
             actions.Controls.Add(NewButton("Mitschnitt analysieren ...", delegate
             {
                 using (AnalysisForm f = new AnalysisForm()) f.ShowDialog(this);
             }));
             actions.Controls.Add(NewButton("Zurücksetzen ...", delegate { ResetAll(); }));
-            actions.Controls.Add(NewButton("Switches ...", delegate
-            {
-                using (SwitchForm f = new SwitchForm(delegate { return svcStatus == ServiceControllerStatus.Running; })) f.ShowDialog(this);
-                RefreshPorts();
-            }));
 
             FlowLayoutPanel dnsRow = NewFlow(new Padding(6, 0, 6, 6));
             dnsRow.Controls.Add(NewLabel("DNS-Server:"));
@@ -1904,14 +1885,118 @@ namespace PingMonitor
             lblLogPath.Padding = new Padding(6, 3, 6, 3);
             lblLogPath.Text = "Logdatei: " + CsvLog.CurrentFile;
 
+            workflow = new WorkflowPanel(new Action[][] {
+                new Action[] { OpenSwitches },
+                new Action[] { ScanNetwork },
+                new Action[] { delegate { StartTargets(targets); }, delegate { if (!svcStatus.HasValue) ServiceCommand("install"); else if (svcStatus == ServiceControllerStatus.Stopped) ServiceCommand("start"); else MessageBox.Show(this, "Der Dienst läuft bereits.", Text); } },
+                new Action[] { ShowMilestones },
+                new Action[] { OpenTopology, OpenDoc } },
+                new string[][] {
+                new string[] { "Switches / Controller ..." },
+                new string[] { "Netzwerk scannen ..." },
+                new string[] { "Alle starten", "Als Dienst ..." },
+                new string[] { "Was ist wann aussagekräftig?" },
+                new string[] { "Netzwerkplan", "Dokumentation" } });
+
             Controls.Add(split);
             Controls.Add(lblLogPath);
             Controls.Add(service);
             Controls.Add(dnsRow);
             Controls.Add(actions);
             Controls.Add(input);
+            Controls.Add(workflow);
 
             Load += delegate { split.SplitterDistance = split.Height / 2; };
+        }
+
+        void OpenSwitches()
+        {
+            using (SwitchForm f = new SwitchForm(delegate { return svcStatus == ServiceControllerStatus.Running; })) f.ShowDialog(this);
+            RefreshPorts();
+        }
+
+        void OpenTopology()
+        {
+            using (TopologyForm f = new TopologyForm(delegate { return SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running); },
+                delegate { return new List<PingTarget>(targets); },
+                delegate { return SwitchMonitor.CurrentUniFi(svcStatus == ServiceControllerStatus.Running); }, delegate (PingTarget t) { ShowDetails(t); }))
+                f.ShowDialog(this);
+        }
+
+        void OpenDoc()
+        {
+            bool svc = svcStatus == ServiceControllerStatus.Running;
+            DocExport.Run(this, SwitchMonitor.Current(svc), SwitchMonitor.CurrentUniFi(svc), new List<PingTarget>(targets));
+        }
+
+        bool NetworkKnown { get { return SwitchMonitor.LoadConfig().Count > 0 || UniFi.Configured; } }
+
+        TimeSpan pingTime, switchTime;
+
+        void ShowMilestones()
+        {
+            HintForm.Show(this, "Messzeit und Aussagekraft", Milestones.Explain(pingTime, switchTime, NetworkKnown));
+        }
+
+        /// <summary>Arbeitsablauf aktualisieren: Was ist erledigt, was ist der nächste sinnvolle Schritt?</summary>
+        void UpdateWorkflow(List<SwitchState> sw)
+        {
+            bool svc = svcStatus == ServiceControllerStatus.Running;
+            UniFiSnapshot uf = SwitchMonitor.CurrentUniFi(svc);
+            // 1 Netzwerk
+            int nSw = 0, nAp = 0; bool fw = false;
+            foreach (SwitchState s in sw) { if (s.Kind == "Firewall") fw = true; else if (s.Kind == "Access Point") nAp++; else nSw++; }
+            bool step1 = sw.Count > 0 || UniFi.Configured;
+            string t1 = step1 ? nSw + " Switches, " + nAp + " APs" + (fw ? ", Firewall" : "") + "\r\nUniFi-Controller: " +
+                (!UniFi.Configured ? "nicht eingerichtet" : uf.Valid ? "verbunden" : uf.Error.Length > 0 ? "FEHLER" : "wird abgefragt ...")
+                : "Zuerst Switches (SNMP), Firewall und ggf. UniFi-Controller eintragen - dann kennt der Scan Ports, VLANs und WLAN.";
+            // 2 Geräte
+            int withMac = 0, placed = 0;
+            foreach (PingTarget t in targets) { if (t.Mac.Length > 0) withMac++; if (t.Link != null && t.Link.Text.Length > 0 && !t.Link.Text.StartsWith("unbekannt")) placed++; }
+            bool step2 = targets.Count > 0;
+            string t2 = step2 ? targets.Count + " Geräte, " + withMac + " mit MAC, " + placed + " zugeordnet" + (placed < targets.Count && step1 ? "\r\nNicht zugeordnet: siehe Netzwerkplan" : "")
+                : "Netzwerk scannen und die zu überwachenden Geräte auswählen.";
+            // 3 Überwachen
+            int running = 0;
+            foreach (PingTarget t in targets) if (t.Running) running++;
+            bool step3 = svc || running > 0;
+            string t3 = svc ? "Windows-Dienst überwacht alle Geräte (auch ohne Anmeldung)." : running > 0 ? "Die App überwacht " + running + " von " + targets.Count +
+                " Geräten (nur solange sie geöffnet ist)." : "Überwachung starten - für längere Messungen als Dienst.";
+            // 4 Messzeit
+            long pingMs = 0;
+            foreach (PingTarget t in targets)
+            {
+                PingTarget v = !t.Running && t.ServiceView != null ? t.ServiceView : t;
+                pingMs = Math.Max(pingMs, v.Sent * (long)Math.Max(t.IntervalMs, 100));
+            }
+            pingTime = TimeSpan.FromMilliseconds(pingMs);
+            DateTime since = SwitchMonitor.Since(svc);
+            switchTime = since == DateTime.MinValue ? TimeSpan.Zero : DateTime.Now - since;
+            TimeSpan eff = step1 && switchTime < pingTime ? switchTime : pingTime;
+            workflow.Bar.Value = eff;
+            workflow.Bar.Invalidate();
+            string t4 = step3 ? "Messzeit " + Milestones.Fmt(eff) + "\r\n" + Milestones.Next(eff) : "Startet mit der Überwachung.";
+            // 5 Auswerten
+            int prob = 0, warn = 0;
+            foreach (SwitchState s in sw)
+            {
+                foreach (PortState p in s.Ports.Values) { if (p.Rating.Level >= Finding.Problem) prob++; else if (p.Rating.Level == Finding.Warning) warn++; }
+                if (s.SysRating.Level >= Finding.Problem) prob++; else if (s.SysRating.Level == Finding.Warning) warn++;
+            }
+            foreach (PingTarget t in targets)
+            {
+                PingTarget v = !t.Running && t.ServiceView != null ? t.ServiceView : t;
+                if (v.OutageStart.HasValue && !v.OfflineMode) prob++;
+                else if (t.QualityLevel >= Finding.Warning) warn++;
+            }
+            string t5 = eff.TotalMinutes < 5 ? "Noch zu früh - erst nach einigen Minuten Messzeit." :
+                (prob + warn == 0 ? "Keine Auffälligkeiten." : prob + " Probleme, " + warn + " Warnungen") + (eff.TotalHours < 24 ? "\r\n(vorläufig - Messzeit unter 24 h)" : "");
+            int current = !step1 ? 0 : !step2 ? 1 : !step3 ? 2 : eff.TotalMinutes < 60 ? 3 : 4;
+            workflow.SetState(0, step1 ? 2 : current == 0 ? 1 : 0, t1);
+            workflow.SetState(1, step2 ? 2 : current == 1 ? 1 : 0, t2);
+            workflow.SetState(2, step3 ? 2 : current == 2 ? 1 : 0, t3);
+            workflow.SetState(3, eff.TotalHours >= 24 ? 2 : current == 3 ? 1 : 0, t4);
+            workflow.SetState(4, current == 4 ? 1 : 0, t5);
         }
 
         void AddTargetColumn(string name, string header, int weight)
@@ -2001,6 +2086,15 @@ namespace PingMonitor
 
         void ScanNetwork()
         {
+            if (!NetworkKnown)
+            {
+                DialogResult r = MessageBox.Show(this, "Empfehlung: Zuerst Switches, Firewall und ggf. den UniFi-Controller eintragen (Schritt 1).\n\n" +
+                    "Dann ergänzt der Scan MAC-Adressen auch aus anderen VLANs (ARP-Tabelle der Firewall), übernimmt Gerätenamen aus dem " +
+                    "UniFi-Controller und die Geräte werden sofort ihren Switch-Ports bzw. Access Points zugeordnet.\n\nJetzt Switches/Controller einrichten?",
+                    "Netzwerk scannen", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                if (r == DialogResult.Cancel) return;
+                if (r == DialogResult.Yes) { OpenSwitches(); return; }
+            }
             HashSet<string> monitored = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (PingTarget t in targets) monitored.Add(t.Host);
             using (ScanForm f = new ScanForm(monitored))
@@ -2374,6 +2468,7 @@ namespace PingMonitor
                 foreach (PortState p in s.Ports.Values)
                     foreach (string mac in p.DeviceMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
                         map[mac] = new KeyValuePair<SwitchState, PortState>(s, p);
+            try { if (workflow != null) BeginInvoke(new Action(delegate { UpdateWorkflow(current); })); } catch (InvalidOperationException) { }
             portByMac = map;
             Dictionary<PingTarget, DeviceLink> links;
             try { Topology.Build(SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running), new List<PingTarget>(targets),
@@ -3455,6 +3550,7 @@ namespace PingMonitor
         public int Ttl;
         public DeviceInfo Info = new DeviceInfo();
         public string Name = "";       // vom Benutzer gewählter Name
+        public string ControllerName = "";   // Name im UniFi-Controller
         public string Comment = "";
 
         /// <summary>Vorschlag für den Gerätenamen.</summary>
@@ -3462,7 +3558,7 @@ namespace PingMonitor
         {
             get
             {
-                foreach (string n in new string[] { Info.DnsName, Info.NetBiosName, Info.SnmpName, Info.MdnsName })
+                foreach (string n in new string[] { ControllerName, Info.DnsName, Info.NetBiosName, Info.SnmpName, Info.MdnsName })
                 {
                     if (string.IsNullOrEmpty(n)) continue;
                     int dot = n.IndexOf('.');
@@ -3702,8 +3798,25 @@ namespace PingMonitor
 
         // ---------------------------------------------------------------- Scan
 
+        /// <summary>Was Switches/Firewall/Controller schon wissen: ARP-Tabelle (IP -> MAC) und UniFi-Clients.</summary>
+        class KnownNet
+        {
+            public Dictionary<string, string> Arp = new Dictionary<string, string>();
+            public UniFiSnapshot UniFi = new UniFiSnapshot();
+        }
+        KnownNet known = new KnownNet();
+
         void StartScan()
         {
+            KnownNet k = new KnownNet();
+            try
+            {
+                bool svc = !SwitchMonitor.Running;
+                foreach (SwitchState sw in SwitchMonitor.Current(svc)) foreach (KeyValuePair<string, string> kv in sw.Arp) k.Arp[kv.Key] = kv.Value;
+                k.UniFi = SwitchMonitor.CurrentUniFi(svc);
+            }
+            catch { }
+            known = k;
             List<IPAddress> addresses;
             try { addresses = NetTools.ParseRange(cboRange.Text); }
             catch (FormatException ex)
@@ -3791,6 +3904,12 @@ namespace PingMonitor
             if (!cancel) r.Info = DeviceInfo.Gather(ip, r.Ttl, extended, community);
             // Über Router hinweg liefert ARP keine MAC - NetBIOS gibt sie aber oft mit aus.
             if (r.Mac.Length == 0 && r.Info.NetBiosMac.Length > 0) r.Mac = r.Info.NetBiosMac;
+            // Firewall (ARP-Tabelle, auch andere VLANs) und UniFi-Controller (Namen) ergänzen
+            string fwMac;
+            if (r.Mac.Length == 0 && known.Arp.TryGetValue(ip.ToString(), out fwMac) && fwMac.Length == 12)
+                r.Mac = string.Join("-", new string[] { fwMac.Substring(0, 2), fwMac.Substring(2, 2), fwMac.Substring(4, 2), fwMac.Substring(6, 2), fwMac.Substring(8, 2), fwMac.Substring(10, 2) });
+            UniFiClientInfo uc = known.UniFi.Valid ? known.UniFi.Client(r.Mac, ip.ToString()) : null;
+            if (uc != null) r.ControllerName = uc.Name;
             if (r.Mac.Length > 0) r.Vendor = MacVendors.Lookup(r.Mac);
             return r;
         }
@@ -4930,6 +5049,22 @@ namespace PingMonitor
         public string Stp = "";          // Spanning-Tree-Zustand: forwarding, blocking, ...
 
         public bool StpBlocked { get { return Stp == "blocking" || Stp == "discarding" || Stp == "broken"; } }
+        public int Pvid;                 // ungetaggtes (natives) VLAN, 0 = unbekannt
+        public readonly List<int> Tagged = new List<int>();   // getaggte VLANs
+        public bool VlanFromSnmp;
+        public readonly List<Finding> VlanIssues = new List<Finding>();
+        public bool HasVlan { get { return Pvid > 0 || Tagged.Count > 0; } }
+
+        public string VlanText
+        {
+            get
+            {
+                if (!HasVlan) return "";
+                List<string> t = new List<string>();
+                foreach (int v in Tagged) t.Add(v.ToString());
+                return (Pvid > 0 ? Pvid + " (U)" : "–") + (t.Count > 0 ? " + " + (t.Count > 8 ? t.Count + " getaggt" : string.Join(",", t.ToArray())) : "");
+            }
+        }
 
         public double Util
         {
@@ -5011,6 +5146,7 @@ namespace PingMonitor
         public string Kind = "Switch";   // "Switch", "Access Point" oder "Firewall"
         public Dictionary<string, string> Arp = new Dictionary<string, string>();   // IP -> MAC (ARP-Tabelle der Firewall)
         public bool FromUniFi;           // nicht per SNMP abgefragt, Daten vom UniFi-Controller
+        public Dictionary<int, string> VlanNames = new Dictionary<int, string>();
         public long StpChanges = -1;     // Zähler der Spanning-Tree-Topologieänderungen (SNMP)
         public readonly List<DateTime> StpTimes = new List<DateTime>();
         public int Cpu = -1, MemPct = -1;   // Auslastung in % (HOST-RESOURCES / UCD-SNMP), -1 = unbekannt
@@ -5062,6 +5198,9 @@ namespace PingMonitor
                      IfInBcast = "1.3.6.1.2.1.31.1.1.1.3", IfHCInBcast = "1.3.6.1.2.1.31.1.1.1.9";
         // BRIDGE-MIB: Spanning Tree
         const string StpTopChanges = "1.3.6.1.2.1.17.2.4.0", StpPortState = "1.3.6.1.2.1.17.2.15.1.3";
+        // Q-BRIDGE-MIB: VLANs
+        const string QPvid = "1.3.6.1.2.1.17.7.1.4.5.1.1", QCurEgress = "1.3.6.1.2.1.17.7.1.4.2.1.4", QCurUntagged = "1.3.6.1.2.1.17.7.1.4.2.1.5",
+                     QStaticName = "1.3.6.1.2.1.17.7.1.4.3.1.1", QStaticEgress = "1.3.6.1.2.1.17.7.1.4.3.1.2", QStaticUntagged = "1.3.6.1.2.1.17.7.1.4.3.1.4";
         // EtherLike-MIB (dot3StatsTable)
         const string Dot3Align = "1.3.6.1.2.1.10.7.2.1.2", Dot3Fcs = "1.3.6.1.2.1.10.7.2.1.3",
                      Dot3Late = "1.3.6.1.2.1.10.7.2.1.8", Dot3Duplex = "1.3.6.1.2.1.10.7.2.1.19";
@@ -5092,6 +5231,23 @@ namespace PingMonitor
         static DateTime configStamp;
         static string snapshot = "";
         static UniFiSnapshot unifi = new UniFiSnapshot();
+        static DateTime started;
+
+        /// <summary>Seit wann fragt die Switch-Überwachung ab (Dienst bzw. App)? MinValue = gar nicht.</summary>
+        public static DateTime Since(bool fromService)
+        {
+            try
+            {
+                foreach (string l in SnapshotLines(fromService))
+                    if (l.StartsWith("#Seit;"))
+                    {
+                        DateTime t;
+                        if (DateTime.TryParseExact(l.Substring(6).Trim(), Fmt.Time, null, System.Globalization.DateTimeStyles.None, out t)) return t;
+                    }
+            }
+            catch { }
+            return DateTime.MinValue;
+        }
 
         static void LogUniFi(string evt, string info)
         {
@@ -5223,6 +5379,7 @@ namespace PingMonitor
                 lastPorts = null;   // nach "Zurücksetzen" neu aus der Datei laden
                 owner = ownerName;
                 writeStatus = writeStatusFile;
+                started = DateTime.Now;
                 configStamp = DateTime.MinValue;
                 thread = new Thread(Loop);
                 thread.IsBackground = true;
@@ -5282,6 +5439,7 @@ namespace PingMonitor
                     }
                     else lock (sync) { unifi = new UniFiSnapshot(); switches.RemoveAll(delegate (SwitchState x) { return x.FromUniFi; }); }
                     AssignRoles();
+                    CheckVlans();
                     MapDevices();
                     lock (sync) foreach (SwitchState s in switches) foreach (PortState p in s.Ports.Values) Evaluate(s, p);
                     // Anzeige und Statusdatei sehen nur vollständig abgeschlossene Abfragerunden.
@@ -5662,6 +5820,68 @@ namespace PingMonitor
                 s.HasFdb = rows.Count > 0;
             }
             ReadLldp(ip, s, bridge);
+            ReadVlans(ip, s, bridge);
+        }
+
+        /// <summary>VLANs je Port aus der Q-BRIDGE-MIB: natives VLAN (PVID) und getaggte VLANs (Egress ohne Untagged).</summary>
+        static void ReadVlans(IPAddress ip, SwitchState s, Dictionary<int, SnmpValue> bridge)
+        {
+            Dictionary<int, SnmpValue> pvid = Column(ip, s.Community, QPvid);
+            Dictionary<int, List<int>> egress = Bitmaps(Snmp.Walk(ip, s.Community, QCurEgress, 2000));
+            Dictionary<int, List<int>> untagged = Bitmaps(Snmp.Walk(ip, s.Community, QCurUntagged, 2000));
+            if (egress.Count == 0)
+            {
+                egress = Bitmaps(Snmp.Walk(ip, s.Community, QStaticEgress, 2000));
+                untagged = Bitmaps(Snmp.Walk(ip, s.Community, QStaticUntagged, 2000));
+            }
+            if (pvid.Count == 0 && egress.Count == 0) return;
+            Dictionary<int, string> names = new Dictionary<int, string>();
+            List<KeyValuePair<string, SnmpValue>> nm = Snmp.Walk(ip, s.Community, QStaticName, 2000);
+            if (nm != null)
+                foreach (KeyValuePair<string, SnmpValue> kv in nm) { int v; if (int.TryParse(kv.Key, out v) && kv.Value.Text.Length > 0) names[v] = kv.Value.Text; }
+            lock (sync)
+            {
+                s.VlanNames = names;
+                foreach (PortState p in s.Ports.Values) { if (!p.Wireless) { p.Pvid = 0; p.Tagged.Clear(); p.VlanFromSnmp = false; } }
+                foreach (KeyValuePair<int, SnmpValue> kv in pvid)
+                {
+                    PortState p;
+                    int ifIndex = bridge.ContainsKey(kv.Key) ? (int)bridge[kv.Key].Number : kv.Key;
+                    if (s.Ports.TryGetValue(ifIndex, out p)) { p.Pvid = (int)kv.Value.Number; p.VlanFromSnmp = true; }
+                }
+                foreach (KeyValuePair<int, List<int>> kv in egress)
+                {
+                    List<int> un;
+                    untagged.TryGetValue(kv.Key, out un);
+                    foreach (int bp in kv.Value)
+                    {
+                        if (un != null && un.Contains(bp)) continue;
+                        PortState p;
+                        int ifIndex = bridge.ContainsKey(bp) ? (int)bridge[bp].Number : bp;
+                        if (s.Ports.TryGetValue(ifIndex, out p) && !p.Tagged.Contains(kv.Key) && kv.Key != p.Pvid) { p.Tagged.Add(kv.Key); p.VlanFromSnmp = true; }
+                    }
+                }
+                foreach (PortState p in s.Ports.Values) p.Tagged.Sort();
+            }
+        }
+
+        /// <summary>Port-Bitmaps (je VLAN) auswerten: Bit 0 des ersten Bytes = Bridge-Port 1.</summary>
+        static Dictionary<int, List<int>> Bitmaps(List<KeyValuePair<string, SnmpValue>> rows)
+        {
+            Dictionary<int, List<int>> r = new Dictionary<int, List<int>>();
+            if (rows == null) return r;
+            foreach (KeyValuePair<string, SnmpValue> kv in rows)
+            {
+                string[] k = kv.Key.Split('.');
+                int vlan;
+                if (!int.TryParse(k[k.Length - 1], out vlan) || kv.Value.Raw == null) continue;
+                List<int> ports = new List<int>();
+                for (int i = 0; i < kv.Value.Raw.Length; i++)
+                    for (int b = 0; b < 8; b++)
+                        if ((kv.Value.Raw[i] & (0x80 >> b)) != 0) ports.Add(i * 8 + b + 1);
+                r[vlan] = ports;
+            }
+            return r;
         }
 
         /// <summary>CPU, Arbeitsspeicher, Systemlast und TCP-Verbindungen (HOST-RESOURCES-MIB, UCD-SNMP-MIB) - z. B. OPNsense.</summary>
@@ -5856,6 +6076,106 @@ namespace PingMonitor
 
         static string gatewayMac = "";
 
+        /// <summary>VLAN mit Namen (UniFi-Netzwerk bzw. Switch), z. B. "30 (Gäste)".</summary>
+        public static string VlanLabel(int v, SwitchState s, UniFiSnapshot u)
+        {
+            string n = u != null ? u.VlanName(v) : "";
+            if (n.Length == 0 && s != null) s.VlanNames.TryGetValue(v, out n);
+            return v + (string.IsNullOrEmpty(n) ? "" : " (" + n + ")");
+        }
+
+        /// <summary>Port eines Switches, an dem die eigene MAC eines anderen Switches gesehen wird (Richtung zu diesem).</summary>
+        static PortState PortToward(SwitchState from, SwitchState to)
+        {
+            PortState best = null;
+            foreach (string m in to.OwnMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                foreach (PortState p in from.Ports.Values)
+                    if (!p.Wireless && p.Macs.Exists(delegate (string x) { return NetTools.MacHex(x) == NetTools.MacHex(m); }) &&
+                        (best == null || p.Macs.Count < best.Macs.Count)) best = p;
+            return best;
+        }
+
+        /// <summary>
+        /// VLAN-Abgleich: An jeder Verbindung zwischen zwei Switches müssen beide Enden dasselbe native VLAN und dieselben getaggten VLANs
+        /// haben; am Port zu einem Access Point müssen alle VLANs der ausgestrahlten WLANs ankommen.
+        /// </summary>
+        static void CheckVlans()
+        {
+            lock (sync)
+            {
+                foreach (SwitchState s in switches) foreach (PortState p in s.Ports.Values) p.VlanIssues.Clear();
+                foreach (SwitchState a in switches)
+                {
+                    if (a.Kind == "Firewall") continue;
+                    foreach (PortState p in a.Ports.Values)
+                    {
+                        if (!p.HasVlan || p.Wireless) continue;
+                        // direkter Nachbar: per LLDP oder der Kandidat aus der Port-Rolle, zwischen dem und uns kein anderer Kandidat liegt
+                        List<SwitchState> cand = new List<SwitchState>();
+                        foreach (string t in p.RoleTarget.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            SwitchState b = switches.Find(delegate (SwitchState x) { return x.Address == t; });
+                            if (b != null && b != a) cand.Add(b);
+                        }
+                        SwitchState lldp = p.LldpName.Length > 0 ? switches.Find(delegate (SwitchState x) { return x != a && x.Kind != "Firewall" &&
+                            (string.Equals(x.SysName, p.LldpName, StringComparison.OrdinalIgnoreCase) || string.Equals(x.Name, p.LldpName, StringComparison.OrdinalIgnoreCase)); }) : null;
+                        if (p.Role == "ap" && cand.Count == 1 && cand[0].Kind == "Access Point") { CheckApPort(a, p, cand[0]); continue; }
+                        List<SwitchState> adj = new List<SwitchState>();
+                        if (lldp != null) adj.Add(lldp);
+                        else
+                            foreach (SwitchState b in cand)
+                            {
+                                PortState q0 = PortToward(b, a);
+                                if (q0 != null && !cand.Exists(delegate (SwitchState o) { return o != b && o.OwnMacs.Length > 0 && PortToward(b, o) == q0; })) adj.Add(b);
+                            }
+                        if (adj.Count != 1) continue;
+                        SwitchState nb = adj[0];
+                        if (nb.Kind == "Access Point")
+                        {
+                            CheckApPort(a, p, nb);
+                            continue;
+                        }
+                        PortState q = PortToward(nb, a);
+                        if (q == null || !q.HasVlan) continue;
+                        string other = nb.Name + " / " + q.DisplayName;
+                        if (p.Pvid > 0 && q.Pvid > 0 && p.Pvid != q.Pvid)
+                            p.VlanIssues.Add(new Finding(Finding.Warning, "Natives VLAN ungleich (" + p.Pvid + " ↔ " + q.Pvid + ")",
+                                "Dieser Port verbindet zu " + other + ". Hier ist VLAN " + VlanLabel(p.Pvid, a, unifi) + " ungetaggt, dort VLAN " +
+                                VlanLabel(q.Pvid, nb, unifi) + ". Ungetaggter Verkehr wechselt an dieser Verbindung das VLAN - Geräte landen im falschen Netz, " +
+                                "DHCP verteilt Adressen aus dem falschen Bereich, VLANs sind ungewollt verbunden.\r\nVorgehen: auf beiden Seiten dasselbe " +
+                                "native VLAN (Port-Profil) einstellen."));
+                        foreach (int v in p.Tagged)
+                        {
+                            if (q.Tagged.Contains(v) || q.Pvid == v) continue;
+                            int vv = v;
+                            Predicate<PortState> uses = delegate (PortState o) { return o != p && o != q && !o.IsInfrastructure && (o.Pvid == vv || o.Role == "ap" && o.Tagged.Contains(vv)); };
+                            string usedAt = new List<PortState>(a.Ports.Values).Exists(uses) ? a.Name : new List<PortState>(nb.Ports.Values).Exists(uses) ? nb.Name : "";
+                            p.VlanIssues.Add(new Finding(usedAt.Length > 0 ? Finding.Warning : Finding.Info, "VLAN " + v + " fehlt bei " + nb.Name,
+                                "VLAN " + VlanLabel(v, a, unifi) + " ist an diesem Port getaggt, am Gegenstück " + other + " aber nicht - über diese Verbindung " +
+                                "kommt das VLAN nicht. " + (usedAt.Length > 0 ? "An " + usedAt + " hängen Geräte in VLAN " + v + "; je nach Lage sind sie vom Rest " +
+                                "dieses VLANs (Gateway, DHCP) abgeschnitten. Vorgehen: VLAN " + v + " am Port " + q.DisplayName + " von " + nb.Name + " zulassen (Port-Profil)."
+                                      : "Derzeit hängen an beiden Switches keine Geräte in diesem VLAN - harmlos, aber uneinheitlich.")));
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>Am Port zu einem Access Point müssen die VLANs aller ausgestrahlten WLANs ankommen.</summary>
+        static void CheckApPort(SwitchState s, PortState p, SwitchState ap)
+        {
+            if (unifi.Wlans.Count == 0) return;
+            List<string> missing = new List<string>();
+            foreach (KeyValuePair<string, int> w in unifi.Wlans)
+                if (w.Value > 0 && w.Value != p.Pvid && !p.Tagged.Contains(w.Value) && !missing.Contains(w.Key + " (VLAN " + w.Value + ")"))
+                    missing.Add("\"" + w.Key + "\" (VLAN " + VlanLabel(w.Value, s, unifi) + ")");
+            if (missing.Count > 0)
+                p.VlanIssues.Add(new Finding(Finding.Problem, "WLAN-VLAN fehlt zum AP",
+                    "Der Access Point " + ap.Name + " strahlt " + string.Join(", ", missing.ToArray()) + " aus, das VLAN kommt an diesem Port aber nicht an. " +
+                    "WLAN-Geräte in diesem Netz verbinden sich, bekommen aber keine Adresse (bzw. 169.254.x.x). Typisch nach einem Umbau: am Switch-Port " +
+                    "ein Profil ohne dieses VLAN.\r\nVorgehen: Port-Profil des Ports " + p.DisplayName + " auf \"Alle\" bzw. um das VLAN erweitern."));
+        }
+
         static bool IsSwitchMac(string macHex)
         {
             foreach (SwitchState s in switches)
@@ -5894,6 +6214,7 @@ namespace PingMonitor
                             if (p == null) continue;
                             p.PoeOn = up.PoeOn; p.PoeWatts = up.PoeWatts;
                             if (up.Stp.Length > 0) p.Stp = up.Stp;
+                            if (up.VlanKnown && !p.VlanFromSnmp) { p.Pvid = up.NativeVlan; p.Tagged.Clear(); p.Tagged.AddRange(up.Tagged); }
                         }
                         continue;
                     }
@@ -5941,6 +6262,7 @@ namespace PingMonitor
                         Rates(p, up.RxBytes, up.TxBytes, now);
                         Broadcasts(p, up.RxBcast, now);
                         p.PoeOn = up.PoeOn; p.PoeWatts = up.PoeWatts; p.Stp = up.Stp;
+                        if (up.VlanKnown) { p.Pvid = up.NativeVlan; p.Tagged.Clear(); p.Tagged.AddRange(up.Tagged); }
                         // "MAC-Tabelle" aus den Controller-Daten: Geräte an diesem Port, angeschlossene UniFi-Geräte, Gateway am Uplink
                         p.Macs.Clear();
                         foreach (UniFiClientInfo c in u.Clients)
@@ -6293,6 +6615,7 @@ namespace PingMonitor
                     "(Drucker, Telefone, Steuerungen) ist das normal. Kann das Gerät eigentlich Gigabit, deutet es auf ein defektes " +
                     "Adernpaar im Kabel hin (Gigabit braucht alle 4 Paare, 100 Mbit nur 2) oder auf ein altes Cat-5-Kabel.\r\n" +
                     "Mehr dazu: " + Links.Gigabit));
+            f.AddRange(p.VlanIssues);
             if (p.Up && p.StpBlocked)
                 f.Add(new Finding(Finding.Warning, "STP blockiert",
                     "Spanning Tree hat diesen Port gesperrt (Zustand \"" + p.Stp + "\"): Über ihn gibt es eine zweite Verbindung zu einem Netz, " +
@@ -6320,6 +6643,8 @@ namespace PingMonitor
                 (p.RateText.Length > 0 ? "\r\nDatenrate empfangen / gesendet: " + p.RateText + " Mbit/s" : "") +
                 (p.PoeOn ? "\r\nPoE: " + p.PoeWatts.ToString("0.0") + " W" : "") +
                 (p.Up && p.Stp.Length > 0 ? "\r\nSpanning Tree: " + p.Stp : "") +
+                (p.HasVlan ? "\r\nVLAN: " + (p.Pvid > 0 ? VlanLabel(p.Pvid, s, unifi) + " ungetaggt" : "kein natives") +
+                    (p.Tagged.Count > 0 ? ", getaggt: " + string.Join(", ", p.Tagged.ConvertAll<string>(delegate (int v) { return v.ToString(); }).ToArray()) : "") : "") +
                 (p.Up && p.RecentBcast.Count > 0 ? "\r\nBroadcasts: " + p.BcastPps.ToString("0") + "/s" : "") + "\r\n" +
                 "\r\nSeit Überwachungsbeginn: Empfangsfehler " + p.RxErrors + ", Sendefehler " + p.TxErrors + ", verworfen " + p.Discards +
                 ", Link-Wechsel (24 h) " + flapsDay +
@@ -6355,6 +6680,7 @@ namespace PingMonitor
             lock (sync)
             {
                 sb.Append("#Stand;" + DateTime.Now.ToString(Fmt.Time) + "\r\n");
+                if (started != DateTime.MinValue) sb.Append("#Seit;" + started.ToString(Fmt.Time) + "\r\n");
                 foreach (SwitchState s in switches)
                 {
                     sb.Append(string.Join(";", new string[] { "S", Fmt.Csv(s.Name), Fmt.Csv(s.Address), Fmt.Csv(s.Community),
@@ -6374,7 +6700,8 @@ namespace PingMonitor
                             p.OutMbps.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
                             p.OctetsAt == DateTime.MinValue ? "" : p.OctetsAt.ToString(Fmt.Time), p.LldpCaps.ToString(), p.Role, Fmt.Csv(p.RoleInfo), Fmt.Csv(p.RoleTarget),
                             p.PoeOn ? "1" : "0", p.PoeWatts.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture), p.Stp,
-                            p.BcastPps.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) })).Append("\r\n");
+                            p.BcastPps.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture), p.Pvid.ToString(),
+                            string.Join(",", p.Tagged.ConvertAll<string>(delegate (int v) { return v.ToString(); }).ToArray()) })).Append("\r\n");
                 }
             }
             return sb.ToString();
@@ -6451,6 +6778,11 @@ namespace PingMonitor
                                 double.TryParse(f[32], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out p.PoeWatts);
                                 p.Stp = f[33];
                                 double.TryParse(f[34], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out p.BcastPps);
+                            }
+                            if (f.Count >= 37)
+                            {
+                                int.TryParse(f[35], out p.Pvid);
+                                foreach (string v in f[36].Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) { int x; if (int.TryParse(v, out x)) p.Tagged.Add(x); }
                             }
                         }
                         foreach (string m in f[22].Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) p.Macs.Add(m);
@@ -6647,6 +6979,7 @@ namespace PingMonitor
             Col(gridPorts, "Flaps", "Link-Wechsel 24 h", 55);
             Col(gridPorts, "LastFlap", "Letzter Link-Wechsel", 80);
             Col(gridPorts, "Connected", "Angeschlossen", 150);
+            Col(gridPorts, "Vlan", "VLAN (U = ungetaggt)", 70);
             Col(gridPorts, "Rate", "Datenrate ↓/↑ Mbit/s", 80);
             Col(gridPorts, "Rating", "Bewertung", 130);
             gridPorts.CellDoubleClick += delegate (object sender, DataGridViewCellEventArgs e)
@@ -6843,7 +7176,7 @@ namespace PingMonitor
                     shown++;
                     int i = gridPorts.Rows.Add(s.Name, p.DisplayName, p.Alias, p.Up ? "an" : "aus", p.SpeedText, p.DuplexText,
                         p.RxErrors, p.TxErrors, p.Discards, p.FlapsSince(TimeSpan.FromDays(1)),
-                        p.LastFlap.HasValue ? p.LastFlap.Value.ToString("dd.MM. HH:mm:ss") : "", p.IsWan ? "WAN / Internet" : p.ConnectedText, p.RateText, p.Rating.Short);
+                        p.LastFlap.HasValue ? p.LastFlap.Value.ToString("dd.MM. HH:mm:ss") : "", p.IsWan ? "WAN / Internet" : p.ConnectedText, p.VlanText, p.RateText, p.Rating.Short);
                     DataGridViewRow row = gridPorts.Rows[i];
                     row.Tag = new object[] { s, p };
                     row.DefaultCellStyle.BackColor = Finding.Back(p.Rating.Level);
@@ -7880,6 +8213,155 @@ namespace PingMonitor
         }
     }
 
+    /// <summary>Messzeit mit Meilensteinen (logarithmische Skala 1 min bis 7 Tage).</summary>
+    class RuntimeBar : Control
+    {
+        public TimeSpan Value;
+        public static readonly double[] Marks = { 5, 15, 60, 1440, 10080 };   // Minuten
+        static readonly string[] Labels = { "5m", "15m", "1h", "24h", "7T" };
+
+        public RuntimeBar() { DoubleBuffered = true; Height = 26; }
+
+        static float Pos(double minutes, int width)
+        {
+            double x = Math.Log10(Math.Max(1, minutes)) / Math.Log10(10080);
+            return (float)(Math.Max(0, Math.Min(1, x)) * (width - 1));
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            int w = Width - 2, barH = 10;
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(225, 228, 234))) g.FillRectangle(b, 1, 2, w, barH);
+            double min = Value.TotalMinutes;
+            Color fill = min >= 1440 ? Icons.Green : min >= 60 ? Color.FromArgb(60, 140, 210) : Color.FromArgb(120, 170, 225);
+            using (SolidBrush b = new SolidBrush(fill)) g.FillRectangle(b, 1, 2, Pos(min, w), barH);
+            using (Font f = new Font(Font.FontFamily, 7.5f))
+                for (int i = 0; i < Marks.Length; i++)
+                {
+                    float x = Pos(Marks[i], w);
+                    bool reached = min >= Marks[i];
+                    using (Pen p = new Pen(reached ? Color.White : Color.Gray)) g.DrawLine(p, x, 2, x, 2 + barH);
+                    Size sz = TextRenderer.MeasureText(Labels[i], f);
+                    int tx = (int)Math.Min(Math.Max(0, x - sz.Width / 2), Width - sz.Width);
+                    TextRenderer.DrawText(g, Labels[i], f, new Point(tx, 3 + barH), reached ? Color.FromArgb(30, 110, 50) : SystemColors.GrayText);
+                }
+        }
+    }
+
+    /// <summary>Arbeitsablauf im Hauptfenster: 1 Netzwerk einlesen, 2 Geräte erfassen, 3 überwachen, 4 beobachten, 5 auswerten.</summary>
+    class WorkflowPanel : TableLayoutPanel
+    {
+        public readonly Label[] Status = new Label[5];
+        readonly Panel[] cards = new Panel[5];
+        public readonly RuntimeBar Bar = new RuntimeBar();
+        static readonly string[] Titles = { "1  Netzwerk einlesen", "2  Geräte erfassen", "3  Überwachen", "4  Beobachten", "5  Auswerten" };
+
+        public WorkflowPanel(Action[][] actions, string[][] buttons)
+        {
+            ColumnCount = 5;
+            RowCount = 1;
+            Dock = DockStyle.Top;
+            Height = 134;
+            Padding = new Padding(4, 4, 4, 0);
+            for (int i = 0; i < 5; i++) ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20));
+            for (int i = 0; i < 5; i++)
+            {
+                Panel c = new Panel();
+                c.Dock = DockStyle.Fill;
+                c.Margin = new Padding(3);
+                c.Padding = new Padding(8, 5, 8, 5);
+                Label t = new Label();
+                t.Text = Titles[i];
+                t.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
+                t.Dock = DockStyle.Top;
+                t.Height = 22;
+                Label s = new Label();
+                s.Dock = DockStyle.Fill;
+                s.ForeColor = Color.FromArgb(60, 60, 60);
+                Status[i] = s;
+                FlowLayoutPanel b = new FlowLayoutPanel();
+                b.Dock = DockStyle.Bottom;
+                b.Height = 30;
+                b.WrapContents = false;
+                for (int k = 0; k < buttons[i].Length; k++)
+                {
+                    Button btn = new Button();
+                    btn.Text = buttons[i][k];
+                    btn.AutoSize = true;
+                    btn.Margin = new Padding(0, 0, 4, 0);
+                    Action a = actions[i][k];
+                    btn.Click += delegate { a(); };
+                    b.Controls.Add(btn);
+                }
+                c.Controls.Add(s);
+                if (i == 3) { Bar.Dock = DockStyle.Bottom; c.Controls.Add(Bar); }
+                c.Controls.Add(b);
+                c.Controls.Add(t);
+                c.Paint += delegate (object sender, PaintEventArgs e)
+                {
+                    Panel pp = (Panel)sender;
+                    using (Pen p = new Pen(Color.FromArgb(190, 196, 205))) e.Graphics.DrawRectangle(p, 0, 0, pp.Width - 1, pp.Height - 1);
+                };
+                cards[i] = c;
+                Controls.Add(c, i, 0);
+            }
+        }
+
+        /// <summary>state: 0 = offen, 1 = aktueller Schritt, 2 = erledigt.</summary>
+        public void SetState(int step, int state, string text)
+        {
+            cards[step].BackColor = state == 2 ? Color.FromArgb(232, 245, 233) : state == 1 ? Color.FromArgb(255, 248, 220) : Color.FromArgb(245, 246, 248);
+            Status[step].Text = (state == 2 ? "✓ " : state == 1 ? "► " : "") + text;
+        }
+    }
+
+    /// <summary>Welche Auswertung ist nach welcher Messzeit aussagekräftig?</summary>
+    static class Milestones
+    {
+        public static readonly string[] Texts = {
+            "Port-Zuordnung und Netzwerkplan (MAC-Tabellen werden alle 5 Abfragen gelesen), Port-Rollen, VLAN-Abgleich",
+            "Leitungsqualität je Gerät (Paketverlust, Jitter, große Pakete - Messfenster 15 Minuten)",
+            "Fehlerzähler-Trends (steigende CRC-Fehler), Link-Wechsel und Spanning-Tree-Änderungen pro Stunde, WLAN-Verlauf (Signal, AP-Wechsel)",
+            "Tagesverlauf (Nacht/Tag, Energiesparen, Backups, Updates), Ausfall-Statistik, Dokumentation für den Kunden",
+            "Wiederkehrende Muster (bestimmte Wochentage/Uhrzeiten), seltene Wackelkontakte" };
+
+        public static string Explain(TimeSpan ping, TimeSpan sw, bool hasSwitches)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("Messzeit Ping-Überwachung: " + Fmt(ping) + (hasSwitches ? "     Switch-/Controller-Abfrage: " + Fmt(sw) : ""));
+            sb.AppendLine();
+            sb.AppendLine("Viele Fehler zeigen sich nur ab und zu. Erst nach einer gewissen Messzeit sind Aussagen belastbar:");
+            sb.AppendLine();
+            TimeSpan eff = hasSwitches && sw < ping ? sw : ping;
+            string[] at = { "nach 5 Minuten", "nach 15 Minuten", "nach 1 Stunde", "nach 24 Stunden", "nach 7 Tagen" };
+            for (int i = 0; i < Texts.Length; i++)
+                sb.AppendLine((eff.TotalMinutes >= RuntimeBar.Marks[i] ? "✓ " : "○ ") + at[i] + ":  " + Texts[i]);
+            sb.AppendLine();
+            sb.AppendLine("Tipp: Für eine Fehlersuche beim Kunden den Windows-Dienst installieren - er misst auch ohne Anmeldung und über Nacht. " +
+                "\"Statistik zurücksetzen\" setzt die Ping-Messzeit zurück.");
+            return sb.ToString();
+        }
+
+        public static string Fmt(TimeSpan t)
+        {
+            if (t.TotalMinutes < 1) return "unter 1 min";
+            if (t.TotalHours < 1) return (int)t.TotalMinutes + " min";
+            if (t.TotalDays < 1) return (int)t.TotalHours + " h " + t.Minutes + " min";
+            return (int)t.TotalDays + " T " + t.Hours + " h";
+        }
+
+        public static string Next(TimeSpan eff)
+        {
+            string[] short_ = { "Port-Zuordnung", "Leitungsqualität", "Fehler-Trends, WLAN-Verlauf", "Tagesverlauf, Doku", "Wochenmuster" };
+            string[] at = { "5 min", "15 min", "1 h", "24 h", "7 Tagen" };
+            for (int i = 0; i < RuntimeBar.Marks.Length; i++)
+                if (eff.TotalMinutes < RuntimeBar.Marks[i]) return "Nächstes: " + short_[i] + " ab " + at[i];
+            return "Alle Auswertungen aussagekräftig.";
+        }
+    }
+
     /// <summary>Netzwerkplan als Baum: Internet - Gateway - Switches - Access Points - Geräte.</summary>
     class TopologyForm : Form
     {
@@ -8516,14 +8998,17 @@ namespace PingMonitor
                     ports.RemoveAll(delegate (PortState p) { return p.Wireless; });
                     if (ports.Count == 0) continue;
                     h.Append("<h3>").Append(Icon("switch")).Append(H(s.Name)).Append(" <span class=\"muted\">").Append(H(s.Address)).Append("</span></h3>");
-                    h.Append("<table><tr><th style=\"width:9%\">Port</th><th style=\"width:13%\">Link</th><th style=\"width:7%\">PoE</th><th>Angeschlossen</th><th style=\"width:22%\">Bewertung</th></tr>");
+                    bool vl = ports.Exists(delegate (PortState x) { return x.HasVlan; });
+                    h.Append("<table><tr><th style=\"width:9%\">Port</th><th style=\"width:13%\">Link</th><th style=\"width:7%\">PoE</th>")
+                     .Append(vl ? "<th style=\"width:13%\">VLAN</th>" : "").Append("<th>Angeschlossen</th><th style=\"width:22%\">Bewertung</th></tr>");
                     foreach (PortState p in ports)
                     {
                         string att = Attached(p);
                         h.Append("<tr").Append(p.Rating.Level >= Finding.Problem ? " class=\"prob\"" : p.Rating.Level >= Finding.Warning ? " class=\"warn\"" : "").Append("><td>")
                          .Append(H(p.DisplayName)).Append(p.Alias.Length > 0 ? "<br><span class=\"small\">" + H(p.Alias) + "</span>" : "").Append("</td><td>")
                          .Append(p.Up ? H(p.SpeedText.Length > 0 ? p.SpeedText : "aktiv") + (p.Duplex == 2 ? " (halb)" : "") : "<span class=\"muted\">aus</span>")
-                         .Append("</td><td>").Append(p.PoeOn && p.PoeWatts > 0 ? p.PoeWatts.ToString("0.0") + " W" : "").Append("</td><td>").Append(H(att))
+                         .Append("</td><td>").Append(p.PoeOn && p.PoeWatts > 0 ? p.PoeWatts.ToString("0.0") + " W" : "").Append("</td><td>")
+                         .Append(vl ? H(p.VlanText) + "</td><td>" : "").Append(H(att))
                          .Append("</td><td>").Append(p.Up || p.Rating.Level >= Finding.Warning ? Dot(p.Rating.Level, false) + H(Plain(p.Rating.Short)) : "").Append("</td></tr>");
                     }
                     h.Append("</table>");
@@ -8993,6 +9478,63 @@ namespace PingMonitor
         public readonly List<DateTime> Lost = new List<DateTime>();
     }
 
+    /// <summary>
+    /// Wo steckt eine MAC-Adresse? Führt Geräteliste, UniFi-Controller und MAC-Tabellen der Switches zusammen
+    /// (für die Mitschnitt-Analyse: "fremder DHCP-Server hängt an USW Büro / Port 7").
+    /// </summary>
+    class Locator
+    {
+        readonly Dictionary<string, string> names = new Dictionary<string, string>();
+        List<SwitchState> switches = new List<SwitchState>();
+        UniFiSnapshot unifi = new UniFiSnapshot();
+
+        public static Locator Load()
+        {
+            Locator l = new Locator();
+            try { foreach (PingTarget h in Config.LoadHosts()) if (NetTools.MacHex(h.Mac).Length == 12) l.names[NetTools.MacHex(h.Mac)] = h.Name; } catch { }
+            try
+            {
+                bool svc = !SwitchMonitor.Running;
+                l.switches = SwitchMonitor.Current(svc);
+                l.unifi = SwitchMonitor.CurrentUniFi(svc);
+            }
+            catch { }
+            return l;
+        }
+
+        /// <summary>" [Name, Switch / Port]" oder leer.</summary>
+        public string Text(string mac)
+        {
+            string w = Where(mac);
+            return w.Length > 0 ? "  [" + w + "]" : "";
+        }
+
+        public string Where(string mac)
+        {
+            string hex = NetTools.MacHex(mac);
+            if (hex.Length != 12) return "";
+            List<string> parts = new List<string>();
+            string n;
+            if (names.TryGetValue(hex, out n)) parts.Add(n);
+            UniFiClientInfo c = unifi.Valid ? unifi.Client(hex, "") : null;
+            if (c != null)
+            {
+                UniFiDeviceInfo d = unifi.Device(c.Wired ? c.SwMac : c.ApMac);
+                if (c.Name.Length > 0 && parts.Count == 0) parts.Add(c.Name);
+                parts.Add(c.Wired ? (d != null ? d.Name : c.SwMac) + " / Port " + c.SwPort : "WLAN " + (d != null ? d.Name : c.ApMac));
+                return string.Join(", ", parts.ToArray());
+            }
+            SwitchState bs = null;
+            PortState bp = null;
+            foreach (SwitchState s in switches)
+                foreach (PortState p in s.Ports.Values)
+                    if (p.Macs.Exists(delegate (string m) { return NetTools.MacHex(m) == hex; }) && (bp == null || SwitchMonitor.PortScore(p) < SwitchMonitor.PortScore(bp)))
+                    { bs = s; bp = p; }
+            if (bp != null) parts.Add((bp.IsInfrastructure && bp.Macs.Count > 1 ? "hinter " : "") + bs.Name + " / " + bp.DisplayName);
+            return string.Join(", ", parts.ToArray());
+        }
+    }
+
     /// <summary>Wertet einen Mitschnitt aus und erzeugt Befunde in Klartext.</summary>
     class CaptureAnalyzer
     {
@@ -9020,7 +9562,32 @@ namespace PingMonitor
         int gratuitous;
 
         // DHCP
-        class DhcpServer { public string Ip = "", Mac = "", Router = "", Dns = ""; public int Offers, Acks, Naks; public DateTime First; }
+        class DhcpServer { public string Ip = "", Mac = "", Router = "", Dns = "", Mask = ""; public int Offers, Acks, Naks, Vlan; public DateTime First; }
+
+        // VLAN (802.1Q-Tags im Mitschnitt)
+        class VlanStat
+        {
+            public int Id;
+            public long Packets;
+            public readonly HashSet<string> Macs = new HashSet<string>();
+            public readonly Dictionary<string, string> Ips = new Dictionary<string, string>();   // IP (ARP-Absender) -> MAC
+            public int Discovers, Offers;
+            public string Mask = "";
+        }
+        readonly Dictionary<int, VlanStat> vlans = new Dictionary<int, VlanStat>();
+        int curVlan;            // VLAN des gerade dekodierten Pakets (0 = ungetaggt)
+        long tagged, doubleTagged;
+        Locator where;
+
+        static string VlanName(int v) { return v == 0 ? "ungetaggt" : "VLAN " + v; }
+        string VlanPrefix { get { return tagged > 0 ? VlanName(curVlan) + ": " : ""; } }
+
+        VlanStat Vlan(int id)
+        {
+            VlanStat v;
+            if (!vlans.TryGetValue(id, out v)) { v = new VlanStat(); v.Id = id; vlans[id] = v; }
+            return v;
+        }
         readonly Dictionary<string, DhcpServer> dhcpServers = new Dictionary<string, DhcpServer>();
         int dhcpDiscover, dhcpRequest;
         readonly HashSet<string> dhcpv6Servers = new HashSet<string>();
@@ -9113,6 +9680,7 @@ namespace PingMonitor
 
         void Decode(DateTime t, int link, byte[] d, int len)
         {
+            curVlan = 0;
             int p;
             int ethertype;
             string srcMac = "", dstMac = "";
@@ -9127,10 +9695,23 @@ namespace PingMonitor
                         if (dstMac == "FF-FF-FF-FF-FF-FF") { broadcast++; Count(bcastPerSecond, t); }
                         else multicast++;
                     }
-                    while (ethertype == 0x8100 || ethertype == 0x88A8) { ethertype = U16(d, p + 2); p += 4; }
+                    curVlan = 0;
+                    int tags = 0;
+                    while ((ethertype == 0x8100 || ethertype == 0x88A8 || ethertype == 0x9100) && p + 4 <= len)
+                    {
+                        if (tags == 0) curVlan = U16(d, p) & 0x0FFF;
+                        tags++;
+                        ethertype = U16(d, p + 2); p += 4;
+                    }
+                    if (tags > 0) tagged++;
+                    if (tags > 1) doubleTagged++;
+                    VlanStat vs = Vlan(curVlan);
+                    vs.Packets++;
+                    if ((d[6] & 1) == 0) vs.Macs.Add(srcMac);
                     if (ethertype < 0x0600) { DecodeLlc(t, d, p, len, dstMac, srcMac); return; }
                     break;
                 case 113:   // Linux "cooked" (SLL)
+                    curVlan = 0;
                     if (len < 16) return;
                     ethertype = U16(d, 14); p = 16;
                     if (U16(d, 4) == 6) srcMac = Mac(d, 6);
@@ -9245,12 +9826,14 @@ namespace PingMonitor
             if (sIp == tIp) gratuitous++;
             if (sIp != "0.0.0.0" && sMac != "00-00-00-00-00-00")
             {
+                Vlan(curVlan).Ips[sIp] = sMac;
+                string ipKey = VlanPrefix + sIp;
                 HashSet<string> macs;
-                if (!ipMacs.TryGetValue(sIp, out macs)) { macs = new HashSet<string>(); ipMacs[sIp] = macs; }
-                if (macs.Add(sMac) && macs.Count == 2 && !ipMacFirstConflict.ContainsKey(sIp))
+                if (!ipMacs.TryGetValue(ipKey, out macs)) { macs = new HashSet<string>(); ipMacs[ipKey] = macs; }
+                if (macs.Add(sMac) && macs.Count == 2 && !ipMacFirstConflict.ContainsKey(ipKey))
                 {
-                    ipMacFirstConflict[sIp] = t;
-                    AddEvent(t, "Doppelte IP-Adresse", sIp + " wird von " + string.Join(" und ", new List<string>(macs).ToArray()) + " verwendet", Finding.Problem);
+                    ipMacFirstConflict[ipKey] = t;
+                    AddEvent(t, "Doppelte IP-Adresse", ipKey + " wird von " + string.Join(" und ", new List<string>(macs).ToArray()) + " verwendet", Finding.Problem);
                 }
             }
             if (op == 1 && sIp != tIp)
@@ -9423,7 +10006,7 @@ namespace PingMonitor
         {
             if (p + 240 > end || U32(d, p + 236) != 0x63825363) return;
             int type = 0;
-            string serverId = "", router = "", dns = "", yiaddr = Ip4(d, p + 16);
+            string serverId = "", router = "", dns = "", mask = "", yiaddr = Ip4(d, p + 16);
             int o = p + 240;
             while (o < end && d[o] != 255)
             {
@@ -9434,30 +10017,168 @@ namespace PingMonitor
                 if (code == 53 && l >= 1) type = d[o + 2];
                 if (code == 54 && l == 4) serverId = Ip4(d, o + 2);
                 if (code == 3 && l >= 4) router = Ip4(d, o + 2);
+                if (code == 1 && l == 4) mask = Ip4(d, o + 2);
                 if (code == 6 && l >= 4) { List<string> s = new List<string>(); for (int i = 0; i + 4 <= l; i += 4) s.Add(Ip4(d, o + 2 + i)); dns = string.Join(", ", s.ToArray()); }
                 o += 2 + l;
             }
             Session(t, d, p, end, type, serverId.Length > 0 ? serverId : src, yiaddr);
-            if (type == 1) dhcpDiscover++;
+            if (type == 1) { dhcpDiscover++; Vlan(curVlan).Discovers++; }
             else if (type == 3) dhcpRequest++;
             else if (type == 2 || type == 5 || type == 6)
             {
                 string id = serverId.Length > 0 ? serverId : src;
+                if (type == 2) Vlan(curVlan).Offers++;
+                if (mask.Length > 0) Vlan(curVlan).Mask = mask;
                 DhcpServer s;
-                if (!dhcpServers.TryGetValue(id, out s))
+                if (!dhcpServers.TryGetValue(curVlan + "|" + id, out s))
                 {
-                    s = new DhcpServer(); s.Ip = id; s.Mac = srcMac; s.First = t;
-                    dhcpServers[id] = s;
-                    AddEvent(t, "DHCP-Server antwortet", id + (srcMac.Length > 0 ? " (MAC " + srcMac + ", " + MacVendors.Lookup(srcMac) + ")" : "") +
+                    s = new DhcpServer(); s.Ip = id; s.Mac = srcMac; s.First = t; s.Vlan = curVlan;
+                    dhcpServers[curVlan + "|" + id] = s;
+                    int same = 0;
+                    foreach (DhcpServer o2 in dhcpServers.Values) if (o2.Vlan == curVlan && o2.Mac != srcMac) same++;
+                    AddEvent(t, "DHCP-Server antwortet", VlanPrefix + id + (srcMac.Length > 0 ? " (MAC " + srcMac + ", " + MacVendors.Lookup(srcMac) + ")" : "") +
                         (router.Length > 0 ? ", verteilt Gateway " + router : "") + (dns.Length > 0 ? ", DNS " + dns : ""),
-                        dhcpServers.Count > 1 ? Finding.Problem : Finding.Info);
+                        same > 0 ? Finding.Problem : Finding.Info);
                 }
+                if (mask.Length > 0) s.Mask = mask;
                 if (router.Length > 0) s.Router = router;
                 if (dns.Length > 0) s.Dns = dns;
                 if (type == 2) s.Offers++;
                 if (type == 5) s.Acks++;
                 if (type == 6) { s.Naks++; AddEvent(t, "DHCP-Ablehnung (NAK)", "Server " + id + " lehnt eine Adressanfrage ab (" + yiaddr + ")", Finding.Warning); }
             }
+        }
+
+        static long IpNum(string ip)
+        {
+            string[] p = ip.Split('.');
+            if (p.Length != 4) return -1;
+            long v = 0;
+            foreach (string x in p) { int b; if (!int.TryParse(x, out b)) return -1; v = v * 256 + b; }
+            return v;
+        }
+
+        static int MaskBits(string mask)
+        {
+            long m = IpNum(mask);
+            if (m <= 0) return 24;
+            int bits = 0;
+            for (int i = 31; i >= 0; i--) if ((m & (1L << i)) != 0) bits++; else break;
+            return bits >= 8 && bits <= 30 ? bits : 24;
+        }
+
+        static string NetOf(string ip, int bits)
+        {
+            long v = IpNum(ip);
+            if (v < 0) return "";
+            long net = v & (0xFFFFFFFFL << (32 - bits)) & 0xFFFFFFFFL;
+            return (net >> 24) + "." + ((net >> 16) & 255) + "." + ((net >> 8) & 255) + "." + (net & 255) + "/" + bits;
+        }
+
+        /// <summary>IP-Netze eines VLANs (aus ARP-Absendern; Maske aus DHCP, sonst /24), häufigstes zuerst.</summary>
+        static List<string> Networks(VlanStat v)
+        {
+            int bits = MaskBits(v.Mask);
+            Dictionary<string, int> n = new Dictionary<string, int>();
+            foreach (string ip in v.Ips.Keys)
+            {
+                if (ip.StartsWith("169.254.")) continue;
+                string net = NetOf(ip, bits);
+                int c; n.TryGetValue(net, out c); n[net] = c + 1;
+            }
+            List<string> r = new List<string>(n.Keys);
+            r.Sort(delegate (string a, string b) { return n[b].CompareTo(n[a]); });
+            return r;
+        }
+
+        /// <summary>VLAN-Befunde: Geräte im falschen Netz, gleiches Netz in mehreren VLANs, VLAN ohne DHCP-Antwort, APIPA-Adressen.</summary>
+        void EvaluateVlans()
+        {
+            // Geräte ohne DHCP-Adresse (169.254.x.x) - unabhängig von VLANs
+            List<string> apipa = new List<string>();
+            foreach (VlanStat v in vlans.Values)
+                foreach (KeyValuePair<string, string> kv in v.Ips)
+                    if (kv.Key.StartsWith("169.254.")) apipa.Add("  • " + (tagged > 0 ? VlanName(v.Id) + ": " : "") + kv.Key + "  " + kv.Value + " (" + MacVendors.Lookup(kv.Value) + ")" + where.Text(kv.Value));
+            if (apipa.Count > 0)
+                Add(Finding.Warning, apipa.Count + " Gerät(e) ohne DHCP-Adresse (169.254.x.x)",
+                    "Diese Geräte haben sich selbst eine Notadresse gegeben, weil sie vom DHCP-Server keine Antwort bekamen:\r\n" + string.Join("\r\n", apipa.ToArray()) +
+                    "\r\nUrsachen: Port im falschen VLAN (dort gibt es keinen DHCP-Server), DHCP Guarding verwirft die Antworten, Adressbereich voll, " +
+                    "oder das Gerät startete, bevor der Port weiterleitete (Spanning Tree).", "arp.src.proto_ipv4 == 169.254.0.0/16", "");
+            if (tagged == 0)
+            {
+                if (Packets > 1000)
+                    Findings.Add(new Finding(Finding.Info, "Keine VLAN-Tags im Mitschnitt",
+                        "Der Mitschnitt enthält keine VLAN-Kennungen. Entweder wurde an einem normalen Endgeräte-Port mitgeschnitten (dann ist das richtig), " +
+                        "oder die Netzwerkkarte entfernt die Tags, bevor Wireshark sie sieht.\r\n" +
+                        "Für eine VLAN-Prüfung: an der OPNsense auf der physischen Schnittstelle (z. B. igb1, nicht \"vlan01\") mitschneiden, oder einen " +
+                        "Uplink (Trunk) per Port Mirroring spiegeln. Windows/Intel: in den Treibereinstellungen \"Priority & VLAN\" abschalten."));
+                return;
+            }
+            // gleiches Netz in mehreren VLANs
+            Dictionary<string, List<int>> netVlans = new Dictionary<string, List<int>>();
+            foreach (VlanStat v in vlans.Values)
+            {
+                int bits = MaskBits(v.Mask);
+                Dictionary<string, int> cnt = new Dictionary<string, int>();
+                foreach (string ip in v.Ips.Keys) { if (ip.StartsWith("169.254.")) continue; string net = NetOf(ip, bits); int c; cnt.TryGetValue(net, out c); cnt[net] = c + 1; }
+                foreach (KeyValuePair<string, int> kv in cnt)
+                {
+                    if (kv.Value < 2) continue;
+                    List<int> l;
+                    if (!netVlans.TryGetValue(kv.Key, out l)) { l = new List<int>(); netVlans[kv.Key] = l; }
+                    l.Add(v.Id);
+                }
+            }
+            foreach (KeyValuePair<string, List<int>> kv in netVlans)
+                if (kv.Value.Count > 1)
+                {
+                    List<string> names = new List<string>();
+                    foreach (int id in kv.Value) names.Add(VlanName(id));
+                    Add(Finding.Problem, "Netz " + kv.Key + " in mehreren VLANs",
+                        "Geräte aus dem Netz " + kv.Key + " tauchen in " + string.Join(" und ", names.ToArray()) + " auf. Zwei VLANs sind irgendwo direkt verbunden " +
+                        "(Leck): ein Port, der in einem VLAN ungetaggt ist, hängt an einem Gerät/Switch im anderen VLAN, oder ein unverwalteter Switch/" +
+                        "WLAN-Router verbindet zwei Dosen aus verschiedenen VLANs. Folge: Broadcasts und DHCP laufen in beide Netze, die Trennung ist aufgehoben.",
+                        "arp && vlan", "");
+                }
+            // Geräte mit einer IP aus einem fremden Netz
+            foreach (VlanStat v in vlans.Values)
+            {
+                List<string> nets = Networks(v);
+                if (nets.Count < 2) continue;
+                int bits = MaskBits(v.Mask);
+                string main = nets[0];
+                int mainCount = 0;
+                foreach (string ip in v.Ips.Keys) if (NetOf(ip, bits) == main) mainCount++;
+                if (mainCount < 3) continue;
+                List<string> odd = new List<string>();
+                foreach (KeyValuePair<string, string> kv in v.Ips)
+                {
+                    if (kv.Key.StartsWith("169.254.") || NetOf(kv.Key, bits) == main) continue;
+                    // Gehört das fremde Netz zu einem anderen VLAN im Mitschnitt?
+                    List<string> others = new List<string>();
+                    foreach (VlanStat o in vlans.Values) if (o != v && Networks(o).Count > 0 && Networks(o)[0] == NetOf(kv.Key, MaskBits(o.Mask))) others.Add(VlanName(o.Id));
+                    others.Sort();
+                    string other = string.Join(" / ", others.ToArray());
+                    odd.Add("  • " + kv.Key + "  " + kv.Value + " (" + MacVendors.Lookup(kv.Value) + ")" + where.Text(kv.Value) + (other.Length > 0 ? " - Adresse gehört zu " + other : ""));
+                }
+                if (odd.Count > 0)
+                    Add(Finding.Warning, odd.Count + " Gerät(e) mit fremder IP in " + VlanName(v.Id),
+                        "In " + VlanName(v.Id) + " (Netz " + main + ") arbeiten Geräte mit Adressen aus einem anderen Netz:\r\n" + string.Join("\r\n", odd.ToArray()) +
+                        "\r\nTypische Ursachen: Switch-Port im falschen VLAN (Gerät hat seine Adresse noch aus dem alten VLAN bzw. eine feste IP), " +
+                        "feste IP falsch eingestellt, oder ein Gerät mit mehreren Netzen (Router, Hypervisor) - dann ist es gewollt.",
+                        "vlan.id == " + v.Id + " && arp", "");
+            }
+            // VLAN mit DHCP-Anfragen ohne Antwort
+            foreach (VlanStat v in vlans.Values)
+                if (v.Discovers >= 3 && v.Offers == 0)
+                    Add(Finding.Problem, "Keine DHCP-Antwort in " + VlanName(v.Id),
+                        "In " + VlanName(v.Id) + " wurden " + v.Discovers + " DHCP-Anfragen gesehen, aber keine Antwort. Ursachen: das VLAN fehlt auf einer " +
+                        "Verbindung zwischen Switch und Firewall (Trunk), auf der Firewall ist für dieses VLAN kein DHCP-Server bzw. kein Relay eingerichtet, " +
+                        "oder die Schnittstelle der Firewall für dieses VLAN ist nicht aktiv.", "vlan.id == " + v.Id + " && dhcp", "");
+            if (doubleTagged > 0)
+                Findings.Add(new Finding(Finding.Info, doubleTagged + " doppelt getaggte Pakete",
+                    "Pakete mit zwei VLAN-Kennungen (Q-in-Q). In normalen Firmen-/Heimnetzen ungewöhnlich - kann auf einen Port hindeuten, der " +
+                    "getaggten Verkehr nochmals in ein VLAN packt (Port-Profil falsch). Wireshark-Filter: vlan.etype == 0x8100"));
         }
 
         static readonly string[] DhcpTypes = { "", "Discover", "Offer", "Request", "Decline", "ACK", "NAK", "Release", "Inform" };
@@ -9540,6 +10261,7 @@ namespace PingMonitor
         void EvaluateDhcp()
         {
             if (DhcpSessions.Count == 0) return;
+            if (where == null) where = Locator.Load();
             Dictionary<string, string> names = new Dictionary<string, string>();
             try { foreach (PingTarget h in Config.LoadHosts()) if (NetTools.MacHex(h.Mac).Length == 12) names[NetTools.MacHex(h.Mac)] = h.Name; } catch { }
             List<DhcpSession> slow = new List<DhcpSession>();
@@ -9557,7 +10279,7 @@ namespace PingMonitor
             foreach (DhcpSession s in slow)
             {
                 worst = Math.Max(worst, s.Total);
-                sb.AppendLine("• " + s.Who + ", " + s.Start.ToString("HH:mm:ss") + ": " + s.Verdict);
+                sb.AppendLine("• " + s.Who + where.Text(s.Mac) + ", " + s.Start.ToString("HH:mm:ss") + ": " + s.Verdict);
                 sb.AppendLine("    Ablauf: " + string.Join(" · ", s.Steps.ToArray()));
                 sb.AppendLine("    → " + s.Cause);
                 AddEvent(s.Start, "DHCP langsam: " + s.Who, s.Verdict, s.Total >= 15 || !s.Done ? Finding.Problem : Finding.Warning);
@@ -9677,21 +10399,28 @@ namespace PingMonitor
             Pings.Sort(delegate (PingStat a, PingStat b) { return LossPct(b).CompareTo(LossPct(a)); });
 
             // ---- Befunde
-            if (dhcpServers.Count > 1)
+            where = Locator.Load();
+            List<DhcpServer> rogue = new List<DhcpServer>();
+            foreach (DhcpServer s in dhcpServers.Values)
+                foreach (DhcpServer o2 in dhcpServers.Values)
+                    if (s.Vlan == o2.Vlan && s.Mac != o2.Mac && !rogue.Contains(s)) rogue.Add(s);
+            if (rogue.Count > 1)
             {
                 StringBuilder sb = new StringBuilder();
-                foreach (DhcpServer s in dhcpServers.Values)
-                    sb.AppendLine("  • " + s.Ip + "  MAC " + s.Mac + " (" + MacVendors.Lookup(s.Mac) + ")  - Angebote " + s.Offers + ", Bestätigungen " + s.Acks +
+                foreach (DhcpServer s in rogue)
+                    sb.AppendLine("  • " + (tagged > 0 ? VlanName(s.Vlan) + ": " : "") + s.Ip + "  MAC " + s.Mac + " (" + MacVendors.Lookup(s.Mac) + ")" + where.Text(s.Mac) +
+                        "  - Angebote " + s.Offers + ", Bestätigungen " + s.Acks +
                         (s.Router.Length > 0 ? ", Gateway " + s.Router : "") + (s.Dns.Length > 0 ? ", DNS " + s.Dns : "") + ", zuerst " + s.First.ToString("HH:mm:ss"));
-                Add(Finding.Problem, dhcpServers.Count + " DHCP-Server im Netz",
-                    "Im Netz verteilen " + dhcpServers.Count + " verschiedene DHCP-Server Adressen:\r\n" + sb +
+                Add(Finding.Problem, rogue.Count + " DHCP-Server im selben Netz",
+                    "Im selben Netz" + (tagged > 0 ? " (VLAN)" : "") + " verteilen " + rogue.Count + " verschiedene Geräte Adressen:\r\n" + sb +
                     "Normalerweise darf es pro Netz (VLAN) nur EINEN geben. Folge: Geräte bekommen zufällig falsche Adressen, ein falsches " +
                     "Gateway oder falsche DNS-Server - typisch \"mal geht's, mal nicht\", oft nach einem Neustart.\r\n" +
                     "Häufige Ursache: ein mitgebrachter Router/WLAN-Router, eine FRITZ!Box oder ein NAS mit eingeschaltetem DHCP. " +
-                    "Vorgehen: Den Hersteller über die MAC (siehe oben) bestimmen, Gerät finden (Switch-Ansicht: an welchem Port hängt die MAC?) " +
+                    "Vorgehen: Gerät über Hersteller und Switch-Port (in eckigen Klammern, sofern bekannt) finden " +
                     "und DHCP dort abschalten. Auf verwalteten Switches hilft \"DHCP Snooping\".",
                     "dhcp.option.dhcp == 2  (ältere Wireshark-Versionen: bootp.option.dhcp == 2)", "https://de.wikipedia.org/wiki/Dynamic_Host_Configuration_Protocol");
             }
+            EvaluateVlans();
             if (dhcpDiscover > 2 && dhcpServers.Count == 0)
                 Add(Finding.Problem, "DHCP-Server antwortet nicht",
                     dhcpDiscover + " DHCP-Anfragen (Discover), aber keine einzige Antwort. Geräte bekommen dann keine IP-Adresse (169.254.x.x). " +
@@ -9714,7 +10443,7 @@ namespace PingMonitor
                 if (kv.Value.Count > 1)
                 {
                     List<string> macs = new List<string>();
-                    foreach (string m in kv.Value) macs.Add(m + " (" + MacVendors.Lookup(m) + ")");
+                    foreach (string m in kv.Value) macs.Add(m + " (" + MacVendors.Lookup(m) + ")" + where.Text(m));
                     dups.Add("  • " + kv.Key + ":  " + string.Join("  /  ", macs.ToArray()));
                 }
             if (dups.Count > 0)
@@ -9896,7 +10625,20 @@ namespace PingMonitor
                 " · STP " + stp + " · LLDP " + lldp + " · sonstige " + other + " · Broadcast " + broadcast + " · Multicast " + multicast + (fragments > 0 ? " · Fragmente " + fragments : ""));
             sb.AppendLine();
             sb.AppendLine("DHCP-Server: " + (dhcpServers.Count == 0 ? "keiner gesehen" : ""));
-            foreach (DhcpServer s in dhcpServers.Values) sb.AppendLine("  • " + s.Ip + "  MAC " + s.Mac + " (" + MacVendors.Lookup(s.Mac) + ")" + (s.Router.Length > 0 ? "  Gateway " + s.Router : "") + (s.Dns.Length > 0 ? "  DNS " + s.Dns : ""));
+            foreach (DhcpServer s in dhcpServers.Values) sb.AppendLine("  • " + (tagged > 0 ? VlanName(s.Vlan) + ": " : "") + s.Ip + "  MAC " + s.Mac + " (" + MacVendors.Lookup(s.Mac) + ")" + (s.Router.Length > 0 ? "  Gateway " + s.Router : "") + (s.Dns.Length > 0 ? "  DNS " + s.Dns : ""));
+            if (tagged > 0)
+            {
+                sb.AppendLine("VLANs (" + tagged.ToString("N0") + " getaggte Pakete" + (doubleTagged > 0 ? ", davon " + doubleTagged + " doppelt getaggt" : "") + "):");
+                List<int> ids = new List<int>(vlans.Keys);
+                ids.Sort();
+                foreach (int id in ids)
+                {
+                    VlanStat v = vlans[id];
+                    List<string> nets = Networks(v);
+                    sb.AppendLine("  • " + VlanName(id) + ": " + v.Packets.ToString("N0") + " Pakete, " + v.Macs.Count + " Geräte (MAC)" +
+                        (nets.Count > 0 ? ", Netz " + string.Join(", ", nets.ToArray()) : "") + (v.Discovers > 0 ? ", DHCP: " + v.Discovers + " Anfragen / " + v.Offers + " Angebote" : ""));
+                }
+            }
             if (DhcpSessions.Count > 0)
             {
                 List<double> done = new List<double>();
@@ -10290,9 +11032,14 @@ namespace PingMonitor
         }
     }
 
+    class UniFiNetwork { public string Id = "", Name = "", Purpose = ""; public int Vlan; }
+
     /// <summary>Port eines UniFi-Switches/APs/Gateways laut Controller (port_table).</summary>
     class UniFiPort
     {
+        public int NativeVlan;               // 0 = unbekannt
+        public readonly List<int> Tagged = new List<int>();
+        public bool VlanKnown;
         public int Idx;
         public string Name = "", Stp = "", Media = "";
         public bool Up, FullDuplex, PoeOn, IsUplink;
@@ -10353,6 +11100,14 @@ namespace PingMonitor
         public readonly List<UniFiClientInfo> Clients = new List<UniFiClientInfo>();
         public readonly List<UniFiDeviceInfo> Devices = new List<UniFiDeviceInfo>();
         public readonly List<KeyValuePair<string, string>> Sites = new List<KeyValuePair<string, string>>();   // interne Kennung -> Anzeigename
+        public readonly List<UniFiNetwork> Networks = new List<UniFiNetwork>();
+        public readonly List<KeyValuePair<string, int>> Wlans = new List<KeyValuePair<string, int>>();     // SSID -> VLAN (1 = Standardnetz)
+
+        public string VlanName(int vlan)
+        {
+            foreach (UniFiNetwork n in Networks) if (n.Vlan == vlan && n.Purpose != "wan") return n.Name;
+            return "";
+        }
         public string Site = "";        // tatsächlich verwendete Site (interne Kennung)
         public Dictionary<string, WlanTrack> History = new Dictionary<string, WlanTrack>();   // MAC -> WLAN-Verlauf (überwachte Geräte)
         public string Error = "";
@@ -10391,6 +11146,8 @@ namespace PingMonitor
             foreach (UniFiClientInfo c in Clients)
                 sb.Append(string.Join(";", new string[] { "UC", c.Mac, c.Ip, Fmt.Csv(c.Name), c.Wired ? "1" : "0", c.ApMac, Fmt.Csv(c.Essid), c.Signal.ToString(),
                     c.SwMac, c.SwPort.ToString(), c.Radio, c.Channel.ToString(), c.TxRate.ToString(), c.RxRate.ToString(), c.Satisfaction.ToString() })).Append("\r\n");
+            foreach (UniFiNetwork n in Networks) sb.Append("UN;" + Fmt.Csv(n.Id) + ";" + Fmt.Csv(n.Name) + ";" + n.Vlan + ";" + Fmt.Csv(n.Purpose) + "\r\n");
+            foreach (KeyValuePair<string, int> w in Wlans) sb.Append("UW;" + Fmt.Csv(w.Key) + ";" + w.Value + "\r\n");
             foreach (KeyValuePair<string, WlanTrack> kv in History)
             {
                 List<string> sm = new List<string>(), ro = new List<string>();
@@ -10430,6 +11187,17 @@ namespace PingMonitor
                     int.TryParse(f[7], out c.Signal); c.SwMac = f[8]; int.TryParse(f[9], out c.SwPort); c.Radio = f[10]; int.TryParse(f[11], out c.Channel);
                     if (f.Count >= 15) { int.TryParse(f[12], out c.TxRate); int.TryParse(f[13], out c.RxRate); int.TryParse(f[14], out c.Satisfaction); }
                     u.Clients.Add(c);
+                }
+                else if (f[0] == "UN" && f.Count >= 5)
+                {
+                    UniFiNetwork n = new UniFiNetwork();
+                    n.Id = f[1]; n.Name = f[2]; int.TryParse(f[3], out n.Vlan); n.Purpose = f[4];
+                    u.Networks.Add(n);
+                }
+                else if (f[0] == "UW" && f.Count >= 3)
+                {
+                    int v; int.TryParse(f[2], out v);
+                    u.Wlans.Add(new KeyValuePair<string, int>(f[1], v));
                 }
                 else if (f[0] == "UH" && f.Count >= 4)
                 {
@@ -10545,9 +11313,20 @@ namespace PingMonitor
                     errors.Add(b + ": Clientliste nicht lesbar (HTTP " + status + ")");
                     continue;
                 }
+                // VLAN-Konfiguration (optional - fehlt bei eingeschränkten Konten oder alten Versionen)
+                string netJson, pcJson, wlJson;
+                Dictionary<string, Dictionary<string, object>> profiles = new Dictionary<string, Dictionary<string, object>>();
                 try
                 {
-                    ParseDevices(devJson, snap);
+                    if (Http("GET", api + "/rest/networkconf", null, cookies, csrf, out status, out netJson, out headers) && status == 200) ParseNetworks(netJson, snap);
+                    if (Http("GET", api + "/rest/portconf", null, cookies, csrf, out status, out pcJson, out headers) && status == 200)
+                        foreach (object o in Data(pcJson)) { Dictionary<string, object> pc = o as Dictionary<string, object>; if (pc != null) profiles[Json.S(pc, "_id")] = pc; }
+                    if (Http("GET", api + "/rest/wlanconf", null, cookies, csrf, out status, out wlJson, out headers) && status == 200) ParseWlans(wlJson, snap);
+                }
+                catch (FormatException) { }
+                try
+                {
+                    ParseDevices(devJson, snap, profiles);
                     ParseClients(staJson, snap);
                 }
                 catch (Exception ex)
@@ -10594,7 +11373,84 @@ namespace PingMonitor
             return Json.Arr(root, "data");
         }
 
+        static void ParseNetworks(string json, UniFiSnapshot snap)
+        {
+            foreach (object o in Data(json))
+            {
+                Dictionary<string, object> d = o as Dictionary<string, object>;
+                if (d == null) continue;
+                UniFiNetwork n = new UniFiNetwork();
+                n.Id = Json.S(d, "_id"); n.Name = Json.S(d, "name"); n.Purpose = Json.S(d, "purpose");
+                if (n.Purpose == "wan" || n.Purpose == "remote-user-vpn" || n.Purpose == "site-vpn" || n.Purpose == "vpn-client") continue;
+                n.Vlan = Json.B(d, "vlan_enabled") ? (int)Json.N(d, "vlan", 1) : 1;
+                if (n.Vlan <= 0) n.Vlan = 1;
+                snap.Networks.Add(n);
+            }
+        }
+
+        static void ParseWlans(string json, UniFiSnapshot snap)
+        {
+            foreach (object o in Data(json))
+            {
+                Dictionary<string, object> d = o as Dictionary<string, object>;
+                if (d == null || d.ContainsKey("enabled") && !Json.B(d, "enabled")) continue;
+                int vlan = 1;
+                string net = Json.S(d, "networkconf_id");
+                UniFiNetwork n = snap.Networks.Find(delegate (UniFiNetwork x) { return x.Id == net; });
+                if (n != null) vlan = n.Vlan;
+                else if (Json.B(d, "vlan_enabled")) vlan = (int)Json.N(d, "vlan", 1);
+                snap.Wlans.Add(new KeyValuePair<string, int>(Json.S(d, "name"), vlan));
+            }
+        }
+
+        static int NetVlan(UniFiSnapshot snap, string id)
+        {
+            UniFiNetwork n = snap.Networks.Find(delegate (UniFiNetwork x) { return x.Id == id; });
+            return n != null ? n.Vlan : 0;
+        }
+
+        static List<string> Ids(Dictionary<string, object> d, string key)
+        {
+            List<string> r = new List<string>();
+            foreach (object o in Json.Arr(d, key)) if (o != null) r.Add(o.ToString());
+            return r;
+        }
+
+        /// <summary>
+        /// VLANs eines Ports aus Port-Profil und Port-Überschreibung bestimmen. Ältere Controller: forward = all/native/customize/disabled
+        /// (+ tagged_networkconf_ids); neuere: tagged_vlan_mgmt = auto/block_all/custom (+ excluded_networkconf_ids).
+        /// </summary>
+        static void PortVlans(UniFiPort up, UniFiSnapshot snap, Dictionary<string, object> profile, Dictionary<string, object> over)
+        {
+            if (snap.Networks.Count == 0) return;
+            Dictionary<string, object> m = new Dictionary<string, object>();
+            if (profile != null) foreach (KeyValuePair<string, object> kv in profile) m[kv.Key] = kv.Value;
+            if (over != null) foreach (KeyValuePair<string, object> kv in over) m[kv.Key] = kv.Value;
+            string native = Json.S(m, "native_networkconf_id");
+            up.NativeVlan = native.Length > 0 ? NetVlan(snap, native) : 1;
+            string fwd = Json.S(m, "forward"), mgmt = Json.S(m, "tagged_vlan_mgmt");
+            List<int> tagged = new List<int>();
+            if (fwd == "disabled") { up.NativeVlan = 0; up.VlanKnown = true; return; }
+            if (fwd == "native" || mgmt == "block_all") { }
+            else if (fwd == "customize")
+                foreach (string id in Ids(m, "tagged_networkconf_ids")) { int v = NetVlan(snap, id); if (v > 0) tagged.Add(v); }
+            else
+            {
+                List<string> excl = mgmt == "custom" ? Ids(m, "excluded_networkconf_ids") : new List<string>();
+                foreach (UniFiNetwork n in snap.Networks) if (!excl.Contains(n.Id)) tagged.Add(n.Vlan);
+            }
+            tagged.Remove(up.NativeVlan);
+            foreach (int v in tagged) if (!up.Tagged.Contains(v)) up.Tagged.Add(v);
+            up.Tagged.Sort();
+            up.VlanKnown = true;
+        }
+
         static void ParseDevices(string json, UniFiSnapshot snap)
+        {
+            ParseDevices(json, snap, new Dictionary<string, Dictionary<string, object>>());
+        }
+
+        static void ParseDevices(string json, UniFiSnapshot snap, Dictionary<string, Dictionary<string, object>> profiles)
         {
             foreach (object o in Data(json))
             {
@@ -10639,6 +11495,19 @@ namespace PingMonitor
                     u.Stp = Json.S(pt, "stp_state");
                     u.IsUplink = Json.B(pt, "is_uplink");
                     u.Media = Json.S(pt, "media");
+                    if (x.Type == "usw" || x.Type == "udm" || x.Type == "uxg")
+                    {
+                        Dictionary<string, object> over = null;
+                        foreach (object oo in Json.Arr(d, "port_overrides"))
+                        {
+                            Dictionary<string, object> ov = oo as Dictionary<string, object>;
+                            if (ov != null && (int)Json.N(ov, "port_idx", 0) == u.Idx) over = ov;
+                        }
+                        string pcId = over != null && Json.S(over, "portconf_id").Length > 0 ? Json.S(over, "portconf_id") : Json.S(pt, "portconf_id");
+                        Dictionary<string, object> prof;
+                        profiles.TryGetValue(pcId, out prof);
+                        PortVlans(u, snap, prof, over);
+                    }
                     x.Ports.Add(u);
                 }
                 snap.Devices.Add(x);
@@ -10739,6 +11608,7 @@ namespace PingMonitor
                     sb.Append("    [" + p.IfIndex + "] " + p.DisplayName + (p.Up ? "" : " (down)") + (p.Wireless ? " WLAN" : "") +
                         "  Rolle=" + (p.Role.Length > 0 ? p.Role : "Endgerät") + (p.RoleTarget.Length > 0 ? " -> " + p.RoleTarget : "") +
                         (p.LldpName.Length > 0 || p.LldpChassis.Length > 0 ? "  LLDP=" + p.LldpName + "/" + p.LldpChassis + " caps " + p.LldpCaps : "") +
+                        (p.HasVlan ? "  VLAN=" + p.VlanText : "") +
                         "  MACs(" + p.Macs.Count + ")=" + string.Join(",", p.Macs.ToArray()) + "\r\n");
                 }
                 sb.Append("\r\n");
@@ -10746,6 +11616,8 @@ namespace PingMonitor
             sb.Append("=== UniFi-Controller: " + (uf.Fetched == DateTime.MinValue ? "nicht eingerichtet/abgefragt" : uf.Valid ? "OK " + uf.Fetched.ToString(Fmt.Time) : "Fehler: " + uf.Error) + "\r\n");
             foreach (UniFiDeviceInfo d in uf.Devices)
                 sb.Append("    Gerät " + d.Name + " " + d.Type + " " + d.Model + " " + d.Ip + " " + d.Mac + " Uplink " + d.UplinkMac + " Port " + d.UplinkPort + (d.Online ? "" : " OFFLINE") + "\r\n");
+            foreach (UniFiNetwork n in uf.Networks) sb.Append("    Netzwerk " + n.Name + " VLAN " + n.Vlan + " (" + n.Purpose + ")\r\n");
+            foreach (KeyValuePair<string, int> w in uf.Wlans) sb.Append("    WLAN " + w.Key + " -> VLAN " + w.Value + "\r\n");
             foreach (UniFiClientInfo c in uf.Clients)
                 sb.Append("    Client " + c.Name + " " + c.Ip + " " + c.Mac + (c.Wired ? " LAN " + c.SwMac + " Port " + c.SwPort : " WLAN AP " + c.ApMac + " " + c.Essid + " " + c.SignalText) + "\r\n");
             sb.Append("\r\n=== Überwachte Geräte\r\n");

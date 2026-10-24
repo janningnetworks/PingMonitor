@@ -246,6 +246,36 @@ Mit eingerichtetem UniFi-Controller zusätzlich:
   - Ausfall-Diagnose: "WLAN weiterhin verbunden, Signal ..." bzw. "nicht mehr im WLAN angemeldet
     (zuletzt AP X, -82 dBm)" - trennt Funkprobleme von Geräteproblemen.
 
+Arbeitsablauf (oben im Hauptfenster)
+------------------------------------
+  1 Netzwerk einlesen   Switches (SNMP), Firewall und ggf. UniFi-Controller eintragen bzw. suchen. ZUERST - dann
+                        ergänzt der Scan MAC-Adressen aus der ARP-Tabelle der Firewall (auch andere VLANs), übernimmt
+                        Namen aus dem UniFi-Controller und ordnet Geräte sofort Switch-Ports/APs zu.
+  2 Geräte erfassen     Netzwerk scannen, Geräte auswählen.
+  3 Überwachen          "Alle starten" (App) bzw. als Windows-Dienst (misst auch ohne Anmeldung und über Nacht).
+  4 Beobachten          Messzeit mit Meilensteinen: 5 min Port-Zuordnung/VLAN-Abgleich, 15 min Leitungsqualität,
+                        1 h Fehler-Trends/STP/WLAN-Verlauf, 24 h Tagesverlauf/Ausfall-Statistik/Doku, 7 Tage Wochenmuster.
+                        "Was ist wann aussagekräftig?" erklärt es im Detail.
+  5 Auswerten           Netzwerkplan, Dokumentation; Anzahl Probleme/Warnungen (unter 24 h als vorläufig markiert).
+Die Karten zeigen erledigt (grün), nächster Schritt (gelb) und offene Schritte.
+
+VLANs
+-----
+Switches (SNMP, Q-BRIDGE-MIB) bzw. UniFi-Controller (Netzwerke, Port-Profile, Port-Überschreibungen, WLANs):
+  - Spalte "VLAN" im Switch-Fenster: natives VLAN "(U)" und getaggte VLANs je Port (auch in der Dokumentation).
+  - Abgleich jeder Verbindung zwischen zwei Switches: natives VLAN ungleich (Warnung), VLAN nur auf einer Seite
+    getaggt (Warnung, wenn an einem der Switches Geräte in diesem VLAN hängen, sonst Hinweis).
+  - Port zu einem Access Point: alle VLANs der ausgestrahlten WLANs (z. B. Gäste) müssen ankommen, sonst Problem
+    "WLAN-VLAN fehlt zum AP".
+Mitschnitt (Mirror eines Uplinks oder an der Firewall auf der physischen Schnittstelle, z. B. igb1):
+  - Übersicht je VLAN: Pakete, Geräte, IP-Netz, DHCP-Anfragen/-Antworten.
+  - Befunde: Gerät mit IP aus fremdem Netz (Port im falschen VLAN), gleiches IP-Netz in mehreren VLANs (Leck),
+    VLAN ohne DHCP-Antwort, Geräte mit 169.254.x.x, doppelt getaggte Pakete. Fremde DHCP-Server werden je VLAN
+    erkannt (die Firewall mit einer Adresse pro VLAN ist KEIN zweiter Server).
+  - Keine VLAN-Tags im Mitschnitt: Hinweis, dass die Netzwerkkarte sie evtl. entfernt (Windows/Intel: "Priority & VLAN").
+Zusammenführung: Geräte in Mitschnitt-Befunden werden mit Name und Switch-Port gezeigt (Geräteliste, UniFi, MAC-Tabellen),
+z. B. "fremder DHCP-Server ... [Drucker Büro, USW Büro / Port 3]".
+
 Schleifen, Spanning Tree, langsame Verbindungen
 -----------------------------------------------
   - Broadcast-Sturm: Broadcasts pro Sekunde je Port (SNMP bzw. UniFi). Ab 300/s Warnung, ab 2000/s
