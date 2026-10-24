@@ -9025,6 +9025,26 @@ namespace PingMonitor
         int dhcpDiscover, dhcpRequest;
         readonly HashSet<string> dhcpv6Servers = new HashSet<string>();
 
+        /// <summary>Ein Adressbezug eines Geräts: von der ersten Anfrage bis zur Bestätigung (ACK).</summary>
+        public class DhcpSession
+        {
+            public string Mac = "", HostName = "", Ip = "", Server = "", Name = "";
+            public DateTime Start, LastClient, End = DateTime.MinValue, FirstAnswer = DateTime.MinValue;
+            public int FirstSecs = -1;          // "secs"-Feld der ersten gesehenen Anfrage: so lange fragt das Gerät schon
+            public int Discovers, Requests, Offers, Declines, Naks;
+            public double MaxLatency;           // längste Antwortzeit des Servers auf eine Anfrage (s)
+            public bool Done;
+            public readonly List<string> Steps = new List<string>();
+            public string Verdict = "", Cause = "";
+
+            public double Seconds { get { return ((Done ? End : LastClient) - Start).TotalSeconds; } }
+            public double Total { get { return Seconds + Math.Max(0, FirstSecs); } }
+            public string Who { get { return (Name.Length > 0 ? Name : HostName.Length > 0 ? HostName : Mac) + (Name.Length == 0 && HostName.Length > 0 ? " (" + Mac + ")" : ""); } }
+        }
+        public readonly List<DhcpSession> DhcpSessions = new List<DhcpSession>();
+        readonly Dictionary<string, DhcpSession> dhcpOpen = new Dictionary<string, DhcpSession>();
+        readonly Dictionary<string, DhcpSession> dhcpDone = new Dictionary<string, DhcpSession>();
+
         // IPv6-Router (Router Advertisements)
         readonly Dictionary<string, string> raRouters = new Dictionary<string, string>();
 
@@ -9417,6 +9437,7 @@ namespace PingMonitor
                 if (code == 6 && l >= 4) { List<string> s = new List<string>(); for (int i = 0; i + 4 <= l; i += 4) s.Add(Ip4(d, o + 2 + i)); dns = string.Join(", ", s.ToArray()); }
                 o += 2 + l;
             }
+            Session(t, d, p, end, type, serverId.Length > 0 ? serverId : src, yiaddr);
             if (type == 1) dhcpDiscover++;
             else if (type == 3) dhcpRequest++;
             else if (type == 2 || type == 5 || type == 6)
@@ -9437,6 +9458,157 @@ namespace PingMonitor
                 if (type == 5) s.Acks++;
                 if (type == 6) { s.Naks++; AddEvent(t, "DHCP-Ablehnung (NAK)", "Server " + id + " lehnt eine Adressanfrage ab (" + yiaddr + ")", Finding.Warning); }
             }
+        }
+
+        static readonly string[] DhcpTypes = { "", "Discover", "Offer", "Request", "Decline", "ACK", "NAK", "Release", "Inform" };
+
+        /// <summary>DHCP-Ablauf je Gerät verfolgen (Zeiten, Wiederholungen, Antwortzeit des Servers).</summary>
+        void Session(DateTime t, byte[] d, int p, int end, int type, string server, string yiaddr)
+        {
+            if (type < 1 || type > 6 || d[p + 2] != 6) return;
+            string mac = Mac(d, p + 28);
+            int secs = U16(d, p + 8);
+            string ciaddr = Ip4(d, p + 12);
+            DhcpSession s;
+            dhcpOpen.TryGetValue(mac, out s);
+            bool client = type == 1 || type == 3 || type == 4;
+            if (client)
+            {
+                if (s != null && (t - s.LastClient).TotalSeconds > 120) { dhcpOpen.Remove(mac); s = null; }
+                DhcpSession last;
+                if (s == null && type == 4 && dhcpDone.TryGetValue(mac, out last) && (t - last.End).TotalSeconds < 30)
+                {
+                    // Gerät lehnt die gerade bestätigte Adresse ab (Adresskonflikt) - der Bezug geht weiter
+                    s = last;
+                    s.Done = false;
+                    dhcpOpen[mac] = s;
+                }
+                if (s == null)
+                {
+                    // Verlängerungen (Request mit eigener Adresse) sind kein Neubezug
+                    if (type == 3 && ciaddr != "0.0.0.0") return;
+                    if (type == 4) return;
+                    s = new DhcpSession();
+                    s.Mac = mac; s.Start = t; s.FirstSecs = secs;
+                    DhcpSessions.Add(s);
+                    dhcpOpen[mac] = s;
+                }
+                s.LastClient = t;
+                if (type == 1) s.Discovers++;
+                if (type == 3) s.Requests++;
+                if (type == 4) s.Declines++;
+                string host = DhcpOption(d, p, end, 12);
+                if (host.Length > 0) s.HostName = host;
+            }
+            else
+            {
+                if (s == null) return;
+                double lat = (t - s.LastClient).TotalSeconds;
+                if (lat > s.MaxLatency) s.MaxLatency = lat;
+                if (s.FirstAnswer == DateTime.MinValue) s.FirstAnswer = t;
+                s.Server = server;
+                if (type == 2) s.Offers++;
+                if (type == 6) s.Naks++;
+                if (type == 5)
+                {
+                    s.Done = true; s.End = t; s.Ip = yiaddr;
+                    dhcpOpen.Remove(mac);
+                    dhcpDone[mac] = s;
+                }
+            }
+            if (s.Steps.Count < 30)
+                s.Steps.Add("+" + (t - s.Start).TotalSeconds.ToString("0.00") + " s " + DhcpTypes[type] + (client && secs > 0 ? " (secs=" + secs + ")" : "") +
+                    (!client ? " von " + server + (type == 5 || type == 2 ? " → " + yiaddr : "") : ""));
+        }
+
+        static string DhcpOption(byte[] d, int p, int end, int code)
+        {
+            int o = p + 240;
+            while (o < end && d[o] != 255)
+            {
+                if (d[o] == 0) { o++; continue; }
+                if (o + 2 > end) break;
+                int c = d[o], l = d[o + 1];
+                if (o + 2 + l > end) break;
+                if (c == code) return Encoding.ASCII.GetString(d, o + 2, l).Trim('\0', ' ');
+                o += 2 + l;
+            }
+            return "";
+        }
+
+        /// <summary>Bewertung der DHCP-Abläufe: wie lange hat jedes Gerät auf seine Adresse gewartet und warum?</summary>
+        void EvaluateDhcp()
+        {
+            if (DhcpSessions.Count == 0) return;
+            Dictionary<string, string> names = new Dictionary<string, string>();
+            try { foreach (PingTarget h in Config.LoadHosts()) if (NetTools.MacHex(h.Mac).Length == 12) names[NetTools.MacHex(h.Mac)] = h.Name; } catch { }
+            List<DhcpSession> slow = new List<DhcpSession>();
+            foreach (DhcpSession s in DhcpSessions)
+            {
+                string n;
+                if (names.TryGetValue(NetTools.MacHex(s.Mac), out n)) s.Name = n;
+                Classify(s);
+                if (s.Total >= 5 || !s.Done && s.Discovers + s.Requests >= 3) slow.Add(s);
+            }
+            if (slow.Count == 0) return;
+            slow.Sort(delegate (DhcpSession a, DhcpSession b) { return b.Total.CompareTo(a.Total); });
+            StringBuilder sb = new StringBuilder();
+            double worst = 0;
+            foreach (DhcpSession s in slow)
+            {
+                worst = Math.Max(worst, s.Total);
+                sb.AppendLine("• " + s.Who + ", " + s.Start.ToString("HH:mm:ss") + ": " + s.Verdict);
+                sb.AppendLine("    Ablauf: " + string.Join(" · ", s.Steps.ToArray()));
+                sb.AppendLine("    → " + s.Cause);
+                AddEvent(s.Start, "DHCP langsam: " + s.Who, s.Verdict, s.Total >= 15 || !s.Done ? Finding.Problem : Finding.Warning);
+            }
+            Add(worst >= 15 || slow.Exists(delegate (DhcpSession x) { return !x.Done; }) ? Finding.Problem : Finding.Warning,
+                "Langsame DHCP-Vergabe (" + slow.Count + (slow.Count == 1 ? " Gerät" : " Geräte") + ", bis " + worst.ToString("0") + " s)",
+                "Normal dauert DHCP unter einer Sekunde (Discover → Offer → Request → ACK). Hier mussten Geräte länger warten:\r\n\r\n" + sb +
+                "\r\nSo liest man das: Die Zeit verliert sich entweder auf dem Weg (Anfragen kommen nicht an oder Antworten nicht zurück) " +
+                "oder beim Server (antwortet spät). \"secs\" ist die Zeit, die das Gerät nach eigener Angabe schon wartet - ist der Wert bei der " +
+                "ersten hier gesehenen Anfrage schon groß, kamen frühere Anfragen gar nicht an.\r\n" +
+                "Wichtig: Wo wurde mitgeschnitten? An der Firewall sieht man, was beim Server ankommt; am PC, was das Gerät sendet und empfängt.",
+                "dhcp", "https://de.wikipedia.org/wiki/Dynamic_Host_Configuration_Protocol");
+        }
+
+        static void Classify(DhcpSession s)
+        {
+            string dur = s.Seconds.ToString("0.0") + " s" + (s.FirstSecs > 0 ? " (das Gerät fragte laut secs-Feld schon " + s.FirstSecs + " s vorher)" : "");
+            int asks = s.Discovers + s.Requests;
+            if (!s.Done)
+            {
+                s.Verdict = asks + " Anfragen ohne Bestätigung" + (s.Offers > 0 ? " (" + s.Offers + " Angebote kamen)" : " - keine Antwort");
+                s.Cause = s.Offers > 0 ? "Der Server bietet an, das Gerät nimmt nicht an: Die Angebote erreichen das Gerät nicht (DHCP Guarding/Snooping, " +
+                    "VLAN, WLAN-Broadcast-Filter) oder es lehnt ab."
+                    : "Keine Antwort: Server aus, Adressbereich voll, VLAN/DHCP-Relay falsch, oder die Anfragen werden unterwegs verworfen.";
+                return;
+            }
+            s.Verdict = "Adresse " + s.Ip + " nach " + dur + ", " + s.Discovers + "× Discover, " + s.Requests + "× Request" +
+                (s.Offers > 0 ? ", " + s.Offers + "× Offer" : "") + (s.Declines > 0 ? ", " + s.Declines + "× DECLINE" : "") + (s.Naks > 0 ? ", " + s.Naks + "× NAK" : "") +
+                ", Antwortzeit des Servers max. " + (s.MaxLatency * 1000).ToString("0") + " ms";
+            if (s.Declines > 0)
+                s.Cause = "Das Gerät hat eine angebotene Adresse abgelehnt (DECLINE): Es hat per ARP festgestellt, dass ein anderes Gerät diese IP schon " +
+                    "benutzt - meist ein Gerät mit fest eingestellter IP innerhalb des DHCP-Bereichs. Danach beginnt alles von vorn (ca. 10 s).";
+            else if (s.FirstSecs >= 4 && s.Seconds < 3)
+                s.Cause = "Die ersten Anfragen sind hier nie angekommen: Das Gerät wartete schon " + s.FirstSecs + " s, der Server antwortete dann sofort. " +
+                    "Der Weg war zunächst gesperrt - typisch Spanning Tree am Switch-Port (klassisches STP: ~30 s, bis ein Port weiterleitet; " +
+                    "Abhilfe: RSTP bzw. PortFast/Edge-Port), langsamer Link-Aufbau (Energiesparen/EEE der Netzwerkkarte) oder WLAN-Anmeldung.";
+            else if (s.Discovers > 1 && s.Offers >= s.Discovers && s.MaxLatency < 1)
+                s.Cause = "Der Server hat jede Anfrage sofort beantwortet, trotzdem fragte das Gerät erneut: Die Antworten kamen beim Gerät nicht an. " +
+                    "Ursachen: DHCP Guarding/Snooping verwirft die Antworten (falscher Server als \"vertrauenswürdig\" eingetragen), " +
+                    "WLAN-Broadcast-/Multicast-Filter, Client-Isolation, VLAN-Fehler, oder die Firewall des Geräts.";
+            else if (asks > 1 && s.MaxLatency < 1)
+                s.Cause = "Erst die " + (s.Offers > 0 && s.Discovers > 1 ? s.Discovers + ". " : "späte ") + "Anfrage wurde beantwortet. Mitschnitt an der Firewall: " +
+                    "Der Server hat frühere Anfragen ignoriert (überlastet, Adresskonflikt-Prüfung, Adressbereich knapp). Mitschnitt am Gerät: Die frühen " +
+                    "Anfragen kamen nicht durch - typisch Spanning Tree (Port leitet erst nach ~30 s weiter) oder Link-Aufbau.";
+            else if (s.MaxLatency >= 2)
+                s.Cause = "Der Server selbst antwortet langsam (" + s.MaxLatency.ToString("0.0") + " s). Mögliche Gründe: \"Ping check\" vor der Vergabe " +
+                    "(1-2 s, länger wenn ICMP gefiltert), überlasteter Server, DHCP-Relay über ein anderes Netz.";
+            else if (s.Naks > 0)
+                s.Cause = "Das Gerät wollte zuerst seine alte Adresse wiederhaben, der Server lehnte ab (NAK) - danach normaler Ablauf. Meist harmlos.";
+            else
+                s.Cause = "Der Ablauf selbst war normal, die Zeit verging vor der ersten hier gesehenen Anfrage (Link-Aufbau/Spanning Tree).";
         }
 
         void DecodeDns(DateTime t, byte[] d, int p, int end, string src, string dst, int sport, int dport)
@@ -9526,6 +9698,7 @@ namespace PingMonitor
                     "Ursachen: DHCP-Server aus/abgestürzt, Adressbereich voll, VLAN/Relay falsch konfiguriert. (Hinweis: Antworten werden " +
                     "manchmal nur an das anfragende Gerät geschickt - dann sieht sie nur ein Mitschnitt auf diesem Gerät oder an der Firewall.)",
                     "dhcp.option.dhcp == 1", "");
+            EvaluateDhcp();
             int naks = 0; foreach (DhcpServer s in dhcpServers.Values) naks += s.Naks;
             if (naks > 0)
                 Add(Finding.Warning, naks + "× DHCP-Ablehnung (NAK)",
@@ -9724,6 +9897,14 @@ namespace PingMonitor
             sb.AppendLine();
             sb.AppendLine("DHCP-Server: " + (dhcpServers.Count == 0 ? "keiner gesehen" : ""));
             foreach (DhcpServer s in dhcpServers.Values) sb.AppendLine("  • " + s.Ip + "  MAC " + s.Mac + " (" + MacVendors.Lookup(s.Mac) + ")" + (s.Router.Length > 0 ? "  Gateway " + s.Router : "") + (s.Dns.Length > 0 ? "  DNS " + s.Dns : ""));
+            if (DhcpSessions.Count > 0)
+            {
+                List<double> done = new List<double>();
+                foreach (DhcpSession s in DhcpSessions) if (s.Done) done.Add(s.Total);
+                done.Sort();
+                sb.AppendLine("DHCP-Vergaben: " + DhcpSessions.Count + (done.Count > 0 ? ", Dauer Median " + done[done.Count / 2].ToString("0.0") + " s, längste " +
+                    done[done.Count - 1].ToString("0.0") + " s" : "") + (done.Count < DhcpSessions.Count ? ", " + (DhcpSessions.Count - done.Count) + " ohne Bestätigung" : ""));
+            }
             sb.AppendLine("DNS-Server:" + (dnsServers.Count == 0 ? " keiner gesehen" : ""));
             foreach (KeyValuePair<string, DnsServer> kv in dnsServers)
                 sb.AppendLine("  • " + kv.Key + ": " + kv.Value.Queries + " Anfragen, " + kv.Value.Answers + " Antworten" + (kv.Value.Answers > 0 ? ", Ø " + (kv.Value.RttSum / kv.Value.Answers).ToString("0") + " ms" : ""));
@@ -9736,6 +9917,49 @@ namespace PingMonitor
             top.Sort(delegate (KeyValuePair<string, long> a, KeyValuePair<string, long> b) { return b.Value.CompareTo(a.Value); });
             for (int i = 0; i < Math.Min(10, top.Count); i++) sb.AppendLine("  • " + top[i].Key + ":  " + (top[i].Value / 1048576.0).ToString("0.00") + " MB");
             Overview = sb.ToString();
+        }
+
+        /// <summary>
+        /// Langsame DHCP-Vergaben mit Switch-/UniFi-Ereignissen abgleichen: Link UP am Port, Spanning-Tree-Änderung, WLAN-Anmeldung.
+        /// Liegt ein Link UP 20-40 s vor der ersten beantworteten Anfrage, ist Spanning Tree die wahrscheinliche Ursache.
+        /// </summary>
+        void CorrelateDhcp(List<TimelineEvent> log)
+        {
+            foreach (DhcpSession s in DhcpSessions)
+            {
+                if (s.Total < 5) continue;
+                DateTime begin = s.Start.AddSeconds(-Math.Max(0, s.FirstSecs));
+                DateTime answer = s.FirstAnswer != DateTime.MinValue ? s.FirstAnswer : s.LastClient;
+                List<TimelineEvent> near = log.FindAll(delegate (TimelineEvent e)
+                {
+                    double dt = (e.Time - answer).TotalSeconds;
+                    bool kind = e.Event.StartsWith("Link UP") || e.Event.StartsWith("Link kurz") || e.Event.StartsWith("Spanning Tree") ||
+                                e.Event.StartsWith("WLAN verbunden") || e.Event.StartsWith("LAN: beim Controller angemeldet");
+                    bool mine = s.Name.Length > 0 && (e.Event.Contains(s.Name) || e.Details.Contains(s.Name));
+                    return kind && dt >= -60 && dt <= 5 && (mine || e.Event.StartsWith("Spanning Tree") || e.Event.StartsWith("Link"));
+                });
+                if (near.Count == 0) continue;
+                List<string> lines = new List<string>();
+                TimelineEvent link = null;
+                foreach (TimelineEvent e in near)
+                {
+                    lines.Add(e.Time.ToString("HH:mm:ss") + " " + e.Event + " - " + e.Details);
+                    if (e.Event.StartsWith("Link UP") && (link == null || s.Name.Length > 0 && e.Details.Contains(s.Name))) link = e;
+                }
+                string verdict = "";
+                if (link != null)
+                {
+                    double wait = (answer - link.Time).TotalSeconds;
+                    verdict = "\r\nVom Link UP bis zur ersten DHCP-Antwort vergingen " + wait.ToString("0") + " s" +
+                        (wait >= 20 ? " - genau das Muster von klassischem Spanning Tree (Port leitet erst nach Listening/Learning, 2 × 15 s, weiter). " +
+                                      "Abhilfe: am Switch RSTP statt STP, Endgeräte-Ports als Edge/PortFast; bei UniFi: Einstellungen → Netzwerk/Switch → Spanning Tree = RSTP."
+                         : wait >= 5 ? " - der Port war schnell aktiv, die Verzögerung liegt eher beim Gerät (Netzwerkkarte, Energiesparen) oder beim Server."
+                         : ".");
+                }
+                Findings.Insert(0, new Finding(Finding.Warning, "DHCP und Switch-Ereignis: " + s.Who,
+                    "Langsame DHCP-Vergabe um " + s.Start.ToString("HH:mm:ss") + " (" + s.Total.ToString("0") + " s). Zur selben Zeit im Ausfallprotokoll:\r\n  • " +
+                    string.Join("\r\n  • ", lines.ToArray()) + verdict));
+            }
         }
 
         /// <summary>Ereignisse aus dem Ausfallprotokoll für den Zeitraum des Mitschnitts dazunehmen und mit dem Mitschnitt abgleichen.</summary>
@@ -9761,6 +9985,7 @@ namespace PingMonitor
                     log.Add(e);
                 }
             }
+            CorrelateDhcp(log);
             // Zu jedem Ausfall: Was zeigt der Mitschnitt in den 15 Sekunden davor/danach?
             List<TimelineEvent> capture = new List<TimelineEvent>(Timeline);
             List<TimelineEvent> extra = new List<TimelineEvent>();

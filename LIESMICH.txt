@@ -293,6 +293,12 @@ Wo mitschneiden?
         pktmon etl2pcap PktMon.etl          (erzeugt PktMon.pcapng)
 Erkannt und in Klartext erklärt werden u. a.:
   - mehrere DHCP-Server (z. B. mitgebrachter Router/FRITZ!Box) inkl. Hersteller und verteiltem Gateway
+  - langsame DHCP-Vergabe je Gerät mit Ablauf und Zeiten (Discover/Offer/Request/ACK, "secs"-Feld) und
+    Ursache: erste Anfragen nie angekommen (Spanning Tree/Link-Aufbau), Server antwortet nicht/spät,
+    Antworten kommen beim Gerät nicht an (DHCP Guarding/Snooping, WLAN-Filter), Adresskonflikt (DECLINE).
+    Mit dem Ausfallprotokoll abgeglichen: Link UP am Switch-Port bzw. STP-Änderung kurz davor -> Hinweis
+    "Vom Link UP bis zur ersten DHCP-Antwort vergingen 30 s" (= klassisches Spanning Tree).
+    Messen: Mitschnitt an der Firewall starten (Filter "port 67 or port 68"), Gerät neu starten, auswerten.
   - DHCP-Server antwortet nicht, DHCP-Ablehnungen (NAK), mehrere DHCPv6-Server
   - doppelte IP-Adressen, Adressen ohne ARP-Antwort (Gerät nicht im Netz)
   - Ping-Verluste im Mitschnitt (mit Zeitpunkten), "Ziel nicht erreichbar", ICMP-Umleitungen, MTU-Probleme
