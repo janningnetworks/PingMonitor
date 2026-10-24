@@ -2311,7 +2311,17 @@ namespace PingMonitor
         void RefreshPorts()
         {
             Dictionary<string, KeyValuePair<SwitchState, PortState>> map = new Dictionary<string, KeyValuePair<SwitchState, PortState>>();
-            foreach (SwitchState s in SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running))
+            List<SwitchState> current = SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running);
+            // Fehlende MACs (z. B. Handy schlief beim Scan, anderes VLAN) aus der ARP-Tabelle der Firewall übernehmen
+            Dictionary<PingTarget, string> before = new Dictionary<PingTarget, string>();
+            foreach (PingTarget t in targets) before[t] = t.Mac;
+            if (SwitchMonitor.FillMacs(targets, current) > 0)
+            {
+                foreach (PingTarget t in targets)
+                    if (t.Mac != before[t]) RefreshInfo(t);
+                SaveHosts();
+            }
+            foreach (SwitchState s in current)
                 foreach (PortState p in s.Ports.Values)
                     foreach (string mac in p.DeviceMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
                         map[mac] = new KeyValuePair<SwitchState, PortState>(s, p);
@@ -3125,12 +3135,34 @@ namespace PingMonitor
             string hex = NetTools.MacHex(mac);
             if (hex.Length < 6) return "";
             // Bit "lokal verwaltet": zufällige/private MAC (z. B. Smartphones mit privater WLAN-Adresse)
-            if ((Convert.ToInt32(hex.Substring(0, 2), 16) & 0x02) != 0) return "(private/zufällige MAC)";
+            if ((Convert.ToInt32(hex.Substring(0, 2), 16) & 0x02) != 0)
+            {
+                string v = VirtualOf(hex);
+                return v.Length > 0 ? "(lokale MAC, vermutlich virtuell: " + v + ")" : "(private/zufällige MAC)";
+            }
             lock (sync)
             {
                 Ensure();
                 string v;
                 return table.TryGetValue(hex.Substring(0, 6), out v) ? v : "";
+            }
+        }
+
+        /// <summary>
+        /// Lokal verwaltete MAC, die bis auf das "lokal"-Bit einer Herstellerkennung entspricht (z. B. 02-11-32 = Synology 00-11-32):
+        /// meist eine virtuelle Schnittstelle (VM, Container, Bond) eines Geräts dieses Herstellers. Sonst leer.
+        /// </summary>
+        public static string VirtualOf(string mac)
+        {
+            string hex = NetTools.MacHex(mac);
+            if (hex.Length < 6) return "";
+            int b0 = Convert.ToInt32(hex.Substring(0, 2), 16);
+            if ((b0 & 0x02) == 0) return "";
+            lock (sync)
+            {
+                Ensure();
+                string v;
+                return table.TryGetValue((b0 & ~0x02).ToString("X2") + hex.Substring(2, 4), out v) ? v : "";
             }
         }
 
@@ -4919,6 +4951,7 @@ namespace PingMonitor
         public bool HasFdb;
         public string OwnMacs = "";      // MAC-Adressen des Switches selbst (Bridge-Adresse, ARP)
         public string Kind = "Switch";   // "Switch", "Access Point" oder "Firewall"
+        public Dictionary<string, string> Arp = new Dictionary<string, string>();   // IP -> MAC (ARP-Tabelle der Firewall)
         public int Cpu = -1, MemPct = -1;   // Auslastung in % (HOST-RESOURCES / UCD-SNMP), -1 = unbekannt
         public long Connections = -1;    // offene TCP-Verbindungen
         public string Load = "";         // Systemlast (1/5/15 min)
@@ -5258,7 +5291,11 @@ namespace PingMonitor
             if (sys.TryGetValue(Snmp.SysName, out v)) s.SysName = v.Text;
             if (sys.TryGetValue(Snmp.SysDescr, out v)) s.SysDescr = v.Text;
             string cls = SwitchDiscoverForm.Classify(s.SysDescr + " " + s.SysName, 0, 0, 0, false);
-            s.Kind = cls == "Access Point" ? "Access Point" : cls == "Router / Firewall" || s.SysDescr.ToLowerInvariant().Contains("opnsense") ? "Firewall" : "Switch";
+            string dl = s.SysDescr.ToLowerInvariant();
+            IPAddress gwIp = Topology.Gateway();
+            s.Kind = cls == "Access Point" ? "Access Point" :
+                     cls == "Router / Firewall" || dl.Contains("opnsense") || dl.Contains("pfsense") || dl.StartsWith("freebsd") ||
+                     gwIp != null && gwIp.Equals(ip) ? "Firewall" : "Switch";
             ReadSystem(ip, s);
             if (s.PollCount % 5 == 0)
             {
@@ -5404,9 +5441,63 @@ namespace PingMonitor
 
             // MAC-Adresstabelle (welches Gerät hängt an welchem Port) - nur jede 5. Abfrage, sie ist aufwändiger
             if (s.PollCount % 5 == 0) ReadFdb(ip, s);
+            if (s.Kind == "Firewall") ReadArp(ip, s);
             s.PollCount++;
             s.Polled = true;
             s.LastPoll = now;
+        }
+
+        const string IpNetToMediaPhys = "1.3.6.1.2.1.4.22.1.2", IpNetToPhysicalPhys = "1.3.6.1.2.1.4.35.1.4";
+
+        /// <summary>ARP-Tabelle des Routers: liefert die MAC auch für Geräte in anderen Subnetzen/VLANs
+        /// und für Geräte, die beim Eintragen gerade schliefen (z. B. Handys).</summary>
+        static void ReadArp(IPAddress ip, SwitchState s)
+        {
+            Dictionary<string, string> arp = new Dictionary<string, string>();
+            foreach (KeyValuePair<string, SnmpValue> r in Snmp.Walk(ip, s.Community, IpNetToMediaPhys, 3000))
+            {
+                // OID-Ende: <ifIndex>.<a>.<b>.<c>.<d>
+                string[] o = r.Key.Split('.');
+                if (o.Length < 4 || r.Value.Raw == null || r.Value.Raw.Length != 6) continue;
+                string addr = string.Join(".", o, o.Length - 4, 4);
+                arp[addr] = NetTools.MacHex(BitConverter.ToString(r.Value.Raw));
+            }
+            if (arp.Count == 0)
+                foreach (KeyValuePair<string, SnmpValue> r in Snmp.Walk(ip, s.Community, IpNetToPhysicalPhys, 3000))
+                {
+                    // OID-Ende: <ifIndex>.1.4.<a>.<b>.<c>.<d> (nur IPv4)
+                    string[] o = r.Key.Split('.');
+                    if (o.Length < 7 || o[o.Length - 6] != "1" || o[o.Length - 5] != "4" || r.Value.Raw == null || r.Value.Raw.Length != 6) continue;
+                    arp[string.Join(".", o, o.Length - 4, 4)] = NetTools.MacHex(BitConverter.ToString(r.Value.Raw));
+                }
+            foreach (string k in new List<string>(arp.Keys)) if (arp[k] == "000000000000" || arp[k] == "FFFFFFFFFFFF") arp.Remove(k);
+            lock (sync) s.Arp = arp;
+        }
+
+        /// <summary>
+        /// Trägt bei Geräten ohne MAC die MAC aus der ARP-Tabelle der Firewall ein. Eine zufällige (private) MAC
+        /// wird aktualisiert, wenn das Gerät inzwischen eine andere zufällige MAC verwendet. Liefert die Anzahl der Änderungen.
+        /// </summary>
+        public static int FillMacs(IEnumerable<PingTarget> hosts, List<SwitchState> sw)
+        {
+            int changed = 0;
+            foreach (PingTarget t in hosts)
+            {
+                string found = "";
+                foreach (SwitchState s in sw)
+                {
+                    string m;
+                    if (s.Arp.TryGetValue(t.Host, out m)) { found = m; break; }
+                }
+                if (found.Length != 12) continue;
+                string cur = NetTools.MacHex(t.Mac);
+                if (cur == found) continue;
+                if (cur.Length == 12 && !(Topology.RandomMac(cur) && Topology.RandomMac(found))) continue;
+                t.Mac = string.Join("-", new string[] { found.Substring(0, 2), found.Substring(2, 2), found.Substring(4, 2), found.Substring(6, 2), found.Substring(8, 2), found.Substring(10, 2) });
+                t.Vendor = MacVendors.Lookup(t.Mac);
+                changed++;
+            }
+            return changed;
         }
 
         static void ReadFdb(IPAddress ip, SwitchState s)
@@ -5586,6 +5677,7 @@ namespace PingMonitor
                         bool seesGw = false;
                         List<string> otherSwitches = new List<string>();
                         List<string> targets = new List<string>();
+                        List<string> apTargets = new List<string>();
                         string apSeen = "";
                         foreach (string m in p.Macs)
                         {
@@ -5593,7 +5685,8 @@ namespace PingMonitor
                             if (h == gw) seesGw = true;
                             SwitchState o;
                             UniFiDeviceInfo ud;
-                            if (switchMacs.TryGetValue(h, out o) && o != s && !otherSwitches.Contains(o.Name)) { otherSwitches.Add(o.Name); targets.Add(o.Address); }
+                            if (switchMacs.TryGetValue(h, out o) && o != s && o.Kind == "Access Point") { if (!apTargets.Contains(o.Address)) apTargets.Add(o.Address); }
+                            else if (switchMacs.TryGetValue(h, out o) && o != s && !otherSwitches.Contains(o.Name)) { otherSwitches.Add(o.Name); targets.Add(o.Address); }
                             else if (unifiMacs.TryGetValue(h, out ud) && !ud.IsAp && !otherSwitches.Contains(ud.Name)) { otherSwitches.Add(ud.Name); targets.Add("mac:" + ud.Mac); }
                             if (apMacs.Contains(h)) apSeen = apNames[h];
                         }
@@ -5603,7 +5696,7 @@ namespace PingMonitor
                         bool lldp = p.LldpName.Length > 0 || p.LldpChassis.Length > 0;
                         bool phone = (p.LldpCaps & 0x04) != 0;
                         bool lldpInfra = lldp && !phone && ((p.LldpCaps & 0x28) != 0 ||
-                            switches.Exists(delegate (SwitchState o) { return o != s && (string.Equals(o.SysName, p.LldpName, StringComparison.OrdinalIgnoreCase) ||
+                            switches.Exists(delegate (SwitchState o) { return o != s && o.Kind != "Access Point" && (string.Equals(o.SysName, p.LldpName, StringComparison.OrdinalIgnoreCase) ||
                                 string.Equals(o.Name, p.LldpName, StringComparison.OrdinalIgnoreCase) || switchMacs.ContainsKey(NetTools.MacHex(p.LldpChassis)) && switchMacs[NetTools.MacHex(p.LldpChassis)] == o); }));
                         bool lldpAp = lldp && (p.LldpCaps & 0x10) != 0;
                         string neighbor = p.LldpName.Length > 0 ? p.LldpName : otherSwitches.Count > 0 ? string.Join(", ", otherSwitches.ToArray()) : "";
@@ -5618,9 +5711,10 @@ namespace PingMonitor
                             p.Role = "switch";
                             p.RoleInfo = "⇄ Verbindung zu " + (neighbor.Length > 0 ? neighbor : "weiterem Switch");
                         }
-                        else if (lldpAp || apSeen.Length > 0 && p.Macs.Count > 1)
+                        else if (lldpAp || apSeen.Length > 0 && p.Macs.Count > 1 || apTargets.Count == 1)
                         {
                             p.Role = "ap";
+                            p.RoleTarget = string.Join(",", apTargets.ToArray());
                             p.RoleInfo = "Access Point " + (p.LldpName.Length > 0 ? p.LldpName : apSeen);
                         }
                     }
@@ -5641,6 +5735,7 @@ namespace PingMonitor
         {
             List<PingTarget> hosts;
             try { hosts = Config.LoadHosts(); } catch { return; }
+            lock (sync) FillMacs(hosts, switches);
             bool changed = false;
             lock (sync)
             {
@@ -5856,7 +5951,7 @@ namespace PingMonitor
                         s.Polled ? "1" : "0", s.Reachable ? "1" : "0", Fmt.Csv(s.Error), Fmt.Csv(s.SysName), Fmt.Csv(s.SysDescr),
                         s.LastPoll == DateTime.MinValue ? "" : s.LastPoll.ToString(Fmt.Time), s.HasFdb ? "1" : "0",
                         Fmt.Csv(s.OwnMacs), Fmt.Csv(s.Kind), s.Cpu.ToString(), s.MemPct.ToString(), s.Connections.ToString(), Fmt.Csv(s.Load),
-                        Fmt.Csv(s.SysRating.Encode()) })).Append("\r\n");
+                        Fmt.Csv(s.SysRating.Encode()), Fmt.Csv(ArpText(s.Arp)) })).Append("\r\n");
                     foreach (PortState p in s.Ports.Values)
                         sb.Append(string.Join(";", new string[] { "P", Fmt.Csv(s.Address), p.IfIndex.ToString(), Fmt.Csv(p.Name), Fmt.Csv(p.Alias),
                             p.Oper.ToString(), p.SpeedMbps.ToString(), p.Duplex.ToString(), p.RxErrors.ToString(), p.TxErrors.ToString(),
@@ -5871,6 +5966,13 @@ namespace PingMonitor
                 }
             }
             return sb.ToString();
+        }
+
+        static string ArpText(Dictionary<string, string> arp)
+        {
+            List<string> l = new List<string>();
+            foreach (KeyValuePair<string, string> kv in arp) l.Add(kv.Key + "=" + kv.Value);
+            return string.Join(",", l.ToArray());
         }
 
         public static List<SwitchState> Deserialize(string[] lines)
@@ -5893,6 +5995,12 @@ namespace PingMonitor
                         int.TryParse(f[13], out s.Cpu); int.TryParse(f[14], out s.MemPct); long.TryParse(f[15], out s.Connections);
                         s.Load = f[16]; s.SysRating = Assessment.Decode(f[17]);
                     }
+                    if (f.Count >= 19)
+                        foreach (string e in f[18].Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            int eq = e.IndexOf('=');
+                            if (eq > 0) s.Arp[e.Substring(0, eq)] = e.Substring(eq + 1);
+                        }
                     list.Add(s);
                 }
                 else if (f.Count >= 18 && f[0] == "P" && list.Count > 0)
@@ -6912,7 +7020,16 @@ namespace PingMonitor
                     upText[n] = par.Name + (pp != null && pp.Length > 0 ? " / " + pp : "");
                     swNodes[par].Children.Add(n);
                 }
-                else gwNode.Children.Add(n);
+                else
+                {
+                    gwNode.Children.Add(n);
+                    PortState up;
+                    if (uplink.TryGetValue(s, out up) && up.Macs.Count == 1 && NetTools.MacHex(up.Macs[0]) == gwMac)
+                    {
+                        n.Title = "(" + up.DisplayName + ")  →  " + n.Title;
+                        upText[n] = "direkt am Gateway (Uplink " + s.Name + " / " + up.DisplayName + ")";
+                    }
+                }
             }
             foreach (TopoNode n in ufNodes.Values)
                 if (n != gwNode && !placed.Contains(n)) { placed.Add(n); gwNode.Children.Add(n); }
@@ -7013,7 +7130,7 @@ namespace PingMonitor
 
                 if (best == null)
                 {
-                    bool random = RandomMac(t.Mac);
+                    bool random = RandomMac(t.Mac) && MacVendors.VirtualOf(t.Mac).Length == 0;
                     bool mobile = MobileVendor(t.Vendor);
                     links[t] = random ? Link("WLAN? (zufällige MAC)", true, false)
                              : mobile ? Link("WLAN? (Mobilgerät-Hersteller)", true, false)
@@ -7022,6 +7139,21 @@ namespace PingMonitor
                     n.Wlan = links[t].Wlan;
                     unassigned.Children.Add(n);
                     continue;
+                }
+
+                // Port führt zu einem eingetragenen Access Point (der selbst keine Clientliste liefert)
+                if (best.Port.Role == "ap" && best.Port.RoleTarget.Length > 0 && !LooksLikeAp(t))
+                {
+                    SwitchState apS = sw.Find(delegate (SwitchState x) { return x.Address == best.Port.RoleTarget; });
+                    if (apS != null && swNodes.ContainsKey(apS))
+                    {
+                        links[t] = Link("WLAN: " + apS.Name + " (erkannt an " + best.Switch.Name + " / " + best.Port.DisplayName + ")", true, false);
+                        n.Wlan = true;
+                        n.Title = "WLAN?  →  " + n.Title;
+                        n.Tip += "\r\nGesehen an " + best.Switch.Name + " / " + best.Port.DisplayName + " (Port zum AP " + apS.Name + ")";
+                        swNodes[apS].Children.Add(n);
+                        continue;
+                    }
                 }
 
                 if (best.Port.Wireless)
@@ -7085,6 +7217,15 @@ namespace PingMonitor
                     swNodes[best.Switch].Children.Add(n);
                     continue;
                 }
+                string virt = rnd ? MacVendors.VirtualOf(mac) : "";
+                if (rnd && (virt.Length > 0 || VirtualSibling(best.Port, mac)))
+                {
+                    links[t] = Link("LAN: " + best.Switch.Name + " / " + best.Port.DisplayName + " (virtuelle MAC" + (virt.Length > 0 ? " " + virt : "") +
+                        " - VM/Container auf einem Gerät an diesem Port)", false, false);
+                    n.Title = best.Port.DisplayName + "  →  " + n.Title;
+                    swNodes[best.Switch].Children.Add(n);
+                    continue;
+                }
                 bool mob = MobileVendor(t.Vendor) && best.Port.Macs.Count > 1;
                 string many = best.Port.Macs.Count >= 3 && !rnd && !mob ? " (" + best.Port.Macs.Count + " Geräte am Port - dahinter vermutlich weiterer Switch/AP)" : "";
                 links[t] = Link("LAN: " + best.Switch.Name + " / " + best.Port.DisplayName +
@@ -7106,6 +7247,20 @@ namespace PingMonitor
             if (unassigned.Children.Count > 0) root.Children.Add(unassigned);
             Sort(root);
             return root;
+        }
+
+        /// <summary>Lokal verwaltete MAC, deren übrige Bytes zum Hersteller eines anderen Geräts am selben Port passen
+        /// (z. B. Synology 00-11-32 -> 02-11-32): virtuelle Schnittstelle (VM, Container, Bond) dieses Geräts.</summary>
+        static bool VirtualSibling(PortState p, string mac)
+        {
+            if (mac.Length != 12) return false;
+            string oui = "00" + mac.Substring(2, 4);
+            foreach (string m in p.Macs)
+            {
+                string h = NetTools.MacHex(m);
+                if (h != mac && h.Length == 12 && !RandomMac(h) && h.Substring(0, 6) == oui) return true;
+            }
+            return false;
         }
 
         /// <summary>Ist x im Teilbaum von root enthalten?</summary>
@@ -8989,6 +9144,7 @@ namespace PingMonitor
             foreach (UniFiClientInfo c in uf.Clients)
                 sb.Append("    Client " + c.Name + " " + c.Ip + " " + c.Mac + (c.Wired ? " LAN " + c.SwMac + " Port " + c.SwPort : " WLAN AP " + c.ApMac + " " + c.Essid + " " + c.SignalText) + "\r\n");
             sb.Append("\r\n=== Überwachte Geräte\r\n");
+            SwitchMonitor.FillMacs(hosts, switches);
             Dictionary<PingTarget, DeviceLink> links;
             TopoNode root = Topology.Build(switches, hosts, uf, out links);
             foreach (PingTarget t in hosts)

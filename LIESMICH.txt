@@ -163,6 +163,10 @@ aktivieren und eine Community vergeben.
   RAM >= 90 %, Fehler und Link-Wechsel wie bei Switch-Ports.
 - Im Netzwerkplan erscheinen diese Werte am Gateway bzw. beim Internet-Knoten.
 - Firewall-Regeln/Paketfilter-Statistiken liefert das SNMP-Plugin nicht (nur über die OPNsense-API).
+- Als Firewall gilt auch ein Gerät, dessen SNMP-Kennung nur "FreeBSD ..." lautet, oder das das Standard-Gateway ist.
+- ARP-Tabelle der Firewall: Geräte ohne MAC-Adresse in der Liste (Handy schlief beim Scan, Gerät in anderem
+  Subnetz/VLAN) bekommen ihre MAC automatisch aus der ARP-Tabelle der Firewall. Wechselt ein Gerät seine
+  zufällige (private) MAC, wird sie dort ebenfalls nachgeführt. Ohne MAC ist keine Port-/WLAN-Zuordnung möglich.
 Auslastung (Datenrate je Port) wird jetzt auch bei Switches angezeigt (Spalte "Datenrate").
 
 Port-Zuordnung (welches Gerät hängt an welchem Switch-Port)
@@ -193,7 +197,10 @@ Vermutet ("WLAN?"):
   - zufällige/private MAC (Android/iOS/Windows verwenden je WLAN eine eigene, zufällige MAC - der Hersteller
     ist dann nicht erkennbar, z. B. beim Pixel) und das Gerät wird nur hinter einem Switch/AP gesehen
   - Hersteller typischer Mobilgeräte an einem Port mit mehreren MACs
+  - Gerät wird am Switch-Port eines eingetragenen Access Points gesehen (Rolle "Access Point"): "WLAN: <AP>"
 UniFi-APs geben ihre WLAN-Clients per SNMP NICHT heraus - für sichere Erkennung den UniFi-Controller einrichten.
+Lokale MACs, die bis auf das "lokal"-Bit einer Herstellerkennung entsprechen (z. B. 02-11-32 = Synology),
+gelten als virtuelle Schnittstelle (VM/Container/Docker) und nicht als WLAN-Gerät.
 
 UniFi-Controller (genaue Zuordnung LAN-Port und WLAN)
 ------------------------------------------------------
