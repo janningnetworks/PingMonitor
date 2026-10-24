@@ -259,6 +259,45 @@ Arbeitsablauf (oben im Hauptfenster)
   5 Auswerten           Netzwerkplan, Dokumentation; Anzahl Probleme/Warnungen (unter 24 h als vorläufig markiert).
 Die Karten zeigen erledigt (grün), nächster Schritt (gelb) und offene Schritte.
 
+Syslog-Empfang
+--------------
+"Switches ..." -> "Syslog ...": Empfang einschalten (UDP, Standard-Port 514). In den Geräten die IP dieses PCs (bzw. des
+PCs mit dem Dienst) als Syslog-Server eintragen: UniFi Network (Einstellungen -> System/CyberSecure -> Remote Logging),
+OPNsense (System -> Einstellungen -> Protokollierung -> Remote; Anwendungen u. a. dhcpd/kea/dnsmasq, dpinger, kernel),
+TP-Link/HP (System Log / Syslog Server).
+  - Alle Meldungen: Logs\Syslog_<Datum>.log (max. 50 MB pro Tag), Anzeige mit Filter im Syslog-Fenster.
+  - Ins Ausfallprotokoll (höchstens 10 gleichartige pro Gerät und Minute): Link-Wechsel, Spanning Tree, Schleife,
+    PoE, Gateway-Alarm (dpinger), Neustart/Temperatur/Lüfter/Firmware, DHCP-Server-Probleme, Fehlermeldungen
+    (Schweregrad 0-3) sowie WLAN-An-/Abmeldungen - letztere nur für überwachte Geräte.
+  - DHCP-Vergaben aus den Meldungen des DHCP-Servers (ISC dhcpd, dnsmasq, Kea): Dauer vom ersten DISCOVER bis zum ACK
+    je Gerät; ab 5 s und Wiederholungen Eintrag "DHCP-Vergabe langsam" mit Bewertung. Liste: Syslog-Fenster ->
+    "DHCP-Vergaben". Der Server sieht nur Anfragen, die bei ihm ankommen (frühe, verlorene Anfragen zeigt nur der
+    Mitschnitt über das "secs"-Feld).
+  - Windows-Firewall: Die Dienst-Installation legt die Regel "PingMonitor (Syslog)" an; die App fragt beim ersten Start.
+
+OPNsense-API
+------------
+"Switches ..." -> "OPNsense-API ...": Adresse, API-Schlüssel und -Geheimnis (System -> Zugang -> Benutzer -> eigener
+Benutzer mit Leserechten "Status: Gateways", "Diagnostics: ARP Table", DHCP-Leases (ISC/Kea/Dnsmasq) -> API-Schlüssel).
+Das Geheimnis wird verschlüsselt gespeichert. Genutzt für:
+  - Gateway-Überwachung (dpinger): Paketverlust, Latenz, Status zum Provider. "Internet-Leitung beeinträchtigt"
+    (ab 5 % Verlust / 150 ms), "gestört" (ab 20 % / down), "wieder normal" - im Ausfallprotokoll, in der
+    Ausfall-Diagnose und in der Dokumentation. Trennt Provider-Probleme von LAN-Problemen.
+  - DHCP-Leases und ARP-Tabelle: fehlende MAC-Adressen und Gerätenamen (auch ohne SNMP, auch andere VLANs) für
+    Geräteliste, Scan, Netzwerkplan und Mitschnitt-Befunde.
+
+Diesen PC prüfen (Windows-Ereignisprotokoll und Netzwerkkarten)
+---------------------------------------------------------------
+Schaltfläche "Diesen PC prüfen ...": Bericht über die letzten 7 Tage DIESES PCs:
+  - Netzwerkkarten-Einstellungen: Energy Efficient Ethernet, Green Ethernet/Energiesparmodi, "Windows darf die Karte
+    abschalten", fest eingestellte Geschwindigkeit/Duplex - jeweils mit Empfehlung.
+  - Ereignisse: Standby/Aufwachen, unerwartete Neustarts, Netzwerkkarte zurückgesetzt (Treiber hing), Link
+    getrennt/hergestellt (Treiber), DHCP-Client-Fehler, IP-Adresskonflikte, WLAN-Trennungen mit Grund,
+    Netzwerk verbunden/getrennt, DNS-Zeitüberschreitungen - mit Zusammenfassung und Bewertung.
+Laufend (Dienst bzw. App): diese Ereignisse (ohne DNS) kommen ins Ausfallprotokoll (Quelle "Windows"), in die
+Ausfall-Diagnose ("Dieser PC: aus dem Standby aufgewacht") und in den Abgleich der Mitschnitt-Analyse.
+Gelesen wird per wevtutil (in Windows enthalten); Abschalten: settings.txt "Windows.Ereignisse=0".
+
 VLANs
 -----
 Switches (SNMP, Q-BRIDGE-MIB) bzw. UniFi-Controller (Netzwerke, Port-Profile, Port-Überschreibungen, WLANs):
