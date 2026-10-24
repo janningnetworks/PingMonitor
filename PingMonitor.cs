@@ -1760,6 +1760,11 @@ namespace PingMonitor
                     delegate { return SwitchMonitor.CurrentUniFi(svcStatus == ServiceControllerStatus.Running); }, delegate (PingTarget t) { ShowDetails(t); }))
                     f.ShowDialog(this);
             }));
+            actions.Controls.Add(NewButton("Dokumentation ...", delegate
+            {
+                bool svc = svcStatus == ServiceControllerStatus.Running;
+                DocExport.Run(this, SwitchMonitor.Current(svc), SwitchMonitor.CurrentUniFi(svc), new List<PingTarget>(targets));
+            }));
             actions.Controls.Add(NewButton("Mitschnitt analysieren ...", delegate
             {
                 using (AnalysisForm f = new AnalysisForm()) f.ShowDialog(this);
@@ -2294,6 +2299,8 @@ namespace PingMonitor
             PingTarget sv = !t.Running && t.ServiceView != null ? t.ServiceView : t;
             if (sv.OutageStart.HasValue)
                 sb.Append("\r\n\r\n=== AUSFALL-DIAGNOSE ===\r\n" + (sv.Diagnosis.Length > 0 ? sv.Diagnosis + "\r\n" + sv.DiagnosisDetails : "läuft (ca. 20 Sekunden nach Ausfallbeginn) ..."));
+            string wl = WlanDetails(t);
+            if (wl.Length > 0) sb.Append("\r\n\r\n=== WLAN (UniFi-Controller) ===\r\n" + wl);
             Assessment q = t.Running ? t.Quality.Evaluate() : (t.ServiceView != null ? t.ServiceView.ServiceQuality : null);
             sb.Append("\r\n\r\n=== LEITUNGSQUALITÄT ===\r\n");
             sb.Append(q != null ? q.Details : "Keine Daten - Überwachung läuft nicht.");
@@ -2305,6 +2312,48 @@ namespace PingMonitor
             else
                 sb.Append("Nicht zugeordnet. Dafür Switches unter \"Switches ...\" eintragen (SNMP); die Zuordnung erfolgt über die MAC-Adresse.");
             HintForm.Show(this, "Gerät: " + t.Name, sb.ToString());
+        }
+
+        /// <summary>WLAN-Zustand und -Verlauf eines Geräts laut UniFi-Controller, mit Bewertung.</summary>
+        string WlanDetails(PingTarget t)
+        {
+            UniFiSnapshot u = SwitchMonitor.CurrentUniFi(svcStatus == ServiceControllerStatus.Running);
+            if (!u.Valid) return "";
+            UniFiClientInfo c = u.Client(t.Mac, t.Host);
+            WlanTrack tr;
+            u.History.TryGetValue(NetTools.MacHex(c != null ? c.Mac : t.Mac), out tr);
+            if ((c == null || c.Wired) && tr == null) return "";
+            StringBuilder sb = new StringBuilder();
+            List<string> hints = new List<string>();
+            if (c != null && !c.Wired)
+            {
+                UniFiDeviceInfo ap = u.Device(c.ApMac);
+                sb.AppendLine("Jetzt: " + (ap != null ? ap.Name : c.ApMac) + (c.Essid.Length > 0 ? ", SSID " + c.Essid : "") +
+                    (c.Radio.Length > 0 ? ", " + (c.Radio == "ng" ? "2,4 GHz" : c.Radio == "na" ? "5 GHz" : c.Radio == "6e" ? "6 GHz" : c.Radio) : "") +
+                    (c.Channel > 0 ? " Kanal " + c.Channel : ""));
+                sb.AppendLine("Signal " + (c.SignalText.Length > 0 ? c.SignalText : "-") + (c.TxRate > 0 ? ", Datenrate " + c.TxRate + " / " + c.RxRate + " Mbit/s" : "") +
+                    (c.Satisfaction >= 0 ? ", Zufriedenheit (UniFi) " + c.Satisfaction + " %" : ""));
+                if (c.Signal != 0 && c.Signal <= -75) hints.Add("Schwaches Signal: Gerät ist weit vom AP entfernt oder durch Wände/Metall abgeschirmt. Abhilfe: AP näher, zusätzlicher AP, anderes Frequenzband.");
+                if (c.TxRate > 0 && c.TxRate < 20) hints.Add("Sehr niedrige Datenrate (" + c.TxRate + " Mbit/s): schlechte Funkverbindung oder altes WLAN-Modul; belegt außerdem viel Sendezeit des APs.");
+                if (c.Radio == "ng" && c.Signal > -65) hints.Add("Gutes Signal, aber nur 2,4 GHz: Kann das Gerät 5 GHz, wäre es dort meist schneller und störungsärmer (Band Steering).");
+            }
+            else if (c == null) sb.AppendLine("Derzeit nicht beim Controller angemeldet.");
+            if (tr != null)
+            {
+                string s1 = tr.Summary(TimeSpan.FromHours(1));
+                if (s1.Length > 0) sb.AppendLine("Letzte Stunde: " + s1);
+                if (tr.Roams.Count >= 10) hints.Add(tr.Roams.Count + " AP-Wechsel in 24 h: Das Gerät pendelt zwischen APs (Ping-Pong). Ursache meist zu hohe Sendeleistung " +
+                    "oder überlappende Funkzellen; Abhilfe: Sendeleistung reduzieren, \"Minimum RSSI\" einstellen.");
+                List<WlanSample> last = tr.Samples.GetRange(Math.Max(0, tr.Samples.Count - 10), Math.Min(10, tr.Samples.Count));
+                if (last.Count > 0)
+                {
+                    sb.AppendLine("Verlauf (letzte Werte):");
+                    foreach (WlanSample x in last)
+                        sb.AppendLine("  " + x.Time.ToString("HH:mm") + "  " + x.Ap + "  " + (x.Signal != 0 ? x.Signal + " dBm" : "-") + (x.Rate > 0 ? "  " + x.Rate + " Mbit/s" : ""));
+                }
+            }
+            if (hints.Count > 0) sb.AppendLine("Bewertung: " + string.Join("\r\n", hints.ToArray()));
+            return sb.ToString().TrimEnd();
         }
 
         /// <summary>Ordnet die Geräte der Liste ihren Switch-Ports zu (über die MAC-Adresse).</summary>
@@ -4872,6 +4921,15 @@ namespace PingMonitor
         public DateTime OctetsAt;
         public double InMbps, OutMbps;   // Datenrate seit der letzten Abfrage
         public readonly Queue<double> RecentUtil = new Queue<double>();   // Auslastung in % (letzte 5 Abfragen)
+        public long BcastPkts = -1;      // empfangene Broadcast-Pakete (Zählerstand)
+        public DateTime BcastAt;
+        public double BcastPps;          // Broadcasts pro Sekunde seit der letzten Abfrage
+        public readonly Queue<double> RecentBcast = new Queue<double>();
+        public bool PoeOn;               // PoE eingeschaltet (UniFi)
+        public double PoeWatts;          // aktuelle PoE-Leistung in Watt (UniFi)
+        public string Stp = "";          // Spanning-Tree-Zustand: forwarding, blocking, ...
+
+        public bool StpBlocked { get { return Stp == "blocking" || Stp == "discarding" || Stp == "broken"; } }
 
         public double Util
         {
@@ -4952,6 +5010,9 @@ namespace PingMonitor
         public string OwnMacs = "";      // MAC-Adressen des Switches selbst (Bridge-Adresse, ARP)
         public string Kind = "Switch";   // "Switch", "Access Point" oder "Firewall"
         public Dictionary<string, string> Arp = new Dictionary<string, string>();   // IP -> MAC (ARP-Tabelle der Firewall)
+        public bool FromUniFi;           // nicht per SNMP abgefragt, Daten vom UniFi-Controller
+        public long StpChanges = -1;     // Zähler der Spanning-Tree-Topologieänderungen (SNMP)
+        public readonly List<DateTime> StpTimes = new List<DateTime>();
         public int Cpu = -1, MemPct = -1;   // Auslastung in % (HOST-RESOURCES / UCD-SNMP), -1 = unbekannt
         public long Connections = -1;    // offene TCP-Verbindungen
         public string Load = "";         // Systemlast (1/5/15 min)
@@ -4997,7 +5058,10 @@ namespace PingMonitor
         const string IfDescr = "1.3.6.1.2.1.2.2.1.2", IfType = "1.3.6.1.2.1.2.2.1.3", IfSpeed = "1.3.6.1.2.1.2.2.1.5",
                      IfOper = "1.3.6.1.2.1.2.2.1.8", IfLastChange = "1.3.6.1.2.1.2.2.1.9", IfInDiscards = "1.3.6.1.2.1.2.2.1.13",
                      IfInErrors = "1.3.6.1.2.1.2.2.1.14", IfOutDiscards = "1.3.6.1.2.1.2.2.1.19", IfOutErrors = "1.3.6.1.2.1.2.2.1.20",
-                     IfName = "1.3.6.1.2.1.31.1.1.1.1", IfHighSpeed = "1.3.6.1.2.1.31.1.1.1.15", IfAlias = "1.3.6.1.2.1.31.1.1.1.18";
+                     IfName = "1.3.6.1.2.1.31.1.1.1.1", IfHighSpeed = "1.3.6.1.2.1.31.1.1.1.15", IfAlias = "1.3.6.1.2.1.31.1.1.1.18",
+                     IfInBcast = "1.3.6.1.2.1.31.1.1.1.3", IfHCInBcast = "1.3.6.1.2.1.31.1.1.1.9";
+        // BRIDGE-MIB: Spanning Tree
+        const string StpTopChanges = "1.3.6.1.2.1.17.2.4.0", StpPortState = "1.3.6.1.2.1.17.2.15.1.3";
         // EtherLike-MIB (dot3StatsTable)
         const string Dot3Align = "1.3.6.1.2.1.10.7.2.1.2", Dot3Fcs = "1.3.6.1.2.1.10.7.2.1.3",
                      Dot3Late = "1.3.6.1.2.1.10.7.2.1.8", Dot3Duplex = "1.3.6.1.2.1.10.7.2.1.19";
@@ -5189,7 +5253,7 @@ namespace PingMonitor
                         Reconcile(LoadConfig());
                     }
                     List<SwitchState> current;
-                    lock (sync) current = new List<SwitchState>(switches);
+                    lock (sync) current = switches.FindAll(delegate (SwitchState x) { return !x.FromUniFi; });
                     List<Thread> jobs = new List<Thread>();
                     foreach (SwitchState s in current)
                     {
@@ -5207,9 +5271,16 @@ namespace PingMonitor
                             LogUniFi("UniFi-Controller nicht erreichbar", u.Error);
                         else if (u.Valid && unifi.Error.Length > 0)
                             LogUniFi("UniFi-Controller wieder erreichbar", u.Devices.Count + " Geräte, " + u.Clients.Count + " Clients");
+                        UniFiSnapshot old = unifi;
+                        if (u.Valid)
+                        {
+                            SyncUniFi(u);
+                            UniFiEvents(old, u);
+                        }
+                        else u.History = old.History;
                         lock (sync) unifi = u;
                     }
-                    else lock (sync) unifi = new UniFiSnapshot();
+                    else lock (sync) { unifi = new UniFiSnapshot(); switches.RemoveAll(delegate (SwitchState x) { return x.FromUniFi; }); }
                     AssignRoles();
                     MapDevices();
                     lock (sync) foreach (SwitchState s in switches) foreach (PortState p in s.Ports.Values) Evaluate(s, p);
@@ -5235,6 +5306,7 @@ namespace PingMonitor
                     if (existing != null) { existing.Name = c.Name; merged.Add(existing); }
                     else merged.Add(c);
                 }
+                merged.AddRange(switches.FindAll(delegate (SwitchState s) { return s.FromUniFi; }));
                 switches = merged;
             }
         }
@@ -5329,6 +5401,8 @@ namespace PingMonitor
             Dictionary<int, SnmpValue> inOct = Column(ip, s.Community, IfHCInOctets);
             Dictionary<int, SnmpValue> outOct = Column(ip, s.Community, IfHCOutOctets);
             if (inOct.Count == 0) { inOct = Column(ip, s.Community, IfInOctets); outOct = Column(ip, s.Community, IfOutOctets); }
+            Dictionary<int, SnmpValue> bcast = Column(ip, s.Community, IfHCInBcast);
+            if (bcast.Count == 0) bcast = Column(ip, s.Community, IfInBcast);
             int wanIndex = -1;
             if (s.Kind == "Firewall")
             {
@@ -5370,52 +5444,17 @@ namespace PingMonitor
                     p.Alias = Txt(alias, idx);
                     p.Wireless = wireless;
                     p.IsWan = idx == wanIndex;
-                    long nIn = Num(inOct, idx, -1), nOut = Num(outOct, idx, -1);
-                    if (nIn >= 0 && p.InOctets >= 0 && nIn >= p.InOctets && nOut >= p.OutOctets && p.OctetsAt != DateTime.MinValue)
-                    {
-                        double secs = Math.Max(1, (now - p.OctetsAt).TotalSeconds);
-                        p.InMbps = (nIn - p.InOctets) * 8 / secs / 1000000;
-                        p.OutMbps = (nOut - p.OutOctets) * 8 / secs / 1000000;
-                        p.RecentUtil.Enqueue(p.Util);
-                        while (p.RecentUtil.Count > 5) p.RecentUtil.Dequeue();
-                    }
-                    if (nIn >= 0) { p.InOctets = nIn; p.OutOctets = nOut; p.OctetsAt = now; }
                     int oldOper = p.Oper;
                     p.Oper = (int)Num(oper, idx, 0);
                     long hs = Num(hspeed, idx, 0);
                     p.SpeedMbps = hs > 0 ? hs : Num(speed, idx, 0) / 1000000;
+                    Rates(p, Num(inOct, idx, -1), Num(outOct, idx, -1), now);
+                    Broadcasts(p, Num(bcast, idx, -1), now);
                     p.Duplex = (int)Num(duplex, idx, 0);
                     p.HasFcs = fcs.ContainsKey(idx);
 
-                    long nInErr = Num(inErr, idx, 0), nOutErr = Num(outErr, idx, 0);
-                    long nDisc = Num(inDisc, idx, 0) + Num(outDisc, idx, 0);
-                    long nFcs = Num(fcs, idx, 0), nAlign = Num(align, idx, 0), nLate = Num(late, idx, 0);
-
-                    if (!p.HaveBase || nInErr < p.InErr || nOutErr < p.OutErr || nFcs < p.Fcs)
-                    {
-                        // Erste Abfrage oder Zähler zurückgesetzt: neue Ausgangswerte
-                        p.BInErr = nInErr; p.BOutErr = nOutErr; p.BDisc = nDisc; p.BFcs = nFcs; p.BAlign = nAlign; p.BLate = nLate;
-                        p.DErr = p.DOutErr = p.DDisc = 0;
-                        p.HaveBase = true;
-                    }
-                    else
-                    {
-                        long rxBefore = p.RxErrors;
-                        long txBefore = p.TxErrors;
-                        long discBefore = p.Discards;
-                        p.InErr = nInErr; p.OutErr = nOutErr; p.Disc = nDisc; p.Fcs = nFcs; p.Align = nAlign; p.Late = nLate;
-                        p.DErr = Math.Max(0, p.RxErrors - rxBefore);
-                        p.DOutErr = Math.Max(0, p.TxErrors - txBefore);
-                        p.DDisc = Math.Max(0, p.Discards - discBefore);
-                    }
-                    p.InErr = nInErr; p.OutErr = nOutErr; p.Disc = nDisc; p.Fcs = nFcs; p.Align = nAlign; p.Late = nLate;
-                    p.RecentErr.Enqueue(p.DErr);
-                    while (p.RecentErr.Count > 5) p.RecentErr.Dequeue();
-                    p.RecentDisc.Enqueue(p.DDisc);
-                    while (p.RecentDisc.Count > 5) p.RecentDisc.Dequeue();
-
-                    if (p.DErr > 0)
-                        Event(s, p, "Empfangsfehler (CRC) +" + p.DErr, "seit Überwachungsbeginn " + p.RxErrors + " fehlerhafte Pakete");
+                    Counters(s, p, Num(inErr, idx, 0), Num(outErr, idx, 0), Num(inDisc, idx, 0) + Num(outDisc, idx, 0),
+                        Num(fcs, idx, 0), Num(align, idx, 0), Num(late, idx, 0));
 
                     // Link-Wechsel: ifLastChange hat sich geändert
                     long lc = Num(change, idx, -1);
@@ -5445,6 +5484,99 @@ namespace PingMonitor
             s.PollCount++;
             s.Polled = true;
             s.LastPoll = now;
+        }
+
+        /// <summary>Fehlerzähler übernehmen: Startwerte, Änderung seit der letzten Abfrage, Ereignis bei neuen CRC-Fehlern.</summary>
+        static void Counters(SwitchState s, PortState p, long nInErr, long nOutErr, long nDisc, long nFcs, long nAlign, long nLate)
+        {
+            if (!p.HaveBase || nInErr < p.InErr || nOutErr < p.OutErr || nFcs < p.Fcs)
+            {
+                // Erste Abfrage oder Zähler zurückgesetzt: neue Ausgangswerte
+                p.BInErr = nInErr; p.BOutErr = nOutErr; p.BDisc = nDisc; p.BFcs = nFcs; p.BAlign = nAlign; p.BLate = nLate;
+                p.DErr = p.DOutErr = p.DDisc = 0;
+                p.HaveBase = true;
+            }
+            else
+            {
+                long rxBefore = p.RxErrors;
+                long txBefore = p.TxErrors;
+                long discBefore = p.Discards;
+                p.InErr = nInErr; p.OutErr = nOutErr; p.Disc = nDisc; p.Fcs = nFcs; p.Align = nAlign; p.Late = nLate;
+                p.DErr = Math.Max(0, p.RxErrors - rxBefore);
+                p.DOutErr = Math.Max(0, p.TxErrors - txBefore);
+                p.DDisc = Math.Max(0, p.Discards - discBefore);
+            }
+            p.InErr = nInErr; p.OutErr = nOutErr; p.Disc = nDisc; p.Fcs = nFcs; p.Align = nAlign; p.Late = nLate;
+            p.RecentErr.Enqueue(p.DErr);
+            while (p.RecentErr.Count > 5) p.RecentErr.Dequeue();
+            p.RecentDisc.Enqueue(p.DDisc);
+            while (p.RecentDisc.Count > 5) p.RecentDisc.Dequeue();
+            if (p.DErr > 0)
+                Event(s, p, "Empfangsfehler (CRC) +" + p.DErr, "seit Überwachungsbeginn " + p.RxErrors + " fehlerhafte Pakete");
+        }
+
+        /// <summary>Datenrate aus den Byte-Zählern.</summary>
+        static void Rates(PortState p, long nIn, long nOut, DateTime now)
+        {
+            if (nIn >= 0 && p.InOctets >= 0 && nIn >= p.InOctets && nOut >= p.OutOctets && p.OctetsAt != DateTime.MinValue)
+            {
+                double secs = Math.Max(1, (now - p.OctetsAt).TotalSeconds);
+                p.InMbps = (nIn - p.InOctets) * 8 / secs / 1000000;
+                p.OutMbps = (nOut - p.OutOctets) * 8 / secs / 1000000;
+                p.RecentUtil.Enqueue(p.Util);
+                while (p.RecentUtil.Count > 5) p.RecentUtil.Dequeue();
+            }
+            if (nIn >= 0) { p.InOctets = nIn; p.OutOctets = nOut; p.OctetsAt = now; }
+        }
+
+        /// <summary>Empfangene Broadcasts pro Sekunde (Broadcast-Sturm = typisches Zeichen einer Netzwerkschleife).</summary>
+        static void Broadcasts(PortState p, long n, DateTime now)
+        {
+            if (n >= 0 && p.BcastPkts >= 0 && n >= p.BcastPkts && p.BcastAt != DateTime.MinValue)
+            {
+                p.BcastPps = (n - p.BcastPkts) / Math.Max(1, (now - p.BcastAt).TotalSeconds);
+                p.RecentBcast.Enqueue(p.BcastPps);
+                while (p.RecentBcast.Count > 3) p.RecentBcast.Dequeue();
+            }
+            if (n >= 0) { p.BcastPkts = n; p.BcastAt = now; }
+        }
+
+        /// <summary>Spanning Tree: Topologieänderungen (Switch) und gesperrte Ports.</summary>
+        static void ReadStp(IPAddress ip, SwitchState s, List<Finding> f)
+        {
+            Dictionary<string, SnmpValue> g = Snmp.GetValues(ip, s.Community, 1500, StpTopChanges);
+            SnmpValue v;
+            if (g.TryGetValue(StpTopChanges, out v) && !v.IsMissing)
+            {
+                if (s.StpChanges >= 0 && v.Number > s.StpChanges)
+                {
+                    long d = v.Number - s.StpChanges;
+                    for (long i = 0; i < Math.Min(d, 20); i++) s.StpTimes.Add(DateTime.Now);
+                    Event(s, null, "Spanning Tree: Topologie geändert" + (d > 1 ? " (" + d + "×)" : ""),
+                        "Der Switch hat seine Weiterleitung neu berechnet: Kabel gesteckt/gezogen an einem Nicht-Endgeräte-Port, flatternde Verbindung oder Schleife.");
+                }
+                s.StpChanges = v.Number;
+            }
+            s.StpTimes.RemoveAll(delegate (DateTime x) { return x < DateTime.Now.AddDays(-1); });
+            int hour = s.StpTimes.FindAll(delegate (DateTime x) { return x >= DateTime.Now.AddHours(-1); }).Count;
+            if (hour >= 3)
+                f.Add(new Finding(hour >= 10 ? Finding.Problem : Finding.Warning, "STP " + hour + "× geändert (1 h)",
+                    "Der Spanning Tree hat sich in der letzten Stunde " + hour + "-mal neu aufgebaut (24 h: " + s.StpTimes.Count + "). " +
+                    "Bei jeder Änderung können für Sekunden Pakete verloren gehen. Ursachen: eine Verbindung zwischen Switches flattert " +
+                    "(Wackelkontakt, defekter SFP), eine Schleife (Kabel doppelt gesteckt, Mini-Switch/Telefon mit zwei Verbindungen) oder " +
+                    "Endgeräte-Ports ohne \"Edge/PortFast\"-Einstellung, an denen Geräte häufig an- und abgehen.\r\n" +
+                    "Vorgehen: Link-Wechsel der Switch-Verbindungen prüfen (Spalte \"Link-Wechsel\"), auf doppelt gesteckte Kabel achten."));
+            if (s.PollCount % 5 != 0) return;
+            Dictionary<int, SnmpValue> bridge = Column(ip, s.Community, BasePortIfIndex);
+            Dictionary<int, SnmpValue> st = Column(ip, s.Community, StpPortState);
+            string[] names = { "", "disabled", "blocking", "listening", "learning", "forwarding", "broken" };
+            lock (sync)
+                foreach (KeyValuePair<int, SnmpValue> kv in st)
+                {
+                    int ifIndex = bridge.ContainsKey(kv.Key) ? (int)bridge[kv.Key].Number : kv.Key;
+                    PortState p;
+                    if (s.Ports.TryGetValue(ifIndex, out p) && kv.Value.Number >= 1 && kv.Value.Number <= 6) p.Stp = names[kv.Value.Number];
+                }
         }
 
         const string IpNetToMediaPhys = "1.3.6.1.2.1.4.22.1.2", IpNetToPhysicalPhys = "1.3.6.1.2.1.4.35.1.4";
@@ -5578,8 +5710,9 @@ namespace PingMonitor
                     "Proxy oder Angriffe/Portscans. Folge: Verzögerungen und Paketverluste für ALLE Geräte."));
             if (s.MemPct >= 90)
                 f.Add(new Finding(Finding.Warning, "RAM " + s.MemPct + " %", "Der Arbeitsspeicher ist fast voll (" + s.MemPct + " %). Dienste können abstürzen oder neu starten."));
+            if (s.Kind != "Firewall") ReadStp(ip, s, f);
             s.SysRating = Assessment.From(f, s.SystemText, "Systemzustand unauffällig.");
-            if (s.SystemText.Length == 0) s.SysRating.Level = Finding.Unknown;
+            if (s.SystemText.Length == 0 && f.Count == 0) s.SysRating.Level = Finding.Unknown;
         }
 
         /// <summary>LLDP: Welcher Nachbar (Switch, AP, Router) hängt direkt an welchem Port?</summary>
@@ -5723,6 +5856,248 @@ namespace PingMonitor
 
         static string gatewayMac = "";
 
+        static bool IsSwitchMac(string macHex)
+        {
+            foreach (SwitchState s in switches)
+                foreach (string m in s.OwnMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                    if (NetTools.MacHex(m) == macHex) return true;
+            return false;
+        }
+
+        static string Dashed(string hex)
+        {
+            if (hex.Length != 12) return hex;
+            return hex.Substring(0, 2) + "-" + hex.Substring(2, 2) + "-" + hex.Substring(4, 2) + "-" + hex.Substring(6, 2) + "-" + hex.Substring(8, 2) + "-" + hex.Substring(10, 2);
+        }
+
+        /// <summary>
+        /// UniFi-Geräte ohne SNMP-Eintrag als Switch/AP übernehmen (Ports, Fehlerzähler, PoE, STP, angeschlossene Geräte),
+        /// bei per SNMP abgefragten UniFi-Switches PoE und STP ergänzen.
+        /// </summary>
+        static void SyncUniFi(UniFiSnapshot u)
+        {
+            DateTime now = DateTime.Now;
+            string gw = gatewayMac.Length == 12 ? gatewayMac : Topology.GatewayMac();
+            lock (sync)
+            {
+                switches.RemoveAll(delegate (SwitchState x) { return x.FromUniFi && !u.Devices.Exists(delegate (UniFiDeviceInfo d) { return Matches(x, d); }); });
+                foreach (UniFiDeviceInfo d in u.Devices)
+                {
+                    UniFiDeviceInfo dd = d;
+                    SwitchState snmp = switches.Find(delegate (SwitchState x) { return !x.FromUniFi && Matches(x, dd); });
+                    if (snmp != null)
+                    {
+                        switches.RemoveAll(delegate (SwitchState x) { return x.FromUniFi && Matches(x, dd); });
+                        foreach (UniFiPort up in d.Ports)
+                        {
+                            PortState p = PortByNumber(snmp, up.Idx);
+                            if (p == null) continue;
+                            p.PoeOn = up.PoeOn; p.PoeWatts = up.PoeWatts;
+                            if (up.Stp.Length > 0) p.Stp = up.Stp;
+                        }
+                        continue;
+                    }
+                    SwitchState s = switches.Find(delegate (SwitchState x) { return x.FromUniFi && Matches(x, dd); });
+                    if (s == null)
+                    {
+                        s = new SwitchState();
+                        s.FromUniFi = true;
+                        s.Community = "(UniFi)";
+                        switches.Add(s);
+                    }
+                    s.Name = d.Name; s.SysName = d.Name; s.Address = d.Ip;
+                    s.SysDescr = "UniFi " + d.Model + (d.Version.Length > 0 ? ", Firmware " + d.Version : "");
+                    s.Kind = d.IsGateway ? "Firewall" : d.IsAp ? "Access Point" : "Switch";
+                    s.OwnMacs = Dashed(d.Mac);
+                    s.HasFdb = true;
+                    s.Reachable = d.Online;
+                    s.Error = d.Online ? "" : "laut UniFi-Controller offline";
+                    s.Polled = true;
+                    s.LastPoll = now;
+                    if (d.Uptime >= 0)
+                    {
+                        if (s.UpTime >= 0 && d.Uptime * 100 < s.UpTime)
+                            foreach (PortState p in s.Ports.Values) p.HaveBase = false;
+                        s.UpTime = d.Uptime * 100;
+                    }
+                    if (!d.Online) continue;
+                    foreach (UniFiPort up in d.Ports)
+                    {
+                        PortState p;
+                        if (!s.Ports.TryGetValue(up.Idx, out p)) { p = new PortState(); p.IfIndex = up.Idx; s.Ports[up.Idx] = p; }
+                        p.Name = up.Name.Length > 0 ? up.Name : "Port " + up.Idx;
+                        int oldOper = p.Oper;
+                        p.Oper = up.Up ? 1 : 2;
+                        p.SpeedMbps = up.Up ? up.Speed : 0;
+                        p.Duplex = up.Up ? (up.FullDuplex ? 3 : 2) : 0;
+                        if (oldOper != 0 && (oldOper == 1) != (p.Oper == 1))
+                        {
+                            if (!p.Up) p.Flaps.Add(now);
+                            p.LastFlap = now;
+                            p.Flaps.RemoveAll(delegate (DateTime x) { return x < DateTime.Now.AddDays(-1); });
+                            Event(s, p, p.Up ? "Link UP" : "Link DOWN", "laut UniFi-Controller" + (p.Up ? " (jetzt " + p.SpeedText + ")" : ""));
+                        }
+                        Counters(s, p, up.RxErr, up.TxErr, up.RxDrop + up.TxDrop, 0, 0, 0);
+                        Rates(p, up.RxBytes, up.TxBytes, now);
+                        Broadcasts(p, up.RxBcast, now);
+                        p.PoeOn = up.PoeOn; p.PoeWatts = up.PoeWatts; p.Stp = up.Stp;
+                        // "MAC-Tabelle" aus den Controller-Daten: Geräte an diesem Port, angeschlossene UniFi-Geräte, Gateway am Uplink
+                        p.Macs.Clear();
+                        foreach (UniFiClientInfo c in u.Clients)
+                            if (c.Wired && c.SwMac == d.Mac && c.SwPort == up.Idx) p.Macs.Add(Dashed(c.Mac));
+                        foreach (UniFiDeviceInfo o in u.Devices)
+                            if (o.UplinkMac == d.Mac && o.UplinkPort == up.Idx) p.Macs.Add(Dashed(o.Mac));
+                        if (up.IsUplink)
+                        {
+                            if (d.UplinkMac.Length == 12) p.Macs.Add(Dashed(d.UplinkMac));
+                            if (gw.Length == 12 && !d.IsGateway) p.Macs.Add(Dashed(gw));
+                        }
+                    }
+                    if (d.IsAp)
+                    {
+                        // WLAN-Schnittstellen je Frequenzband mit den angemeldeten Clients
+                        string[] radios = { "ng", "na", "6e" };
+                        string[] names = { "WLAN 2,4 GHz", "WLAN 5 GHz", "WLAN 6 GHz" };
+                        for (int i = 0; i < radios.Length; i++)
+                        {
+                            List<string> macs = new List<string>();
+                            foreach (UniFiClientInfo c in u.Clients)
+                                if (!c.Wired && c.ApMac == d.Mac && c.Radio == radios[i]) macs.Add(Dashed(c.Mac));
+                            PortState p;
+                            if (!s.Ports.TryGetValue(1001 + i, out p))
+                            {
+                                if (macs.Count == 0) continue;
+                                p = new PortState(); p.IfIndex = 1001 + i; s.Ports[1001 + i] = p;
+                            }
+                            p.Name = names[i]; p.Wireless = true; p.Oper = 1;
+                            p.Macs.Clear(); p.Macs.AddRange(macs);
+                        }
+                    }
+                }
+            }
+        }
+
+        static void LogClient(string name, string host, string evt, string info)
+        {
+            LogEntry e = new LogEntry();
+            e.Time = DateTime.Now; e.Name = name; e.Host = host; e.Event = evt; e.Info = info;
+            e.Source = "UniFi (" + owner + ")";
+            try { CsvLog.Write(e); } catch { }
+        }
+
+        static string ApName(UniFiSnapshot u, string mac)
+        {
+            UniFiDeviceInfo d = u.Device(mac);
+            return d != null ? d.Name : mac;
+        }
+
+        static string WlanText(UniFiSnapshot u, UniFiClientInfo c)
+        {
+            return ApName(u, c.ApMac) + (c.Essid.Length > 0 ? ", SSID " + c.Essid : "") + (c.SignalText.Length > 0 ? ", Signal " + c.SignalText : "") +
+                (c.TxRate > 0 ? ", " + c.TxRate + " Mbit/s" : "");
+        }
+
+        /// <summary>
+        /// Ereignisse aus dem Vergleich zweier Controller-Abfragen ins Ausfallprotokoll: UniFi-Geräte offline/neu gestartet/
+        /// Firmware/Uplink, überwachte Geräte an-/abgemeldet, AP-Wechsel, WLAN-Signal. Führt außerdem den WLAN-Verlauf.
+        /// </summary>
+        static void UniFiEvents(UniFiSnapshot old, UniFiSnapshot u)
+        {
+            u.History = old.History;
+            DateTime now = DateTime.Now;
+            List<PingTarget> hosts;
+            try { hosts = Config.LoadHosts(); } catch { hosts = new List<PingTarget>(); }
+            lock (sync) FillMacs(hosts, switches);
+
+            // WLAN-Verlauf der überwachten Geräte
+            foreach (PingTarget t in hosts)
+            {
+                UniFiClientInfo c = u.Client(t.Mac, t.Host);
+                if (c == null || c.Wired) continue;
+                string key = NetTools.MacHex(c.Mac);
+                WlanTrack tr;
+                if (!u.History.TryGetValue(key, out tr)) { tr = new WlanTrack(); u.History[key] = tr; }
+                WlanSample smp = new WlanSample();
+                smp.Time = now; smp.Ap = ApName(u, c.ApMac); smp.Signal = c.Signal; smp.Rate = c.TxRate; smp.Satisfaction = c.Satisfaction;
+                tr.Samples.Add(smp);
+                if (tr.Samples.Count > 120) tr.Samples.RemoveAt(0);
+                tr.Roams.RemoveAll(delegate (DateTime x) { return x < now.AddDays(-1); });
+            }
+            if (!old.Valid) return;
+
+            foreach (UniFiDeviceInfo d in u.Devices)
+            {
+                UniFiDeviceInfo o = old.Device(d.Mac);
+                if (o == null) continue;
+                string what = d.KindText + " " + d.Name;
+                if (o.Online && !d.Online)
+                    LogClient(d.Name, d.Ip, "UniFi-Gerät offline", what + " ist laut Controller nicht mehr verbunden" + (d.IsAp ? " - seine WLAN-Clients sind getrennt" : ""));
+                else if (!o.Online && d.Online)
+                    LogClient(d.Name, d.Ip, "UniFi-Gerät wieder online", what);
+                if (o.Uptime > 0 && d.Uptime >= 0 && d.Uptime < o.Uptime)
+                    LogClient(d.Name, d.Ip, "UniFi-Gerät neu gestartet", what + " läuft erst seit " + Outages.Duration(now.AddSeconds(-d.Uptime), now) +
+                        " (Stromausfall, PoE-Unterbrechung, Absturz oder Firmware-Update?)");
+                if (o.Version.Length > 0 && d.Version.Length > 0 && o.Version != d.Version)
+                    LogClient(d.Name, d.Ip, "Firmware geändert", what + ": " + o.Version + " → " + d.Version);
+                if (o.UplinkMac.Length == 12 && d.UplinkMac.Length == 12 && (o.UplinkMac != d.UplinkMac || o.UplinkPort != d.UplinkPort))
+                    LogClient(d.Name, d.Ip, "Uplink geändert", what + ": vorher " + ApName(u, o.UplinkMac) + " Port " + o.UplinkPort +
+                        ", jetzt " + ApName(u, d.UplinkMac) + " Port " + d.UplinkPort + (d.IsAp ? " (Mesh/Kabel?)" : ""));
+                if (o.UplinkSpeed > 0 && d.UplinkSpeed > 0 && d.UplinkSpeed < o.UplinkSpeed)
+                    LogClient(d.Name, d.Ip, "Uplink langsamer", what + ": " + o.UplinkSpeed + " → " + d.UplinkSpeed + " Mbit/s - Kabel/Stecker prüfen");
+            }
+
+            foreach (PingTarget t in hosts)
+            {
+                UniFiClientInfo oc = old.Client(t.Mac, t.Host), nc = u.Client(t.Mac, t.Host);
+                if (oc == null && nc == null) continue;
+                if (oc != null && nc == null)
+                    LogClient(t.Name, t.Host, oc.Wired ? "LAN: beim Controller abgemeldet" : "WLAN getrennt",
+                        oc.Wired ? "zuletzt an " + ApName(old, oc.SwMac) + " Port " + oc.SwPort : "zuletzt " + WlanText(old, oc));
+                else if (oc == null)
+                    LogClient(t.Name, t.Host, nc.Wired ? "LAN: beim Controller angemeldet" : "WLAN verbunden",
+                        nc.Wired ? ApName(u, nc.SwMac) + " Port " + nc.SwPort : WlanText(u, nc));
+                else if (!oc.Wired && !nc.Wired)
+                {
+                    if (oc.ApMac != nc.ApMac)
+                    {
+                        WlanTrack tr;
+                        if (u.History.TryGetValue(NetTools.MacHex(nc.Mac), out tr)) tr.Roams.Add(now);
+                        LogClient(t.Name, t.Host, "WLAN: AP-Wechsel", "von " + ApName(old, oc.ApMac) + (oc.SignalText.Length > 0 ? " (" + oc.Signal + " dBm)" : "") +
+                            " zu " + WlanText(u, nc));
+                    }
+                    if (nc.Signal != 0 && nc.Signal <= -80 && (oc.Signal == 0 || oc.Signal > -80))
+                        LogClient(t.Name, t.Host, "WLAN-Signal sehr schwach", WlanText(u, nc) + " - Abbrüche wahrscheinlich");
+                    else if (oc.Signal != 0 && oc.Signal <= -80 && nc.Signal >= -75)
+                        LogClient(t.Name, t.Host, "WLAN-Signal wieder ausreichend", WlanText(u, nc));
+                }
+                else if (oc.Wired && nc.Wired && (oc.SwMac != nc.SwMac || oc.SwPort != nc.SwPort))
+                    LogClient(t.Name, t.Host, "LAN: Anschluss geändert", ApName(old, oc.SwMac) + " Port " + oc.SwPort + " → " + ApName(u, nc.SwMac) + " Port " + nc.SwPort);
+                else if (oc.Wired != nc.Wired)
+                    LogClient(t.Name, t.Host, nc.Wired ? "Jetzt per Kabel" : "Jetzt per WLAN", nc.Wired ? ApName(u, nc.SwMac) + " Port " + nc.SwPort : WlanText(u, nc));
+            }
+        }
+
+        /// <summary>WLAN-Hinweis für die Ausfall-Diagnose (Daten des UniFi-Controllers), sonst leer.</summary>
+        public static string WlanDiagnosis(PingTarget t)
+        {
+            UniFiSnapshot u;
+            lock (sync) u = unifi;
+            if (!u.Valid) return "";
+            UniFiClientInfo c = u.Client(t.Mac, t.Host);
+            if (c != null && c.Wired) return "";
+            if (c != null)
+                return (c.Signal != 0 && c.Signal <= -80 ? "✖ WLAN laut UniFi: " + WlanText(u, c) + " - das Signal ist sehr schwach, Funkabbrüche sind die wahrscheinliche Ursache."
+                                                       : "ⓘ WLAN laut UniFi weiterhin verbunden: " + WlanText(u, c) + ".");
+            WlanTrack tr;
+            if (u.History.TryGetValue(NetTools.MacHex(t.Mac), out tr) && tr.Samples.Count > 0)
+            {
+                WlanSample l = tr.Samples[tr.Samples.Count - 1];
+                return "✖ Laut UniFi-Controller nicht mehr im WLAN angemeldet (zuletzt " + l.Time.ToString("HH:mm") + " an " + l.Ap +
+                    (l.Signal != 0 ? ", Signal " + l.Signal + " dBm" : "") + "): Gerät hat das WLAN verlassen - aus, Standby, außer Reichweite.";
+            }
+            return "";
+        }
+
         /// <summary>Rangfolge für die Zuordnung: Endgeräte-Port vor Access Point vor Switch-Verbindung vor Uplink, dann wenigste MACs.</summary>
         public static int PortScore(PortState p)
         {
@@ -5757,7 +6132,12 @@ namespace PingMonitor
                         if (home != null)
                         {
                             if (uc.Wired) best = PortByNumber(home, uc.SwPort);
-                            else foreach (PortState wp in home.Ports.Values) if (wp.Wireless) { best = wp; break; }
+                            else
+                            {
+                                foreach (PortState wp in home.Ports.Values)
+                                    if (wp.Wireless && wp.Macs.Exists(delegate (string m) { return NetTools.MacHex(m) == mac; })) { best = wp; break; }
+                                if (best == null) foreach (PortState wp in home.Ports.Values) if (wp.Wireless) { best = wp; break; }
+                            }
                         }
                         if (best != null)
                         {
@@ -5790,8 +6170,10 @@ namespace PingMonitor
                     {
                         if (best.Role == "uplink" && mac == gatewayMac)
                             suffix = "";   // Gateway/Firewall hängt direkt am Uplink-Port
-                        else if (best.IsInfrastructure)
+                        else if (best.IsInfrastructure && !IsSwitchMac(mac))
                             suffix = " (nur an Switch-Verbindung gesehen - hängt an einem nicht eingetragenen Switch/AP)";
+                        else if (best.IsInfrastructure)
+                            suffix = "";   // das Gerät ist selbst der Switch/AP hinter dieser Verbindung
                         else
                         {
                             SwitchState home = switches.Find(delegate (SwitchState x) { return x.Ports.ContainsValue(best); });
@@ -5897,12 +6279,37 @@ namespace PingMonitor
             if (p.IsWan && !p.Up)
                 f.Add(new Finding(Finding.Problem, "INTERNET-LEITUNG WEG",
                     "Die WAN-Schnittstelle der Firewall hat keinen Link: Modem/Glasfaser-Box aus, Kabel ab oder Störung beim Provider."));
-            if (p.Up && p.SpeedMbps > 0 && p.SpeedMbps < 1000 && maxSpeed >= 1000 && !p.IsWan && s.Kind != "Firewall")
+            bool link = p.IsInfrastructure || p.Role == "ap";
+            if (p.Up && link && p.SpeedMbps > 0 && p.SpeedMbps < 1000 && s.Kind != "Firewall")
+                f.Add(new Finding(Finding.Warning, "Verbindung nur " + p.SpeedText,
+                    "Dieser Port verbindet " + (p.Role == "ap" ? "einen Access Point" : "zu einem weiteren Switch bzw. Richtung Gateway") +
+                    " und läuft nur mit " + p.SpeedText + ". Alle Geräte dahinter teilen sich diese Bandbreite - ein typischer Engpass.\r\n" +
+                    "Häufigste Ursache: ein Adernpaar im Kabel ist unterbrochen (Gigabit braucht alle 4 Paare, 100 Mbit nur 2) - " +
+                    "Stecker neu crimpen, Patchkabel tauschen, Dose prüfen. Seltener: Port fest auf 100 Mbit eingestellt oder altes Cat-5-Kabel.\r\n" +
+                    "Mehr dazu: " + Links.Gigabit));
+            if (p.Up && !link && p.SpeedMbps > 0 && p.SpeedMbps < 1000 && maxSpeed >= 1000 && !p.IsWan && s.Kind != "Firewall")
                 f.Add(new Finding(Finding.Info, "nur " + p.SpeedText,
                     "Der Port läuft nur mit " + p.SpeedText + ", andere Ports dieses Switches mit Gigabit. Bei älteren Geräten " +
                     "(Drucker, Telefone, Steuerungen) ist das normal. Kann das Gerät eigentlich Gigabit, deutet es auf ein defektes " +
                     "Adernpaar im Kabel hin (Gigabit braucht alle 4 Paare, 100 Mbit nur 2) oder auf ein altes Cat-5-Kabel.\r\n" +
                     "Mehr dazu: " + Links.Gigabit));
+            if (p.Up && p.StpBlocked)
+                f.Add(new Finding(Finding.Warning, "STP blockiert",
+                    "Spanning Tree hat diesen Port gesperrt (Zustand \"" + p.Stp + "\"): Über ihn gibt es eine zweite Verbindung zu einem Netz, " +
+                    "das schon anders erreichbar ist - also eine Schleife. Bei bewusst redundanter Verkabelung ist das gewollt. Sonst: " +
+                    "Kabel doppelt gesteckt (z. B. Dose-zu-Dose), Mini-Switch oder IP-Telefon mit zwei Verbindungen, WLAN-Mesh plus Kabel.\r\n" +
+                    "Ohne STP würde diese Schleife das Netz mit Broadcasts lahmlegen."));
+            double bc = 0;
+            foreach (double x in p.RecentBcast) bc += x;
+            if (p.RecentBcast.Count > 0) bc /= p.RecentBcast.Count;
+            if (p.Up && bc >= 300)
+                f.Add(new Finding(bc >= 2000 ? Finding.Problem : Finding.Warning, (bc >= 2000 ? "Broadcast-Sturm " : "viele Broadcasts ") + bc.ToString("0") + "/s",
+                    "An diesem Port kommen " + bc.ToString("0") + " Broadcast-Pakete pro Sekunde an (normal: unter 50). " +
+                    (bc >= 2000 ? "Das ist ein Broadcast-Sturm - fast immer eine Netzwerkschleife (Kabel doppelt gesteckt, Switch ohne Spanning Tree) " +
+                                  "oder ein defektes Gerät, das ununterbrochen sendet. Folge: Das ganze Netz wird langsam, Geräte fallen aus.\r\n" +
+                                  "Vorgehen: Kabel an diesem Port kurz ziehen - wird das Netz sofort normal, liegt die Ursache dahinter; dort Schleife suchen."
+                                : "Mögliche Ursachen: viele Geräte im selben Netz, Discovery-Protokolle (mDNS/SSDP), eine beginnende Schleife oder ein " +
+                                  "fehlerhaftes Gerät. Beobachten - steigt der Wert weiter, nach einer Schleife suchen.")));
             if (recentDisc > 0 && recentErr == 0)
                 f.Add(new Finding(Finding.Info, "Pakete verworfen",
                     "Der Switch hat an diesem Port zuletzt " + recentDisc + " Pakete verworfen, ohne dass Fehler auftraten. Das ist " +
@@ -5910,7 +6317,10 @@ namespace PingMonitor
 
             string stats = (p.IsWan ? "WAN-Schnittstelle (Standardroute)\r\n" : "") +
                 (p.Up ? "Link aktiv" + (p.SpeedText.Length > 0 ? ", " + p.SpeedText : "") + (p.DuplexText.Length > 0 ? ", Duplex " + p.DuplexText : "") : "Link aus") +
-                (p.RateText.Length > 0 ? "\r\nDatenrate empfangen / gesendet: " + p.RateText + " Mbit/s" : "") + "\r\n" +
+                (p.RateText.Length > 0 ? "\r\nDatenrate empfangen / gesendet: " + p.RateText + " Mbit/s" : "") +
+                (p.PoeOn ? "\r\nPoE: " + p.PoeWatts.ToString("0.0") + " W" : "") +
+                (p.Up && p.Stp.Length > 0 ? "\r\nSpanning Tree: " + p.Stp : "") +
+                (p.Up && p.RecentBcast.Count > 0 ? "\r\nBroadcasts: " + p.BcastPps.ToString("0") + "/s" : "") + "\r\n" +
                 "\r\nSeit Überwachungsbeginn: Empfangsfehler " + p.RxErrors + ", Sendefehler " + p.TxErrors + ", verworfen " + p.Discards +
                 ", Link-Wechsel (24 h) " + flapsDay +
                 (p.ConnectedText.Length > 0 ? "\r\nAngeschlossen: " + p.ConnectedText : "");
@@ -5951,7 +6361,7 @@ namespace PingMonitor
                         s.Polled ? "1" : "0", s.Reachable ? "1" : "0", Fmt.Csv(s.Error), Fmt.Csv(s.SysName), Fmt.Csv(s.SysDescr),
                         s.LastPoll == DateTime.MinValue ? "" : s.LastPoll.ToString(Fmt.Time), s.HasFdb ? "1" : "0",
                         Fmt.Csv(s.OwnMacs), Fmt.Csv(s.Kind), s.Cpu.ToString(), s.MemPct.ToString(), s.Connections.ToString(), Fmt.Csv(s.Load),
-                        Fmt.Csv(s.SysRating.Encode()), Fmt.Csv(ArpText(s.Arp)) })).Append("\r\n");
+                        Fmt.Csv(s.SysRating.Encode()), Fmt.Csv(ArpText(s.Arp)), s.FromUniFi ? "1" : "0" })).Append("\r\n");
                     foreach (PortState p in s.Ports.Values)
                         sb.Append(string.Join(";", new string[] { "P", Fmt.Csv(s.Address), p.IfIndex.ToString(), Fmt.Csv(p.Name), Fmt.Csv(p.Alias),
                             p.Oper.ToString(), p.SpeedMbps.ToString(), p.Duplex.ToString(), p.RxErrors.ToString(), p.TxErrors.ToString(),
@@ -5962,7 +6372,9 @@ namespace PingMonitor
                             string.Join(",", p.Macs.ToArray()), p.IsWan ? "1" : "0",
                             p.InMbps.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
                             p.OutMbps.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
-                            p.OctetsAt == DateTime.MinValue ? "" : p.OctetsAt.ToString(Fmt.Time), p.LldpCaps.ToString(), p.Role, Fmt.Csv(p.RoleInfo), Fmt.Csv(p.RoleTarget) })).Append("\r\n");
+                            p.OctetsAt == DateTime.MinValue ? "" : p.OctetsAt.ToString(Fmt.Time), p.LldpCaps.ToString(), p.Role, Fmt.Csv(p.RoleInfo), Fmt.Csv(p.RoleTarget),
+                            p.PoeOn ? "1" : "0", p.PoeWatts.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture), p.Stp,
+                            p.BcastPps.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) })).Append("\r\n");
                 }
             }
             return sb.ToString();
@@ -6001,6 +6413,7 @@ namespace PingMonitor
                             int eq = e.IndexOf('=');
                             if (eq > 0) s.Arp[e.Substring(0, eq)] = e.Substring(eq + 1);
                         }
+                    if (f.Count >= 20) s.FromUniFi = f[19] == "1";
                     list.Add(s);
                 }
                 else if (f.Count >= 18 && f[0] == "P" && list.Count > 0)
@@ -6032,6 +6445,13 @@ namespace PingMonitor
                             if (DateTime.TryParseExact(f[26], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out at)) p.OctetsAt = at;
                             if (f.Count >= 30) { int.TryParse(f[27], out p.LldpCaps); p.Role = f[28]; p.RoleInfo = f[29]; }
                             if (f.Count >= 31) p.RoleTarget = f[30];
+                            if (f.Count >= 35)
+                            {
+                                p.PoeOn = f[31] == "1";
+                                double.TryParse(f[32], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out p.PoeWatts);
+                                p.Stp = f[33];
+                                double.TryParse(f[34], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out p.BcastPps);
+                            }
                         }
                         foreach (string m in f[22].Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) p.Macs.Add(m);
                     }
@@ -6961,7 +7381,9 @@ namespace PingMonitor
                 n.Tip = s.SysDescr;
                 int worst = Finding.Ok;
                 foreach (PortState p in s.Ports.Values) if (p.Rating.Level > worst) worst = p.Rating.Level;
+                if (s.SysRating.Level > worst) worst = s.SysRating.Level;
                 n.Level = worst;
+                if (s.SysRating.Level >= Finding.Warning) n.Tip += "\r\n" + s.SysRating.Short;
                 swNodes[s] = n;
             }
             Dictionary<TopoNode, string> nodeName = new Dictionary<TopoNode, string>();
@@ -7449,7 +7871,9 @@ namespace PingMonitor
             else
                 lines.Add("● Das Gerät liegt in einem anderen Netz (hinter einem Router) - ARP und MAC-Prüfung sind von hier nicht möglich.");
 
-            if (Topology.RandomMac(t.Mac) || Topology.MobileVendor(t.Vendor))
+            string wlan = SwitchMonitor.WlanDiagnosis(t);
+            if (wlan.Length > 0) lines.Add(wlan);
+            else if (Topology.RandomMac(t.Mac) || Topology.MobileVendor(t.Vendor))
                 lines.Add("ⓘ Vermutlich ein WLAN-/Mobilgerät: Smartphones und Tablets trennen im Standby das WLAN oder antworten nicht auf Ping - meist kein Fehler.");
             if (verdict.Length == 0) verdict = "Ursache unklar";
             details = string.Join("\r\n", lines.ToArray());
@@ -7464,9 +7888,11 @@ namespace PingMonitor
         readonly Func<UniFiSnapshot> unifiData;
         readonly Action<PingTarget> showDevice;
         TreeView tree;
-        CheckBox chkHideWlan;
-        Label lblInfo;
+        CheckBox chkHideWlan, chkInfra, chkProblems;
+        TextBox txtSearch;
+        Label lblCount;
         TopoNode current;
+        Font bold;
 
         public TopologyForm(Func<List<SwitchState>> switches, Func<List<PingTarget>> devices, Func<UniFiSnapshot> unifi, Action<PingTarget> show)
         {
@@ -7476,7 +7902,8 @@ namespace PingMonitor
             showDevice = show;
             Text = "Netzwerkplan";
             Font = new Font("Segoe UI", 9.5F);
-            Size = new Size(1000, 760);
+            bold = new Font(Font, FontStyle.Bold);
+            Size = new Size(1100, 800);
             StartPosition = FormStartPosition.CenterParent;
 
             FlowLayoutPanel top = new FlowLayoutPanel();
@@ -7485,43 +7912,68 @@ namespace PingMonitor
             top.Padding = new Padding(6);
             top.Controls.Add(Btn("Aktualisieren", delegate { Rebuild(); }));
             top.Controls.Add(Btn("Alles aufklappen", delegate { tree.ExpandAll(); }));
-            top.Controls.Add(Btn("Alles zuklappen", delegate { tree.CollapseAll(); if (tree.Nodes.Count > 0) tree.Nodes[0].Expand(); }));
+            top.Controls.Add(Btn("Nur Infrastruktur aufklappen", delegate { Render(); }));
             top.Controls.Add(Btn("Als Text kopieren", delegate
             {
                 if (current == null) return;
                 try { Clipboard.SetText(Topology.ToText(current)); MessageBox.Show(this, "Netzwerkplan als Text in die Zwischenablage kopiert.", Text); }
                 catch (Exception ex) { MessageBox.Show(this, ex.Message, Text); }
             }));
-            chkHideWlan = new CheckBox();
-            chkHideWlan.Text = "WLAN-Geräte ausblenden";
-            chkHideWlan.AutoSize = true;
-            chkHideWlan.Margin = new Padding(12, 7, 3, 3);
-            chkHideWlan.CheckedChanged += delegate { Render(); };
-            top.Controls.Add(chkHideWlan);
-            lblInfo = new Label();
-            lblInfo.AutoSize = true;
-            lblInfo.Margin = new Padding(12, 7, 3, 3);
-            lblInfo.ForeColor = SystemColors.GrayText;
-            lblInfo.MaximumSize = new Size(960, 0);
-            lblInfo.Text = "Switch-Verbindungen aus LLDP bzw. den MAC-Tabellen der Switches (\"Switches ...\" müssen eingetragen sein). " +
-                "Rot = Ausfall, grau = offline/ausgeschaltet, farbig hinterlegt = auffälliger Port, blau = WLAN (vermutet). Doppelklick auf ein Gerät zeigt Details.";
-            top.SetFlowBreak(chkHideWlan, true);
-            top.Controls.Add(lblInfo);
+            Button doc = Btn("Dokumentation exportieren ...", delegate { DocExport.Run(this, switchData(), unifiData(), deviceData()); });
+            doc.Font = bold;
+            top.Controls.Add(doc);
+
+            FlowLayoutPanel filter = new FlowLayoutPanel();
+            filter.Dock = DockStyle.Top;
+            filter.AutoSize = true;
+            filter.Padding = new Padding(6, 0, 6, 4);
+            Label ls = new Label(); ls.Text = "Suchen:"; ls.AutoSize = true; ls.Margin = new Padding(3, 7, 3, 3);
+            filter.Controls.Add(ls);
+            txtSearch = new TextBox(); txtSearch.Width = 220;
+            txtSearch.TextChanged += delegate { Render(); };
+            filter.Controls.Add(txtSearch);
+            chkInfra = Chk("Nur Switches/APs");
+            chkProblems = Chk("Nur Auffälligkeiten");
+            chkHideWlan = Chk("WLAN-Geräte ausblenden");
+            filter.Controls.Add(chkInfra); filter.Controls.Add(chkProblems); filter.Controls.Add(chkHideWlan);
+            lblCount = new Label(); lblCount.AutoSize = true; lblCount.Margin = new Padding(12, 7, 3, 3); lblCount.ForeColor = SystemColors.GrayText;
+            filter.Controls.Add(lblCount);
 
             tree = new TreeView();
             tree.Dock = DockStyle.Fill;
             tree.ShowNodeToolTips = true;
             tree.HideSelection = false;
             tree.FullRowSelect = true;
-            tree.ItemHeight = 22;
+            tree.ItemHeight = 26;
+            tree.ImageList = Icons.List;
+            tree.DrawMode = TreeViewDrawMode.OwnerDrawText;
+            tree.DrawNode += DrawNode;
+            tree.Resize += delegate { tree.Invalidate(); };
             tree.NodeMouseDoubleClick += delegate (object sender, TreeNodeMouseClickEventArgs e)
             {
                 TopoNode n = e.Node.Tag as TopoNode;
                 if (n != null && n.Target != null) showDevice(n.Target);
             };
+
+            Panel legend = new LegendPanel();
+            legend.Dock = DockStyle.Bottom;
+            legend.Height = 30;
+
             Controls.Add(tree);
+            Controls.Add(legend);
+            Controls.Add(filter);
             Controls.Add(top);
             Shown += delegate { Rebuild(); };
+        }
+
+        CheckBox Chk(string text)
+        {
+            CheckBox c = new CheckBox();
+            c.Text = text;
+            c.AutoSize = true;
+            c.Margin = new Padding(12, 7, 3, 3);
+            c.CheckedChanged += delegate { Render(); };
+            return c;
         }
 
         static Button Btn(string t, EventHandler click)
@@ -7542,29 +7994,797 @@ namespace PingMonitor
             Render();
         }
 
+        bool Filtering { get { return txtSearch.Text.Trim().Length > 0 || chkProblems.Checked || chkInfra.Checked; } }
+
         void Render()
         {
             if (current == null) return;
             tree.BeginUpdate();
             tree.Nodes.Clear();
-            TreeNode root = Add(tree.Nodes, current);
+            int shown = 0;
+            TreeNode root = Add(tree.Nodes, Group(current), ref shown);
             tree.EndUpdate();
-            if (root != null) root.ExpandAll();
+            if (root != null) Expand(root);
+            if (tree.Nodes.Count > 0) tree.Nodes[0].EnsureVisible();
+            lblCount.Text = shown + " Einträge" + (Filtering || chkHideWlan.Checked ? " (gefiltert)" : "");
         }
 
-        TreeNode Add(TreeNodeCollection parent, TopoNode n)
+        /// <summary>WLAN-Geräte unter einem AP zu einem aufklappbaren Eintrag "n WLAN-Clients" zusammenfassen.</summary>
+        static TopoNode Group(TopoNode n)
         {
-            if (chkHideWlan.Checked && n.Wlan && n.Children.Count == 0) return null;
-            TreeNode node = parent.Add(n.Title);
+            TopoNode c = new TopoNode();
+            c.Kind = n.Kind; c.Title = n.Title; c.Tip = n.Tip; c.Level = n.Level; c.Offline = n.Offline; c.Off = n.Off; c.Wlan = n.Wlan; c.Target = n.Target;
+            List<TopoNode> wlan = new List<TopoNode>();
+            foreach (TopoNode x in n.Children)
+            {
+                if (n.Kind == "ap" && x.Wlan && x.Children.Count == 0) wlan.Add(x);
+                else c.Children.Add(Group(x));
+            }
+            if (wlan.Count > 0)
+            {
+                TopoNode g = new TopoNode();
+                g.Kind = "wlangroup";
+                g.Title = wlan.Count + " WLAN-Client" + (wlan.Count == 1 ? "" : "s");
+                foreach (TopoNode x in wlan)
+                {
+                    g.Children.Add(x);
+                    if (x.Offline) g.Offline = true;
+                    if (x.Level > g.Level) g.Level = x.Level;
+                }
+                g.Tip = "Am Access Point angemeldete (bzw. vermutete) WLAN-Geräte. Aufklappen zeigt die Geräte mit Signalstärke.";
+                c.Children.Add(g);
+            }
+            return c;
+        }
+
+        static bool Infra(TopoNode n) { return n.Kind == "internet" || n.Kind == "gateway" || n.Kind == "switch" || n.Kind == "ap"; }
+        static bool Problem(TopoNode n) { return n.Offline || n.Level >= Finding.Warning; }
+
+        bool SelfVisible(TopoNode n)
+        {
+            if (n.Kind == "group" || n.Kind == "wlangroup") return false;
+            string q = txtSearch.Text.Trim().ToLowerInvariant();
+            if (q.Length > 0 && !(n.Title + " " + n.Tip).ToLowerInvariant().Contains(q)) return false;
+            if (chkProblems.Checked && !Problem(n)) return false;
+            if (Infra(n)) return true;
+            if (chkInfra.Checked) return false;
+            if (chkHideWlan.Checked && n.Wlan) return false;
+            return true;
+        }
+
+        bool Visible(TopoNode n)
+        {
+            if (n.Kind == "internet") return true;
+            if (SelfVisible(n)) return true;
+            foreach (TopoNode c in n.Children) if (Visible(c)) return true;
+            return false;
+        }
+
+        TreeNode Add(TreeNodeCollection parent, TopoNode n, ref int shown)
+        {
+            if (!Visible(n)) return null;
+            string prefix, main;
+            Split(n.Title, out prefix, out main);
+            TreeNode node = parent.Add(main + "      ");
             node.Tag = n;
-            node.ToolTipText = n.Tip;
-            if (n.Offline) { node.ForeColor = Color.DarkRed; node.NodeFont = new Font(tree.Font, FontStyle.Bold); }
-            else if (n.Off || n.Kind == "group") node.ForeColor = SystemColors.GrayText;
-            else if (n.Wlan) node.ForeColor = Color.SteelBlue;
-            else if (n.Kind == "switch" || n.Kind == "gateway" || n.Kind == "internet" || n.Kind == "ap") node.NodeFont = new Font(tree.Font, FontStyle.Bold);
-            if (n.Level >= Finding.Warning) node.BackColor = Finding.Back(n.Level);
-            foreach (TopoNode c in n.Children) Add(node.Nodes, c);
+            node.ToolTipText = (prefix.Length > 0 ? prefix + "\r\n" : "") + n.Tip;
+            string key = Icons.KeyFor(n);
+            node.ImageKey = key; node.SelectedImageKey = key;
+            if (Infra(n)) node.NodeFont = bold;
+            shown++;
+            foreach (TopoNode c in n.Children) Add(node.Nodes, c, ref shown);
             return node;
+        }
+
+        /// <summary>"Port 8  →  Name (IP)  [Switch]" in Anschluss ("Port 8") und Bezeichnung ("Name (IP)") zerlegen.</summary>
+        static void Split(string title, out string prefix, out string main)
+        {
+            int i = title.LastIndexOf("  →  ");
+            prefix = i >= 0 ? title.Substring(0, i).Trim() : "";
+            main = i >= 0 ? title.Substring(i + 5) : title;
+            foreach (string t in new string[] { "  [Switch]", "  [Access Point]", "  [Gateway]" }) main = main.Replace(t, "");
+            if (prefix.StartsWith("(") && prefix.EndsWith(")")) prefix = "Uplink " + prefix.Substring(1, prefix.Length - 2);
+        }
+
+        void Expand(TreeNode n)
+        {
+            TopoNode t = n.Tag as TopoNode;
+            bool open = Filtering || t == null || Infra(t) || (t.Kind == "wlangroup" || t.Kind == "group") && HasProblem(n);
+            if (open) n.Expand(); else n.Collapse();
+            foreach (TreeNode c in n.Nodes) Expand(c);
+        }
+
+        static bool HasProblem(TreeNode n)
+        {
+            foreach (TreeNode c in n.Nodes)
+            {
+                TopoNode t = c.Tag as TopoNode;
+                if (t != null && Problem(t)) return true;
+            }
+            return false;
+        }
+
+        void DrawNode(object sender, DrawTreeNodeEventArgs e)
+        {
+            TopoNode n = e.Node.Tag as TopoNode;
+            if (n == null || e.Bounds.Height == 0) { e.DrawDefault = true; return; }
+            Graphics g = e.Graphics;
+            bool selected = (e.State & TreeNodeStates.Selected) != 0;
+            Rectangle row = new Rectangle(e.Bounds.X, e.Bounds.Y, Math.Max(e.Bounds.Width, tree.ClientSize.Width - e.Bounds.X), e.Bounds.Height);
+            Color back = selected ? SystemColors.Highlight : Problem(n) && n.Kind == "device" ? Finding.Back(n.Offline ? Finding.Problem : n.Level)
+                       : Icons.Back(n);
+            using (SolidBrush b = new SolidBrush(back)) g.FillRectangle(b, row);
+
+            int x = e.Bounds.X + 4;
+            if (n.Kind != "group" && n.Kind != "wlangroup" && n.Kind != "internet")
+            {
+                using (SolidBrush b = new SolidBrush(Icons.StatusColor(n))) g.FillEllipse(b, x, row.Y + row.Height / 2 - 5, 10, 10);
+                x += 16;
+            }
+            string prefix, main;
+            Split(n.Title, out prefix, out main);
+            Font f = e.Node.NodeFont ?? tree.Font;
+            Color fore = selected ? SystemColors.HighlightText : n.Offline ? Color.DarkRed : n.Off || n.Kind == "group" ? SystemColors.GrayText
+                       : n.Wlan ? Color.SteelBlue : SystemColors.ControlText;
+            TextRenderer.DrawText(g, main, f, new Point(x, row.Y + (row.Height - f.Height) / 2), fore, TextFormatFlags.NoPrefix);
+            int mainW = TextRenderer.MeasureText(main, f).Width;
+            string right = prefix;
+            if (!e.Node.IsExpanded && e.Node.Nodes.Count > 0) right = (right.Length > 0 ? right + "   " : "") + "▸ " + Count(e.Node) + " darunter";
+            if (right.Length > 0)
+            {
+                Size sz = TextRenderer.MeasureText(right, tree.Font);
+                int rx = Math.Max(x + mainW + 20, tree.ClientSize.Width - sz.Width - 12);
+                TextRenderer.DrawText(g, right, tree.Font, new Point(rx, row.Y + (row.Height - sz.Height) / 2),
+                    selected ? SystemColors.HighlightText : Color.FromArgb(110, 110, 110), TextFormatFlags.NoPrefix);
+            }
+        }
+
+        static int Count(TreeNode n)
+        {
+            int c = 0;
+            foreach (TreeNode x in n.Nodes) c += 1 + Count(x);
+            return c;
+        }
+    }
+
+    /// <summary>Legende unter dem Netzwerkplan.</summary>
+    class LegendPanel : Panel
+    {
+        public LegendPanel() { DoubleBuffered = true; }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            int x = 8, y = (Height - 18) / 2;
+            string[][] items = {
+                new string[] { "gateway", "Firewall" }, new string[] { "switch", "Switch" }, new string[] { "ap", "Access Point" },
+                new string[] { "device", "Gerät (LAN)" }, new string[] { "wlan", "Gerät (WLAN)" } };
+            foreach (string[] it in items)
+            {
+                TopoNode n = new TopoNode(); n.Kind = it[0] == "wlan" ? "device" : it[0]; n.Wlan = it[0] == "wlan";
+                using (SolidBrush b = new SolidBrush(Icons.Back(n))) g.FillRectangle(b, x - 2, y - 2, 22 + TextRenderer.MeasureText(it[1], Font).Width + 6, 22);
+                g.DrawImage(Icons.List.Images[it[0]], x, y - 1, 18, 18);
+                TextRenderer.DrawText(g, it[1], Font, new Point(x + 22, y), ForeColor);
+                x += 22 + TextRenderer.MeasureText(it[1], Font).Width + 16;
+            }
+            x += 10;
+            Color[] cols = { Icons.Green, Icons.Yellow, Icons.Red, Color.Silver };
+            string[] txt = { "OK", "Warnung", "Problem / Ausfall", "aus / unbekannt" };
+            for (int i = 0; i < cols.Length; i++)
+            {
+                using (SolidBrush b = new SolidBrush(cols[i])) g.FillEllipse(b, x, y + 3, 10, 10);
+                TextRenderer.DrawText(g, txt[i], Font, new Point(x + 14, y), ForeColor);
+                x += 14 + TextRenderer.MeasureText(txt[i], Font).Width + 12;
+            }
+            TextRenderer.DrawText(g, "Doppelklick = Details", Font, new Point(x + 10, y), SystemColors.GrayText);
+        }
+    }
+
+    /// <summary>Selbst gezeichnete Symbole und Farben für Netzwerkplan und Dokumentation.</summary>
+    static class Icons
+    {
+        public static readonly Color Green = Color.FromArgb(46, 160, 67), Yellow = Color.FromArgb(230, 170, 20), Red = Color.FromArgb(210, 45, 45);
+        static ImageList list;
+
+        public static ImageList List
+        {
+            get
+            {
+                if (list != null) return list;
+                list = new ImageList();
+                list.ColorDepth = ColorDepth.Depth32Bit;
+                list.ImageSize = new Size(20, 20);
+                foreach (string k in new string[] { "internet", "gateway", "switch", "ap", "device", "wlan", "group", "wlangroup" })
+                    list.Images.Add(k, Draw(k, 20));
+                return list;
+            }
+        }
+
+        public static string KeyFor(TopoNode n)
+        {
+            if (n.Kind == "device") return n.Wlan ? "wlan" : "device";
+            return n.Kind;
+        }
+
+        public static Color Back(TopoNode n)
+        {
+            switch (n.Kind)
+            {
+                case "internet": return Color.FromArgb(238, 241, 245);
+                case "gateway": return Color.FromArgb(253, 236, 214);
+                case "switch": return Color.FromArgb(222, 236, 250);
+                case "ap": return Color.FromArgb(238, 228, 250);
+                case "wlangroup": return Color.FromArgb(247, 242, 253);
+                default: return SystemColors.Window;
+            }
+        }
+
+        public static Color StatusColor(TopoNode n)
+        {
+            if (n.Offline) return Red;
+            if (n.Off) return Color.Silver;
+            if (n.Level >= Finding.Problem) return Red;
+            if (n.Level >= Finding.Warning) return Yellow;
+            if (n.Target == null && n.Level == Finding.Unknown && n.Kind == "device") return Color.Silver;
+            return Green;
+        }
+
+        public static Bitmap Draw(string kind, int size)
+        {
+            Bitmap bmp = new Bitmap(size, size);
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.ScaleTransform(size / 20f, size / 20f);
+                switch (kind)
+                {
+                    case "internet":
+                        using (SolidBrush b = new SolidBrush(Color.FromArgb(120, 140, 170)))
+                        {
+                            g.FillEllipse(b, 2, 8, 8, 8); g.FillEllipse(b, 6, 4, 10, 10); g.FillEllipse(b, 11, 8, 8, 8); g.FillRectangle(b, 6, 11, 9, 5);
+                        }
+                        break;
+                    case "gateway":
+                        using (SolidBrush b = new SolidBrush(Color.FromArgb(230, 120, 30)))
+                            g.FillPolygon(b, new PointF[] { new PointF(10, 1), new PointF(18, 4), new PointF(17, 11), new PointF(10, 19), new PointF(3, 11), new PointF(2, 4) });
+                        using (Pen p = new Pen(Color.White, 2)) { g.DrawLine(p, 6, 10, 9, 13); g.DrawLine(p, 9, 13, 14, 7); }
+                        break;
+                    case "switch":
+                        using (SolidBrush b = new SolidBrush(Color.FromArgb(30, 110, 200))) g.FillRectangle(b, 1, 5, 18, 10);
+                        using (SolidBrush w = new SolidBrush(Color.White))
+                            for (int i = 0; i < 4; i++) g.FillRectangle(w, 3 + i * 4, 10, 3, 3);
+                        using (SolidBrush l = new SolidBrush(Color.FromArgb(120, 230, 120))) g.FillRectangle(l, 3, 7, 2, 2);
+                        break;
+                    case "ap":
+                    case "wlangroup":
+                        Color c = Color.FromArgb(130, 70, 200);
+                        using (SolidBrush b = new SolidBrush(c)) g.FillEllipse(b, 8, 14, 4, 4);
+                        using (Pen p = new Pen(c, 2))
+                        {
+                            g.DrawArc(p, 5, 10, 10, 10, 225, 90);
+                            g.DrawArc(p, 2, 6, 16, 16, 225, 90);
+                            if (kind == "ap") g.DrawArc(p, -1, 2, 22, 22, 225, 90);
+                        }
+                        if (kind == "ap") using (SolidBrush b = new SolidBrush(c)) g.FillRectangle(b, 6, 18, 8, 2);
+                        break;
+                    case "device":
+                        using (SolidBrush b = new SolidBrush(Color.FromArgb(70, 75, 85))) { g.FillRectangle(b, 2, 3, 16, 11); g.FillRectangle(b, 8, 14, 4, 3); g.FillRectangle(b, 5, 17, 10, 2); }
+                        using (SolidBrush s = new SolidBrush(Color.FromArgb(150, 200, 240))) g.FillRectangle(s, 4, 5, 12, 7);
+                        break;
+                    case "wlan":
+                        using (SolidBrush b = new SolidBrush(Color.SteelBlue)) g.FillRectangle(b, 6, 2, 9, 16);
+                        using (SolidBrush s = new SolidBrush(Color.FromArgb(200, 225, 245))) g.FillRectangle(s, 7, 4, 7, 11);
+                        using (SolidBrush w = new SolidBrush(Color.White)) g.FillEllipse(w, 9.5f, 15.5f, 2, 2);
+                        break;
+                    case "group":
+                        using (SolidBrush b = new SolidBrush(Color.FromArgb(200, 170, 90))) { g.FillRectangle(b, 2, 4, 7, 3); g.FillRectangle(b, 2, 6, 16, 11); }
+                        break;
+                }
+            }
+            return bmp;
+        }
+    }
+
+    /// <summary>
+    /// Netzwerk-Dokumentation für den Kunden als eine HTML-Datei (im Browser öffnen, als PDF drucken):
+    /// Zusammenfassung, Handlungsbedarf, Netzwerkplan, Infrastruktur, Port-Belegung, WLAN, Geräte, Ausfälle.
+    /// </summary>
+    static class DocExport
+    {
+        public class Options
+        {
+            public string Customer = "", Site = "", Author = "";
+            public int Days = 7;
+            public bool Devices = true, Macs = true, Ports = true;
+        }
+
+        public static void Run(IWin32Window owner, List<SwitchState> switches, UniFiSnapshot uf, List<PingTarget> devices)
+        {
+            Options o = Ask(owner);
+            if (o == null) return;
+            using (SaveFileDialog d = new SaveFileDialog())
+            {
+                d.Filter = "HTML-Dokument (*.html)|*.html";
+                string name = o.Customer.Length > 0 ? o.Customer : "Netzwerk";
+                foreach (char c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
+                d.FileName = "Netzwerkdokumentation_" + name + "_" + DateTime.Now.ToString("yyyy-MM-dd") + ".html";
+                if (d.ShowDialog(owner) != DialogResult.OK) return;
+                try
+                {
+                    File.WriteAllText(d.FileName, Build(o, switches, uf, devices), new UTF8Encoding(true));
+                    try { System.Diagnostics.Process.Start(d.FileName); } catch { }
+                }
+                catch (Exception ex) { MessageBox.Show(owner, ex.Message, "Dokumentation", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            }
+        }
+
+        static Options Ask(IWin32Window owner)
+        {
+            Dictionary<string, string> st = Config.LoadSettings();
+            using (Form f = new Form())
+            {
+                f.Text = "Dokumentation exportieren";
+                f.Font = new Font("Segoe UI", 9.5F);
+                f.FormBorderStyle = FormBorderStyle.FixedDialog;
+                f.MaximizeBox = f.MinimizeBox = false;
+                f.StartPosition = FormStartPosition.CenterParent;
+                f.AutoSize = true;
+                f.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+                TableLayoutPanel t = new TableLayoutPanel();
+                t.ColumnCount = 2; t.AutoSize = true; t.Padding = new Padding(12);
+                TextBox cust = Row(t, 0, "Kunde:", Config.Get(st, "Doku.Kunde", ""));
+                TextBox site = Row(t, 1, "Standort:", Config.Get(st, "Doku.Standort", ""));
+                TextBox auth = Row(t, 2, "Erstellt von:", Config.Get(st, "Doku.Ersteller", ""));
+                Label ld = new Label(); ld.Text = "Ausfälle der letzten:"; ld.AutoSize = true; ld.Margin = new Padding(3, 7, 3, 3);
+                NumericUpDown days = new NumericUpDown(); days.Minimum = 1; days.Maximum = 365; days.Width = 60;
+                int dv; days.Value = int.TryParse(Config.Get(st, "Doku.Tage", "7"), out dv) ? Math.Max(1, Math.Min(365, dv)) : 7;
+                FlowLayoutPanel dp = new FlowLayoutPanel(); dp.AutoSize = true; dp.Margin = new Padding(0);
+                dp.Controls.Add(days);
+                Label lt = new Label(); lt.Text = "Tage"; lt.AutoSize = true; lt.Margin = new Padding(3, 7, 3, 3); dp.Controls.Add(lt);
+                t.Controls.Add(ld, 0, 3); t.Controls.Add(dp, 1, 3);
+                CheckBox cPorts = Chk(t, 4, "Port-Belegung aller Switches", true);
+                CheckBox cDev = Chk(t, 5, "Liste der überwachten Geräte", true);
+                CheckBox cMac = Chk(t, 6, "MAC-Adressen aufführen", true);
+                FlowLayoutPanel b = new FlowLayoutPanel(); b.AutoSize = true; b.Margin = new Padding(0, 10, 0, 0);
+                Button ok = new Button(); ok.Text = "Erstellen ..."; ok.AutoSize = true; ok.DialogResult = DialogResult.OK;
+                Button cancel = new Button(); cancel.Text = "Abbrechen"; cancel.AutoSize = true; cancel.DialogResult = DialogResult.Cancel;
+                b.Controls.Add(ok); b.Controls.Add(cancel);
+                t.Controls.Add(b, 0, 7); t.SetColumnSpan(b, 2);
+                Label hint = new Label(); hint.AutoSize = true; hint.MaximumSize = new Size(420, 0); hint.ForeColor = SystemColors.GrayText;
+                hint.Text = "Es entsteht eine HTML-Datei, die sich im Browser öffnet. Als PDF: im Browser \"Drucken\" -> \"Als PDF speichern\".";
+                t.Controls.Add(hint, 0, 8); t.SetColumnSpan(hint, 2);
+                f.Controls.Add(t);
+                f.AcceptButton = ok; f.CancelButton = cancel;
+                if (f.ShowDialog(owner) != DialogResult.OK) return null;
+                Options o = new Options();
+                o.Customer = cust.Text.Trim(); o.Site = site.Text.Trim(); o.Author = auth.Text.Trim(); o.Days = (int)days.Value;
+                o.Ports = cPorts.Checked; o.Devices = cDev.Checked; o.Macs = cMac.Checked;
+                Dictionary<string, string> save = new Dictionary<string, string>();
+                save["Doku.Kunde"] = o.Customer; save["Doku.Standort"] = o.Site; save["Doku.Ersteller"] = o.Author; save["Doku.Tage"] = o.Days.ToString();
+                try { Config.SaveSettings(save); } catch { }
+                return o;
+            }
+        }
+
+        static TextBox Row(TableLayoutPanel t, int r, string label, string value)
+        {
+            Label l = new Label(); l.Text = label; l.AutoSize = true; l.Margin = new Padding(3, 7, 3, 3);
+            TextBox x = new TextBox(); x.Text = value; x.Width = 300;
+            t.Controls.Add(l, 0, r); t.Controls.Add(x, 1, r);
+            return x;
+        }
+
+        static CheckBox Chk(TableLayoutPanel t, int r, string text, bool on)
+        {
+            CheckBox c = new CheckBox(); c.Text = text; c.Checked = on; c.AutoSize = true;
+            t.Controls.Add(c, 1, r);
+            return c;
+        }
+
+        static string H(string s)
+        {
+            return (s ?? "").Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
+        }
+
+        static readonly Dictionary<string, string> iconCache = new Dictionary<string, string>();
+
+        static string Icon(string key)
+        {
+            string uri;
+            if (!iconCache.TryGetValue(key, out uri))
+            {
+                using (Bitmap b = Icons.Draw(key, 40))
+                using (MemoryStream m = new MemoryStream())
+                {
+                    b.Save(m, System.Drawing.Imaging.ImageFormat.Png);
+                    uri = "data:image/png;base64," + Convert.ToBase64String(m.ToArray());
+                }
+                iconCache[key] = uri;
+            }
+            return "<img class=\"ic\" src=\"" + uri + "\" alt=\"\">";
+        }
+
+        static string Hex(Color c) { return "#" + c.R.ToString("X2") + c.G.ToString("X2") + c.B.ToString("X2"); }
+
+        static string Dot(int level, bool offline)
+        {
+            Color c = offline || level >= Finding.Problem ? Icons.Red : level >= Finding.Warning ? Icons.Yellow : level == Finding.Unknown ? Color.Silver : Icons.Green;
+            return "<span class=\"dot\" style=\"background:" + Hex(c) + "\"></span>";
+        }
+
+        static PingTarget View(PingTarget t) { return !t.Running && t.ServiceView != null ? t.ServiceView : t; }
+
+        public static string Build(Options o, List<SwitchState> switches, UniFiSnapshot uf, List<PingTarget> devices)
+        {
+            if (uf == null) uf = new UniFiSnapshot();
+            SwitchMonitor.FillMacs(devices, switches);
+            Dictionary<PingTarget, DeviceLink> links;
+            TopoNode root = Topology.Build(switches, devices, uf, out links);
+            List<SwitchState> sw = switches.FindAll(delegate (SwitchState x) { return x.Reachable || x.Polled; });
+            sw.Sort(delegate (SwitchState a, SwitchState b) { int k = KindOrder(a).CompareTo(KindOrder(b)); return k != 0 ? k : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase); });
+
+            StringBuilder h = new StringBuilder();
+            string title = "Netzwerkdokumentation" + (o.Customer.Length > 0 ? " " + o.Customer : "");
+            h.Append("<!DOCTYPE html><html lang=\"de\"><head><meta charset=\"utf-8\"><title>").Append(H(title)).Append("</title><style>");
+            h.Append("body{font-family:'Segoe UI',Arial,sans-serif;font-size:13px;color:#222;margin:24px auto;max-width:1100px;padding:0 16px}");
+            h.Append("h1{font-size:24px;margin:0 0 4px}h2{font-size:17px;border-bottom:2px solid #1e6ec8;padding-bottom:3px;margin-top:28px;page-break-after:avoid}");
+            h.Append("h3{font-size:14px;margin:18px 0 6px}.meta{color:#666;margin-bottom:16px}");
+            h.Append("table{border-collapse:collapse;width:100%;margin:6px 0 10px;page-break-inside:auto}tr{page-break-inside:avoid}");
+            h.Append("th,td{border:1px solid #d5d9e0;padding:4px 6px;text-align:left;vertical-align:top}th{background:#eef2f7}");
+            h.Append(".ic{width:18px;height:18px;vertical-align:middle;margin-right:5px}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}");
+            h.Append(".kpi{display:flex;flex-wrap:wrap;gap:10px}.kpi div{border:1px solid #d5d9e0;border-radius:6px;padding:8px 14px;min-width:120px}.kpi b{display:block;font-size:20px}");
+            h.Append("ul.tree{list-style:none;padding-left:0}ul.tree ul{list-style:none;padding-left:22px;border-left:1px dotted #aab}");
+            h.Append("ul.tree li{margin:2px 0}.n{display:inline-block;padding:2px 8px;border-radius:4px}.port{color:#777;font-size:12px;margin-right:6px}");
+            h.Append(".warn{background:#fff6d6}.prob{background:#fde2e2}.muted{color:#888}.small{font-size:12px;color:#555}");
+            h.Append("@media print{body{margin:0;max-width:none}h2{page-break-before:auto}a{color:#222;text-decoration:none}}");
+            h.Append("</style></head><body>");
+            h.Append("<h1>").Append(H(title)).Append("</h1><div class=\"meta\">");
+            if (o.Site.Length > 0) h.Append("Standort: ").Append(H(o.Site)).Append(" &nbsp;·&nbsp; ");
+            h.Append("Stand: ").Append(DateTime.Now.ToString("dd.MM.yyyy HH:mm"));
+            if (o.Author.Length > 0) h.Append(" &nbsp;·&nbsp; Erstellt von: ").Append(H(o.Author));
+            h.Append("</div>");
+
+            // --- Zusammenfassung
+            int nSw = sw.FindAll(delegate (SwitchState x) { return x.Kind == "Switch"; }).Count;
+            int nAp = sw.FindAll(delegate (SwitchState x) { return x.Kind == "Access Point"; }).Count;
+            int wlanClients = 0;
+            foreach (UniFiClientInfo c in uf.Clients) if (!c.Wired) wlanClients++;
+            List<string[]> issues = Issues(sw, devices, uf);
+            List<string[]> outages = Outages(o.Days, devices);
+            int outageCount = 0;
+            foreach (string[] r in outages) outageCount += int.Parse(r[2]);
+            h.Append("<h2>Zusammenfassung</h2><div class=\"kpi\">");
+            Kpi(h, nSw.ToString(), "Switches");
+            Kpi(h, nAp.ToString(), "Access Points");
+            Kpi(h, devices.Count.ToString(), "überwachte Geräte");
+            if (uf.Valid) Kpi(h, uf.Clients.Count + " / " + wlanClients, "Clients gesamt / WLAN");
+            Kpi(h, issues.Count.ToString(), "Auffälligkeiten");
+            Kpi(h, outageCount.ToString(), "Ausfälle (" + o.Days + " Tage)");
+            h.Append("</div>");
+            SwitchState fw = sw.Find(delegate (SwitchState x) { return x.Kind == "Firewall"; });
+            if (fw != null)
+                foreach (PortState p in fw.Ports.Values)
+                    if (p.IsWan) h.Append("<p>Internet (WAN ").Append(H(p.DisplayName)).Append("): ").Append(p.Up ? "Link aktiv" + (p.SpeedText.Length > 0 ? ", " + H(p.SpeedText) : "") : "<b>kein Link</b>").Append("</p>");
+
+            // --- Handlungsbedarf
+            h.Append("<h2>Auffälligkeiten und Handlungsbedarf</h2>");
+            if (issues.Count == 0) h.Append("<p>Zum Zeitpunkt der Erstellung keine Auffälligkeiten.</p>");
+            else
+            {
+                h.Append("<table><tr><th style=\"width:22%\">Wo</th><th style=\"width:20%\">Befund</th><th>Erläuterung / Empfehlung</th></tr>");
+                foreach (string[] r in issues)
+                    h.Append("<tr class=\"").Append(r[0] == "3" ? "prob" : "warn").Append("\"><td>").Append(H(r[1])).Append("</td><td><b>").Append(H(r[2]))
+                     .Append("</b></td><td>").Append(H(r[3]).Replace("\r\n", "<br>")).Append("</td></tr>");
+                h.Append("</table>");
+            }
+
+            // --- Netzwerkplan
+            h.Append("<h2>Netzwerkplan</h2><p class=\"small\">Verbindungen aus LLDP, MAC-Tabellen der Switches")
+             .Append(uf.Valid ? " und dem UniFi-Controller" : "").Append(". „?“ = vermutet.</p><ul class=\"tree\">");
+            Tree(h, root, o);
+            h.Append("</ul>");
+
+            // --- Infrastruktur
+            h.Append("<h2>Netzwerkkomponenten</h2><table><tr><th>Name</th><th>Typ</th><th>Modell / System</th><th>IP-Adresse</th>");
+            if (o.Macs) h.Append("<th>MAC</th>");
+            h.Append("<th>Anschluss</th><th>Ports aktiv</th><th>PoE</th><th>Zustand</th></tr>");
+            foreach (SwitchState s in sw)
+            {
+                int up = 0, all = 0;
+                double poe = 0;
+                foreach (PortState p in s.Ports.Values) { if (p.Wireless) continue; all++; if (p.Up) up++; if (p.PoeOn) poe += p.PoeWatts; }
+                UniFiDeviceInfo ud = uf.Devices.Find(delegate (UniFiDeviceInfo d) { return SwitchMonitor.Matches(s, d); });
+                h.Append("<tr><td>").Append(Icon(s.Kind == "Firewall" ? "gateway" : s.Kind == "Access Point" ? "ap" : "switch")).Append("<b>").Append(H(s.Name)).Append("</b></td><td>")
+                 .Append(H(s.Kind)).Append("</td><td>").Append(H(ud != null ? ud.Model + (ud.Version.Length > 0 ? ", FW " + ud.Version : "") : s.SysDescr)).Append("</td><td>")
+                 .Append(H(s.Address)).Append("</td>");
+                if (o.Macs) h.Append("<td>").Append(H(s.OwnMacs.Replace(",", ", "))).Append("</td>");
+                h.Append("<td>").Append(H(Uplink(s, links, devices, root))).Append("</td><td>").Append(s.Kind == "Access Point" ? "" : up + " / " + all)
+                 .Append("</td><td>").Append(poe > 0 ? poe.ToString("0.0") + " W" : "").Append("</td><td>")
+                 .Append(Dot(Worst(s), !s.Reachable)).Append(H(!s.Reachable ? (s.Error.Length > 0 ? s.Error : "nicht erreichbar") : Worst(s) >= Finding.Warning ? "auffällig" : "OK"))
+                 .Append(s.FromUniFi ? " <span class=\"muted\">(Daten: UniFi)</span>" : "").Append("</td></tr>");
+            }
+            h.Append("</table>");
+
+            // --- Port-Belegung
+            if (o.Ports)
+            {
+                h.Append("<h2>Port-Belegung</h2>");
+                foreach (SwitchState s in sw)
+                {
+                    if (s.Kind == "Access Point" || s.Kind == "Firewall") continue;
+                    List<PortState> ports = new List<PortState>(s.Ports.Values);
+                    ports.RemoveAll(delegate (PortState p) { return p.Wireless; });
+                    if (ports.Count == 0) continue;
+                    h.Append("<h3>").Append(Icon("switch")).Append(H(s.Name)).Append(" <span class=\"muted\">").Append(H(s.Address)).Append("</span></h3>");
+                    h.Append("<table><tr><th style=\"width:9%\">Port</th><th style=\"width:13%\">Link</th><th style=\"width:7%\">PoE</th><th>Angeschlossen</th><th style=\"width:22%\">Bewertung</th></tr>");
+                    foreach (PortState p in ports)
+                    {
+                        string att = Attached(p);
+                        h.Append("<tr").Append(p.Rating.Level >= Finding.Problem ? " class=\"prob\"" : p.Rating.Level >= Finding.Warning ? " class=\"warn\"" : "").Append("><td>")
+                         .Append(H(p.DisplayName)).Append(p.Alias.Length > 0 ? "<br><span class=\"small\">" + H(p.Alias) + "</span>" : "").Append("</td><td>")
+                         .Append(p.Up ? H(p.SpeedText.Length > 0 ? p.SpeedText : "aktiv") + (p.Duplex == 2 ? " (halb)" : "") : "<span class=\"muted\">aus</span>")
+                         .Append("</td><td>").Append(p.PoeOn && p.PoeWatts > 0 ? p.PoeWatts.ToString("0.0") + " W" : "").Append("</td><td>").Append(H(att))
+                         .Append("</td><td>").Append(p.Up || p.Rating.Level >= Finding.Warning ? Dot(p.Rating.Level, false) + H(Plain(p.Rating.Short)) : "").Append("</td></tr>");
+                    }
+                    h.Append("</table>");
+                }
+            }
+
+            // --- WLAN
+            if (uf.Valid && uf.Devices.Exists(delegate (UniFiDeviceInfo d) { return d.IsAp; }))
+            {
+                h.Append("<h2>WLAN</h2><table><tr><th>Access Point</th><th>Modell</th><th>IP-Adresse</th><th>Clients</th><th>SSIDs</th><th>Anschluss</th></tr>");
+                foreach (UniFiDeviceInfo ap in uf.Devices)
+                {
+                    if (!ap.IsAp) continue;
+                    int n = 0;
+                    List<string> ssids = new List<string>();
+                    foreach (UniFiClientInfo c in uf.Clients)
+                        if (!c.Wired && c.ApMac == ap.Mac) { n++; if (c.Essid.Length > 0 && !ssids.Contains(c.Essid)) ssids.Add(c.Essid); }
+                    UniFiDeviceInfo up = uf.Device(ap.UplinkMac);
+                    h.Append("<tr><td>").Append(Icon("ap")).Append(Dot(ap.Online ? Finding.Ok : Finding.Problem, !ap.Online)).Append("<b>").Append(H(ap.Name)).Append("</b></td><td>")
+                     .Append(H(ap.Model)).Append("</td><td>").Append(H(ap.Ip)).Append("</td><td>").Append(n).Append("</td><td>").Append(H(string.Join(", ", ssids.ToArray())))
+                     .Append("</td><td>").Append(H(up != null ? up.Name + (ap.UplinkPort > 0 ? " / Port " + ap.UplinkPort : "") : "")).Append(ap.UplinkSpeed > 0 ? " (" + ap.UplinkSpeed + " Mbit/s)" : "")
+                     .Append("</td></tr>");
+                }
+                h.Append("</table>");
+                List<string> rows = new List<string>();
+                foreach (PingTarget t in devices)
+                {
+                    UniFiClientInfo c = uf.Client(t.Mac, t.Host);
+                    if (c == null || c.Wired) continue;
+                    UniFiDeviceInfo ap = uf.Device(c.ApMac);
+                    int lvl = c.Signal != 0 && c.Signal <= -80 ? Finding.Problem : c.Signal != 0 && c.Signal <= -72 ? Finding.Warning : Finding.Ok;
+                    rows.Add("<tr><td>" + Icon("wlan") + H(t.Name) + "</td><td>" + H(ap != null ? ap.Name : c.ApMac) + "</td><td>" + H(c.Essid) + "</td><td>" +
+                        (c.Radio == "ng" ? "2,4 GHz" : c.Radio == "na" ? "5 GHz" : c.Radio == "6e" ? "6 GHz" : H(c.Radio)) + "</td><td>" + Dot(lvl, false) + H(c.SignalText) +
+                        "</td><td>" + (c.TxRate > 0 ? c.TxRate + " Mbit/s" : "") + "</td></tr>");
+                }
+                if (rows.Count > 0)
+                    h.Append("<h3>Überwachte WLAN-Geräte</h3><table><tr><th>Gerät</th><th>Access Point</th><th>SSID</th><th>Band</th><th>Signal</th><th>Datenrate</th></tr>")
+                     .Append(string.Join("", rows.ToArray())).Append("</table>");
+            }
+
+            // --- Geräte
+            if (o.Devices && devices.Count > 0)
+            {
+                h.Append("<h2>Überwachte Geräte</h2><table><tr><th>Name</th><th>IP-Adresse</th>");
+                if (o.Macs) h.Append("<th>MAC</th><th>Hersteller</th>");
+                h.Append("<th>Anschluss</th><th>Kommentar</th><th>Erreichbarkeit</th></tr>");
+                List<PingTarget> sorted = new List<PingTarget>(devices);
+                sorted.Sort(delegate (PingTarget a, PingTarget b) { return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase); });
+                foreach (PingTarget t in sorted)
+                {
+                    PingTarget v = View(t);
+                    DeviceLink l;
+                    links.TryGetValue(t, out l);
+                    string avail = v.Sent > 0 ? (100.0 * (v.Sent - v.Lost) / v.Sent).ToString("0.0") + " %" : "–";
+                    bool off = v.OutageStart.HasValue && v.OfflineMode, down = v.OutageStart.HasValue && !off;
+                    h.Append("<tr><td>").Append(Icon(l != null && l.Wlan ? "wlan" : "device")).Append(Dot(down ? Finding.Problem : off ? Finding.Unknown : Finding.Ok, down))
+                     .Append(H(t.Name)).Append("</td><td>").Append(H(t.Host)).Append("</td>");
+                    if (o.Macs) h.Append("<td>").Append(H(t.Mac)).Append("</td><td>").Append(H(t.Vendor)).Append("</td>");
+                    h.Append("<td>").Append(H(l != null ? l.Text + (l.Certain ? "" : " (vermutet)") : "")).Append("</td><td>").Append(H(t.Comment)).Append("</td><td>")
+                     .Append(down ? "<b>Ausfall</b>" : off ? "aus" : avail).Append("</td></tr>");
+                }
+                h.Append("</table>");
+            }
+
+            // --- Ausfälle
+            h.Append("<h2>Ausfälle der letzten ").Append(o.Days).Append(" Tage</h2>");
+            if (outages.Count == 0) h.Append("<p>Keine Ausfälle protokolliert.</p>");
+            else
+            {
+                h.Append("<table><tr><th>Gerät</th><th>Adresse</th><th>Ausfälle</th><th>Letzter Ausfall</th><th>Hinweis</th></tr>");
+                foreach (string[] r in outages)
+                    h.Append("<tr><td>").Append(H(r[0])).Append("</td><td>").Append(H(r[1])).Append("</td><td>").Append(r[2]).Append("</td><td>").Append(H(r[3]))
+                     .Append("</td><td>").Append(H(r[4])).Append("</td></tr>");
+                h.Append("</table>");
+            }
+            h.Append("<p class=\"small\" style=\"margin-top:30px\">Erstellt mit PingMonitor am ").Append(DateTime.Now.ToString("dd.MM.yyyy HH:mm"))
+             .Append(". Momentaufnahme - Werte wie Fehlerzähler und Erreichbarkeit beziehen sich auf den Überwachungszeitraum.</p>");
+            h.Append("</body></html>");
+            return h.ToString();
+        }
+
+        static int KindOrder(SwitchState s) { return s.Kind == "Firewall" ? 0 : s.Kind == "Switch" ? 1 : 2; }
+
+        static void Kpi(StringBuilder h, string value, string label)
+        {
+            h.Append("<div><b>").Append(H(value)).Append("</b>").Append(H(label)).Append("</div>");
+        }
+
+        static int Worst(SwitchState s)
+        {
+            int w = s.SysRating.Level > Finding.Ok ? s.SysRating.Level : Finding.Ok;
+            foreach (PortState p in s.Ports.Values) if (p.Rating.Level > w) w = p.Rating.Level;
+            return w;
+        }
+
+        /// <summary>Anschluss eines Switches/APs laut Netzwerkplan.</summary>
+        static string Uplink(SwitchState s, Dictionary<PingTarget, DeviceLink> links, List<PingTarget> devices, TopoNode root)
+        {
+            foreach (PingTarget t in devices)
+            {
+                DeviceLink l;
+                if (t.Host == s.Address && links.TryGetValue(t, out l)) return l.Text.StartsWith("LAN: ") ? l.Text.Substring(5) : l.Text;
+            }
+            string parent = "", port = "";
+            FindParent(root, null, s.Name + "  (" + s.Address + ")", ref parent, ref port);
+            return parent.Length > 0 ? parent + (port.Length > 0 ? " / " + port : "") : "";
+        }
+
+        static void FindParent(TopoNode n, TopoNode par, string key, ref string parent, ref string port)
+        {
+            if (par != null && n.Title.Contains(key) && parent.Length == 0)
+            {
+                int i = n.Title.LastIndexOf("  →  ");
+                port = i >= 0 ? n.Title.Substring(0, i).Trim().Trim('(', ')') : "";
+                string pt = par.Title;
+                int j = pt.LastIndexOf("  →  ");
+                if (j >= 0) pt = pt.Substring(j + 5);
+                int k = pt.IndexOf("  (");
+                parent = k > 0 ? pt.Substring(0, k) : pt;
+                return;
+            }
+            foreach (TopoNode c in n.Children) FindParent(c, n, key, ref parent, ref port);
+        }
+
+        static void Tree(StringBuilder h, TopoNode n, DocExport.Options o)
+        {
+            int i = n.Title.LastIndexOf("  →  ");
+            string prefix = i >= 0 ? n.Title.Substring(0, i).Trim() : "", main = i >= 0 ? n.Title.Substring(i + 5) : n.Title;
+            foreach (string t in new string[] { "  [Switch]", "  [Access Point]", "  [Gateway]" }) main = main.Replace(t, "");
+            if (prefix.StartsWith("(") && prefix.EndsWith(")")) prefix = "Uplink " + prefix.Trim('(', ')');
+            string key = Icons.KeyFor(n);
+            bool infra = n.Kind != "device" && n.Kind != "group";
+            h.Append("<li><span class=\"n\" style=\"background:").Append(Hex(Icons.Back(n))).Append("\">")
+             .Append(n.Kind != "group" ? Icon(key) : "").Append(n.Kind != "group" && n.Kind != "internet" ? Dot(n.Level, n.Offline) : "")
+             .Append(prefix.Length > 0 ? "<span class=\"port\">" + H(prefix) + "</span>" : "")
+             .Append(infra ? "<b>" + H(main) + "</b>" : H(main)).Append("</span>");
+            if (n.Children.Count > 0)
+            {
+                h.Append("<ul>");
+                foreach (TopoNode c in n.Children) Tree(h, c, o);
+                h.Append("</ul>");
+            }
+            h.Append("</li>");
+        }
+
+        /// <summary>Befunde mit Handlungsbedarf: Level ("2"/"3"), Ort, Befund, Erläuterung.</summary>
+        static List<string[]> Issues(List<SwitchState> sw, List<PingTarget> devices, UniFiSnapshot uf)
+        {
+            List<string[]> r = new List<string[]>();
+            foreach (SwitchState s in sw)
+            {
+                if (!s.Reachable && s.Polled)
+                    r.Add(new string[] { "3", s.Name + " (" + s.Address + ")", "nicht erreichbar", s.Error });
+                if (s.SysRating.Level >= Finding.Warning)
+                    r.Add(new string[] { s.SysRating.Level.ToString(), s.Name, Plain(s.SysRating.Short), Explain(s.SysRating) });
+                foreach (PortState p in s.Ports.Values)
+                    if (p.Rating.Level >= Finding.Warning)
+                        r.Add(new string[] { p.Rating.Level.ToString(), s.Name + " / " + p.DisplayName + " (" + Attached(p) + ")",
+                            Plain(p.Rating.Short), Explain(p.Rating) });
+            }
+            foreach (PingTarget t in devices)
+            {
+                PingTarget v = View(t);
+                if (v.OutageStart.HasValue && !v.OfflineMode)
+                    r.Add(new string[] { "3", t.Name + " (" + t.Host + ")", "derzeit nicht erreichbar", "seit " + v.OutageStart.Value.ToString("dd.MM. HH:mm") +
+                        (v.Diagnosis.Length > 0 ? " - " + v.Diagnosis : "") });
+                Assessment q = t.Running ? t.Quality.Evaluate() : t.ServiceView != null ? t.ServiceView.ServiceQuality : null;
+                if (q != null && q.Level >= Finding.Warning)
+                    r.Add(new string[] { q.Level.ToString(), t.Name + " (" + t.Host + ")", Plain(q.Short), Explain(q) });
+                UniFiClientInfo c = uf.Client(t.Mac, t.Host);
+                if (c != null && !c.Wired && c.Signal != 0 && c.Signal <= -75)
+                    r.Add(new string[] { c.Signal <= -80 ? "3" : "2", t.Name + " (WLAN)", "schwaches WLAN-Signal " + c.Signal + " dBm",
+                        "Das Gerät ist schlecht mit dem Access Point verbunden - Abbrüche und langsame Verbindung. Abhilfe: AP näher am Gerät, zusätzlicher AP oder Kabel." });
+            }
+            r.Sort(delegate (string[] a, string[] b) { return b[0].CompareTo(a[0]); });
+            return r;
+        }
+
+        /// <summary>Bewertungstext ohne Symbol ("▲ CRC-Fehler" -> "CRC-Fehler").</summary>
+        static string Plain(string shortText)
+        {
+            return (shortText ?? "").TrimStart('●', '▲', '✖', 'ⓘ', '–', '○', ' ');
+        }
+
+        /// <summary>Was hängt an einem Port (für Tabellen): Verbindungsrolle bzw. Geräte.</summary>
+        static string Attached(PortState p)
+        {
+            string att = p.RoleInfo.Length > 0 ? p.RoleInfo : p.DeviceNames.Length > 0 ? p.DeviceNames : p.Attached;
+            if (p.LldpName.Length > 0 && att.IndexOf(p.LldpName, StringComparison.OrdinalIgnoreCase) < 0) att += (att.Length > 0 ? " · " : "") + "LLDP: " + p.LldpName;
+            return att;
+        }
+
+        /// <summary>Erläuterung des wichtigsten Befunds einer Bewertung (ohne Messwerte und Links).</summary>
+        static string Explain(Assessment a)
+        {
+            string d = (a.Details ?? "").Replace("\r\n", "\n");
+            string head = System.Text.RegularExpressions.Regex.Replace(a.Short ?? "", @" \(\+\d+\)$", "");
+            int i = head.Length > 0 ? d.IndexOf(head + "\n") : -1;
+            if (i < 0) return First(a.Details);
+            string rest = d.Substring(i + head.Length + 1);
+            int end = rest.IndexOf("\n\n");
+            if (end >= 0) rest = rest.Substring(0, end);
+            List<string> keep = new List<string>();
+            foreach (string line in rest.Split('\n'))
+                if (!line.StartsWith("Mehr dazu") && !line.StartsWith("http")) keep.Add(line);
+            return string.Join("\r\n", keep.ToArray()).Trim();
+        }
+
+        static string First(string details)
+        {
+            if (string.IsNullOrEmpty(details)) return "";
+            // Erste Befund-Erläuterung (bis zur ersten Leerzeile), ohne Links
+            string d = details.Replace("\r\n\r\n", "\u0001");
+            int i = d.IndexOf('\u0001');
+            string s = (i > 0 ? d.Substring(0, i) : d).Replace("\u0001", "\r\n");
+            List<string> keep = new List<string>();
+            foreach (string line in s.Split(new string[] { "\r\n" }, StringSplitOptions.None))
+                if (!line.StartsWith("Mehr dazu") && !line.StartsWith("http")) keep.Add(line);
+            return string.Join("\r\n", keep.ToArray()).Trim();
+        }
+
+        /// <summary>Ausfälle je Gerät aus den Protokolldateien: Name, Adresse, Anzahl, letzter Ausfall, Hinweis.</summary>
+        static List<string[]> Outages(int days, List<PingTarget> devices)
+        {
+            Dictionary<string, string[]> map = new Dictionary<string, string[]>();
+            Dictionary<string, int> offline = new Dictionary<string, int>();
+            for (int i = days - 1; i >= 0; i--)
+            {
+                string file = CsvLog.FileFor(DateTime.Today.AddDays(-i));
+                if (!File.Exists(file)) continue;
+                string[] lines;
+                try { lines = Config.ReadAllLinesShared(file); } catch { continue; }
+                foreach (string line in lines)
+                {
+                    List<string> f = Fmt.ParseCsv(line.TrimStart('﻿'));
+                    if (f.Count < 4) continue;
+                    string key = f[1] + "|" + f[2];
+                    if (f[3] == global::PingMonitor.Outages.EvOutage)
+                    {
+                        string[] r;
+                        if (!map.TryGetValue(key, out r)) { r = new string[] { f[1], f[2], "0", "", "" }; map[key] = r; }
+                        r[2] = (int.Parse(r[2]) + 1).ToString();
+                        r[3] = f[0].Length >= 16 ? f[0].Substring(0, 16) : f[0];
+                    }
+                    else if (f[3] == global::PingMonitor.Outages.EvOffline)
+                    {
+                        int n;
+                        offline.TryGetValue(key, out n);
+                        offline[key] = n + 1;
+                    }
+                }
+            }
+            List<string[]> list = new List<string[]>(map.Values);
+            foreach (string[] r in list)
+            {
+                int n;
+                if (offline.TryGetValue(r[0] + "|" + r[1], out n) && n > 0) r[4] = n + "× davon als ausgeschaltet erkannt";
+                else if (int.Parse(r[2]) >= 5) r[4] = "häufig - Ursache prüfen (Kabel, WLAN, Energiesparen)";
+            }
+            list.Sort(delegate (string[] a, string[] b) { return int.Parse(b[2]).CompareTo(int.Parse(a[2])); });
+            return list;
         }
     }
 
@@ -8832,6 +10052,8 @@ namespace PingMonitor
         public string Mac = "", Ip = "", Name = "", ApMac = "", Essid = "", SwMac = "", Radio = "";
         public bool Wired;
         public int Signal, SwPort, Channel;
+        public int TxRate, RxRate;          // WLAN-Datenrate in Mbit/s (AP -> Client / Client -> AP)
+        public int Satisfaction = -1;       // UniFi-"Zufriedenheit" 0-100 %, -1 = unbekannt
 
         public string SignalText
         {
@@ -8843,15 +10065,62 @@ namespace PingMonitor
         }
     }
 
+    /// <summary>Port eines UniFi-Switches/APs/Gateways laut Controller (port_table).</summary>
+    class UniFiPort
+    {
+        public int Idx;
+        public string Name = "", Stp = "", Media = "";
+        public bool Up, FullDuplex, PoeOn, IsUplink;
+        public int Speed;
+        public double PoeWatts;
+        public long RxErr, TxErr, RxDrop, TxDrop, RxBytes = -1, TxBytes = -1, RxBcast = -1;
+    }
+
     class UniFiDeviceInfo
     {
         public string Mac = "", Ip = "", Name = "", Model = "", Type = "", UplinkMac = "";
         public int UplinkPort;
         public bool Online = true;
+        public string Version = "";
+        public long Uptime = -1;            // Sekunden seit dem Start
+        public int UplinkSpeed;             // Mbit/s der eigenen Uplink-Verbindung
+        public readonly List<UniFiPort> Ports = new List<UniFiPort>();
 
         public bool IsAp { get { return Type == "uap"; } }
         public bool IsGateway { get { return Type == "ugw" || Type == "udm" || Type == "uxg"; } }
         public string KindText { get { return IsAp ? "Access Point" : IsGateway ? "Gateway" : Type == "usw" ? "Switch" : Type; } }
+    }
+
+    class WlanSample
+    {
+        public DateTime Time;
+        public string Ap = "";
+        public int Signal, Rate, Satisfaction = -1;
+    }
+
+    /// <summary>WLAN-Verlauf eines überwachten Geräts: Messwerte je Abfrage und AP-Wechsel (24 h).</summary>
+    class WlanTrack
+    {
+        public readonly List<WlanSample> Samples = new List<WlanSample>();
+        public readonly List<DateTime> Roams = new List<DateTime>();
+
+        public string Summary(TimeSpan span)
+        {
+            DateTime from = DateTime.Now - span;
+            List<WlanSample> r = Samples.FindAll(delegate (WlanSample x) { return x.Time >= from && x.Signal != 0; });
+            if (r.Count == 0) return "";
+            int min = 0, sum = 0, rate = 0, rateN = 0;
+            List<string> aps = new List<string>();
+            foreach (WlanSample x in r)
+            {
+                if (min == 0 || x.Signal < min) min = x.Signal;
+                sum += x.Signal;
+                if (x.Rate > 0) { rate += x.Rate; rateN++; }
+                if (!aps.Contains(x.Ap)) aps.Add(x.Ap);
+            }
+            return "Signal Ø " + (sum / r.Count) + " dBm, schlechtester Wert " + min + " dBm" + (rateN > 0 ? ", Datenrate Ø " + (rate / rateN) + " Mbit/s" : "") +
+                ", APs: " + string.Join(", ", aps.ToArray()) + ", AP-Wechsel (24 h): " + Roams.Count;
+        }
     }
 
     class UniFiSnapshot
@@ -8860,6 +10129,7 @@ namespace PingMonitor
         public readonly List<UniFiDeviceInfo> Devices = new List<UniFiDeviceInfo>();
         public readonly List<KeyValuePair<string, string>> Sites = new List<KeyValuePair<string, string>>();   // interne Kennung -> Anzeigename
         public string Site = "";        // tatsächlich verwendete Site (interne Kennung)
+        public Dictionary<string, WlanTrack> History = new Dictionary<string, WlanTrack>();   // MAC -> WLAN-Verlauf (überwachte Geräte)
         public string Error = "";
         public DateTime Fetched = DateTime.MinValue;
 
@@ -8891,10 +10161,19 @@ namespace PingMonitor
             StringBuilder sb = new StringBuilder();
             sb.Append("UE;" + Fmt.Csv(Error) + ";" + (Fetched == DateTime.MinValue ? "" : Fetched.ToString(Fmt.Time)) + "\r\n");
             foreach (UniFiDeviceInfo d in Devices)
-                sb.Append(string.Join(";", new string[] { "UD", d.Mac, d.Ip, Fmt.Csv(d.Name), Fmt.Csv(d.Model), d.Type, d.UplinkMac, d.UplinkPort.ToString(), d.Online ? "1" : "0" })).Append("\r\n");
+                sb.Append(string.Join(";", new string[] { "UD", d.Mac, d.Ip, Fmt.Csv(d.Name), Fmt.Csv(d.Model), d.Type, d.UplinkMac, d.UplinkPort.ToString(), d.Online ? "1" : "0",
+                    Fmt.Csv(d.Version), d.Uptime.ToString(), d.UplinkSpeed.ToString() })).Append("\r\n");
             foreach (UniFiClientInfo c in Clients)
                 sb.Append(string.Join(";", new string[] { "UC", c.Mac, c.Ip, Fmt.Csv(c.Name), c.Wired ? "1" : "0", c.ApMac, Fmt.Csv(c.Essid), c.Signal.ToString(),
-                    c.SwMac, c.SwPort.ToString(), c.Radio, c.Channel.ToString() })).Append("\r\n");
+                    c.SwMac, c.SwPort.ToString(), c.Radio, c.Channel.ToString(), c.TxRate.ToString(), c.RxRate.ToString(), c.Satisfaction.ToString() })).Append("\r\n");
+            foreach (KeyValuePair<string, WlanTrack> kv in History)
+            {
+                List<string> sm = new List<string>(), ro = new List<string>();
+                foreach (WlanSample x in kv.Value.Samples)
+                    sm.Add(x.Time.ToString("yyyyMMddHHmmss") + "~" + x.Ap.Replace("~", " ").Replace("|", " ") + "~" + x.Signal + "~" + x.Rate + "~" + x.Satisfaction);
+                foreach (DateTime d in kv.Value.Roams) ro.Add(d.ToString("yyyyMMddHHmmss"));
+                sb.Append("UH;" + kv.Key + ";" + Fmt.Csv(string.Join("|", ro.ToArray())) + ";" + Fmt.Csv(string.Join("|", sm.ToArray()))).Append("\r\n");
+            }
             return sb.ToString();
         }
 
@@ -8916,6 +10195,7 @@ namespace PingMonitor
                     UniFiDeviceInfo d = new UniFiDeviceInfo();
                     d.Mac = f[1]; d.Ip = f[2]; d.Name = f[3]; d.Model = f[4]; d.Type = f[5]; d.UplinkMac = f[6];
                     int.TryParse(f[7], out d.UplinkPort); d.Online = f[8] == "1";
+                    if (f.Count >= 12) { d.Version = f[9]; long.TryParse(f[10], out d.Uptime); int.TryParse(f[11], out d.UplinkSpeed); }
                     u.Devices.Add(d);
                 }
                 else if (f[0] == "UC" && f.Count >= 12)
@@ -8923,7 +10203,25 @@ namespace PingMonitor
                     UniFiClientInfo c = new UniFiClientInfo();
                     c.Mac = f[1]; c.Ip = f[2]; c.Name = f[3]; c.Wired = f[4] == "1"; c.ApMac = f[5]; c.Essid = f[6];
                     int.TryParse(f[7], out c.Signal); c.SwMac = f[8]; int.TryParse(f[9], out c.SwPort); c.Radio = f[10]; int.TryParse(f[11], out c.Channel);
+                    if (f.Count >= 15) { int.TryParse(f[12], out c.TxRate); int.TryParse(f[13], out c.RxRate); int.TryParse(f[14], out c.Satisfaction); }
                     u.Clients.Add(c);
+                }
+                else if (f[0] == "UH" && f.Count >= 4)
+                {
+                    WlanTrack tr = new WlanTrack();
+                    DateTime d;
+                    foreach (string r in f[2].Split(new char[] { '|' }, StringSplitOptions.RemoveEmptyEntries))
+                        if (DateTime.TryParseExact(r, "yyyyMMddHHmmss", null, System.Globalization.DateTimeStyles.None, out d)) tr.Roams.Add(d);
+                    foreach (string r in f[3].Split(new char[] { '|' }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        string[] x = r.Split('~');
+                        if (x.Length < 5 || !DateTime.TryParseExact(x[0], "yyyyMMddHHmmss", null, System.Globalization.DateTimeStyles.None, out d)) continue;
+                        WlanSample smp = new WlanSample();
+                        smp.Time = d; smp.Ap = x[1];
+                        int.TryParse(x[2], out smp.Signal); int.TryParse(x[3], out smp.Rate); int.TryParse(x[4], out smp.Satisfaction);
+                        tr.Samples.Add(smp);
+                    }
+                    u.History[f[1]] = tr;
                 }
             }
             return u;
@@ -9084,11 +10382,39 @@ namespace PingMonitor
                 x.Name = Json.S(d, "name").Length > 0 ? Json.S(d, "name") : x.Model + " " + x.Ip;
                 x.Type = Json.S(d, "type");
                 x.Online = Json.N(d, "state", 1) == 1;
+                x.Version = Json.S(d, "version");
+                x.Uptime = (long)Json.N(d, "uptime", -1);
                 Dictionary<string, object> up = Json.Obj(d, "uplink") ?? Json.Obj(d, "last_uplink");
                 if (up != null)
                 {
                     x.UplinkMac = NetTools.MacHex(Json.S(up, "uplink_mac"));
                     x.UplinkPort = (int)Json.N(up, "uplink_remote_port", 0);
+                    x.UplinkSpeed = (int)Json.N(up, "speed", 0);
+                }
+                foreach (object po in Json.Arr(d, "port_table"))
+                {
+                    Dictionary<string, object> pt = po as Dictionary<string, object>;
+                    if (pt == null) continue;
+                    UniFiPort u = new UniFiPort();
+                    u.Idx = (int)Json.N(pt, "port_idx", 0);
+                    if (u.Idx <= 0) continue;
+                    u.Name = Json.S(pt, "name");
+                    u.Up = Json.B(pt, "up");
+                    u.Speed = (int)Json.N(pt, "speed", 0);
+                    u.FullDuplex = Json.B(pt, "full_duplex");
+                    u.PoeOn = Json.B(pt, "poe_enable") && Json.S(pt, "poe_mode") != "off";
+                    u.PoeWatts = Json.N(pt, "poe_power", 0);
+                    u.RxErr = (long)Json.N(pt, "rx_errors", 0);
+                    u.TxErr = (long)Json.N(pt, "tx_errors", 0);
+                    u.RxDrop = (long)Json.N(pt, "rx_dropped", 0);
+                    u.TxDrop = (long)Json.N(pt, "tx_dropped", 0);
+                    u.RxBytes = (long)Json.N(pt, "rx_bytes", -1);
+                    u.TxBytes = (long)Json.N(pt, "tx_bytes", -1);
+                    u.RxBcast = (long)Json.N(pt, "rx_broadcast", -1);
+                    u.Stp = Json.S(pt, "stp_state");
+                    u.IsUplink = Json.B(pt, "is_uplink");
+                    u.Media = Json.S(pt, "media");
+                    x.Ports.Add(u);
                 }
                 snap.Devices.Add(x);
             }
@@ -9113,6 +10439,9 @@ namespace PingMonitor
                 x.SwPort = (int)Json.N(c, "sw_port", 0);
                 x.Radio = Json.S(c, "radio");
                 x.Channel = (int)Json.N(c, "channel", 0);
+                x.TxRate = (int)(Json.N(c, "tx_rate", 0) / 1000);
+                x.RxRate = (int)(Json.N(c, "rx_rate", 0) / 1000);
+                x.Satisfaction = (int)Json.N(c, "satisfaction", -1);
                 snap.Clients.Add(x);
             }
         }

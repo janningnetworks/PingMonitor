@@ -125,9 +125,18 @@ Netzwerkplan
 ------------
 Schaltfläche "Netzwerkplan ...": Baum Internet -> Gateway/Firewall -> Switches -> Access Points -> Geräte.
 - Verbindungen zwischen Switches über LLDP (direkte Nachbarn), sonst aus den MAC-Tabellen abgeleitet.
-- Geräte erscheinen an ihrem Port; WLAN-Geräte (vermutet) unter dem Access Point.
-- Farben: rot = Ausfall, grau = offline/ausgeschaltet, hinterlegt = auffälliger Port, blau = WLAN.
-- "Als Text kopieren" für Dokumentation/E-Mail. Doppelklick auf ein Gerät zeigt alle Details.
+- Geräte erscheinen an ihrem Port; WLAN-Geräte unter dem Access Point, zusammengefasst als
+  "n WLAN-Clients" (aufklappbar; klappt bei Problemen automatisch auf).
+- Symbole und Hintergrund je Typ: Firewall (orange), Switch (blau), Access Point (violett), Gerät per
+  Kabel (Monitor), Gerät per WLAN (Handy). Legende unten im Fenster.
+- Status-Punkt: grün = OK, gelb = Warnung, rot = Problem/Ausfall, grau = aus/unbekannt. Auffällige Geräte
+  sind zusätzlich farbig hinterlegt.
+- Rechts in grau: der Anschluss (Port, Uplink bzw. WLAN mit SSID und Signal) und bei zugeklappten
+  Einträgen die Anzahl der Geräte darunter.
+- Filter: Suchfeld (Name, IP, MAC, Kommentar), "Nur Switches/APs", "Nur Auffälligkeiten",
+  "WLAN-Geräte ausblenden". Zu Beginn sind nur Switches/APs aufgeklappt.
+- "Als Text kopieren" für E-Mail, "Dokumentation exportieren ..." für den Kunden (siehe unten).
+  Doppelklick auf ein Gerät zeigt alle Details.
 - Voraussetzung: Switches unter "Switches ..." eingetragen (SNMP). Ohne verwaltete Switches landen
   Geräte unter "Nicht zugeordnet".
 
@@ -218,6 +227,48 @@ klassischer Controller: https://name:8443), Benutzer, Passwort, Site.
 Ergebnis: Geräte stehen am richtigen Switch-Port ("LAN: USW Büro / Port 3"), WLAN-Geräte am richtigen AP
 ("WLAN: U6-Pro Büro · SSID · -58 dBm"), die UniFi-Switches/APs sind laut Controller verkabelt (Uplink-Port),
 auch UniFi-Geräte ohne SNMP-Eintrag erscheinen im Netzwerkplan (offline beim Controller wird markiert).
+
+UniFi: Port-Daten, Ereignisse und WLAN-Verlauf
+----------------------------------------------
+Mit eingerichtetem UniFi-Controller zusätzlich:
+  - Port-Daten ohne SNMP: UniFi-Switches/APs, die NICHT unter "Switches" eingetragen sind, werden mit allen
+    Ports aus dem Controller übernommen (Link, Geschwindigkeit, Duplex, Fehler-/Verwurfzähler, Datenrate,
+    PoE-Leistung, Spanning Tree) und genauso bewertet wie per SNMP abgefragte (Spalte Community: "(UniFi)").
+    Bei per SNMP eingetragenen UniFi-Switches werden PoE-Leistung und STP-Zustand ergänzt.
+  - Ereignisse im Ausfallprotokoll (Quelle "UniFi"): UniFi-Gerät offline/wieder online, neu gestartet,
+    Firmware geändert, Uplink geändert oder langsamer geworden; für überwachte Geräte: WLAN verbunden/
+    getrennt, AP-Wechsel (Roaming), WLAN-Signal sehr schwach (<= -80 dBm) / wieder ausreichend,
+    LAN-Anschluss geändert. So stehen Ping-Ausfälle und UniFi-Ereignisse in EINER Zeitleiste.
+  - WLAN-Verlauf je überwachtem Gerät (Doppelklick -> Abschnitt "WLAN"): AP, SSID, Band/Kanal, Signal,
+    Datenrate, UniFi-Zufriedenheit, Durchschnitt/schlechtester Wert der letzten Stunde, AP-Wechsel in 24 h,
+    letzte Messwerte und eine Bewertung (schwaches Signal, niedrige Datenrate, Ping-Pong zwischen APs,
+    nur 2,4 GHz). Der Verlauf liegt im Speicher des Dienstes bzw. der App (nach Neustart beginnt er neu).
+  - Ausfall-Diagnose: "WLAN weiterhin verbunden, Signal ..." bzw. "nicht mehr im WLAN angemeldet
+    (zuletzt AP X, -82 dBm)" - trennt Funkprobleme von Geräteproblemen.
+
+Schleifen, Spanning Tree, langsame Verbindungen
+-----------------------------------------------
+  - Broadcast-Sturm: Broadcasts pro Sekunde je Port (SNMP bzw. UniFi). Ab 300/s Warnung, ab 2000/s
+    Problem "Broadcast-Sturm" - fast immer eine Netzwerkschleife.
+  - Spanning Tree: Topologieänderungen werden protokolliert; ab 3 pro Stunde Warnung am Switch
+    (Spalte "System"). Ports im Zustand "blocking" werden als "STP blockiert" (Schleife/redundant) markiert.
+  - Verbindung zwischen Switches bzw. zu einem Access Point mit nur 10/100 Mbit/s: Warnung (Engpass,
+    meist ein defektes Adernpaar).
+
+Dokumentation für den Kunden
+----------------------------
+"Dokumentation ..." (Hauptfenster) bzw. "Dokumentation exportieren ..." (Netzwerkplan): Kunde, Standort,
+Ersteller und Zeitraum eingeben -> HTML-Datei, die sich im Browser öffnet. Als PDF: im Browser
+"Drucken" -> "Als PDF speichern". Inhalt:
+  - Zusammenfassung (Anzahl Switches, APs, Geräte, Clients, Auffälligkeiten, Ausfälle; Internet-Link)
+  - Auffälligkeiten und Handlungsbedarf mit Erläuterung und Empfehlung
+  - Netzwerkplan mit Symbolen und Status
+  - Netzwerkkomponenten (Typ, Modell, Firmware, IP, MAC, Anschluss, aktive Ports, PoE gesamt)
+  - Port-Belegung je Switch (Link, PoE, Angeschlossen, Bewertung) - abschaltbar
+  - WLAN: Access Points mit Clients/SSIDs/Anschluss, überwachte WLAN-Geräte mit Signal - mit UniFi
+  - Überwachte Geräte (IP, MAC, Hersteller, Anschluss, Kommentar, Erreichbarkeit) - abschaltbar
+  - Ausfälle der letzten n Tage je Gerät (aus den Protokolldateien)
+Die Angaben werden für den nächsten Export gemerkt (settings.txt).
 
 Diagnosedaten speichern
 -----------------------
