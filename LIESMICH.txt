@@ -259,6 +259,50 @@ Arbeitsablauf (oben im Hauptfenster)
   5 Auswerten           Netzwerkplan, Dokumentation; Anzahl Probleme/Warnungen (unter 24 h als vorläufig markiert).
 Die Karten zeigen erledigt (grün), nächster Schritt (gelb) und offene Schritte.
 
+Datenquellen, Vorrang und Widersprüche
+--------------------------------------
+Arbeitsablauf Schritt 1 -> "Quellen ...": Zustand und Alter jeder Quelle (Switches per SNMP/UniFi, UniFi-Controller,
+OPNsense-API, Syslog-Empfang, Agenten, Windows-Ereignisse, Weiterleitung), aktuelle Widersprüche und die Vorrangregeln.
+Grundsatz: eigene Messung jetzt > Live-Zustand des Geräts (SNMP) > Wissen des Controllers > Konfiguration > alte Daten
+> Vermutung. Im Einzelnen:
+  - Erreichbarkeit: Ping/ARP dieses PCs; Controller und Switch-Link ergänzen die Diagnose.
+  - Port-Zustand, Fehlerzähler, VLAN-Ist, Spanning Tree: SNMP; UniFi nur, wo kein SNMP vorhanden ist.
+  - Standort eines Geräts: UniFi > Endgeräte-Port der MAC-Tabelle (LLDP für Switch-Verbindungen) > zuletzt gesehen
+    > Rückschluss > Vermutung. Die Herkunft steht in der Spalte "Verbindung" (· UniFi, · MAC-Tabelle, · LLDP, · Rückschluss).
+  - MAC zu einer IP: aktuelle ARP-Tabelle > DHCP-Lease > Geräteliste.
+Veraltete Daten (Switch/Controller antwortet nicht, Dienst schreibt seit > 5 min nicht) werden als "Daten veraltet"
+angezeigt und nicht bewertet.
+Widersprüche (Ausfallprotokoll "Widerspruch: ...", Dokumentation, Schritt 5) - erst nach zwei Abfragerunden:
+  - Standort laut UniFi ≠ Endgeräte-Port in der MAC-Tabelle (umgesteckt, unverwalteter Switch, Schleife)
+  - andere echte MAC unter einer bekannten IP (neu vergeben oder IP-Konflikt)
+  - LLDP-Nachbar ≠ MAC-Tabelle (zwei Verbindungen, Switch dazwischen)
+  - VLAN laut UniFi-Konfiguration ≠ VLAN laut Switch (Provisionierung)
+  - Controller meldet online, SNMP antwortet nicht (SNMP/Community) bzw. umgekehrt (Inform/Adoption)
+  - Port-Geschwindigkeit UniFi ≠ SNMP
+Ist die beteiligte Quelle gerade nicht erreichbar, bleibt ein Widerspruch bestehen (nicht "aufgelöst").
+Mitschnitt: Die Uhrzeit-Abweichung zwischen Mitschnitt und diesem PC wird aus DHCP-Bestätigungen ermittelt, die im
+Mitschnitt UND im Syslog des DHCP-Servers stehen, und beim Abgleich mit dem Ausfallprotokoll herausgerechnet.
+
+Protokoll, Weiterleitung (SIEM), Aufbewahrung
+---------------------------------------------
+"Protokoll / Weiterleitung ...":
+  - Aufbewahrung in Tagen (Standard 90, 0 = unbegrenzt): ältere Ausfallprotokolle und Syslog-Dateien werden
+    automatisch gelöscht.
+  - Weiterleitung jedes Protokolleintrags per Syslog (UDP, RFC 5424, Facility local0) an Graylog, Wazuh, Elastic,
+    Splunk o. Ä.: strukturierte Daten [pm@32473 name host source level], Meldung "Ereignis | Details".
+    Mindeststufe wählbar (alles / Info+ / Warnungen+ / nur Probleme). "Testmeldung senden".
+  - Datenschutz: WLAN-An-/Abmeldungen und Windows-Ereignisse von Arbeitsplätzen sind personenbezogen - dauerhafte
+    Aufzeichnung beim Kunden absprechen (DSGVO, ggf. Betriebsrat § 87 Abs. 1 Nr. 6 BetrVG), Aufbewahrung kurz halten.
+
+Agent-Modus (Windows-Ereignisse anderer PCs)
+--------------------------------------------
+Auf einem Problem-PC: "Protokoll / Weiterleitung ..." -> IP der Zentrale eintragen -> "Diesen PC als Agent
+einrichten ..." oder per Skript/GPO:  PingMonitor.exe /agent <IP-der-Zentrale>[:Port] /quiet
+Der Agent (PingMonitor-Dienst) liest das Ereignisprotokoll und die Netzwerkkarten-Einstellungen dieses PCs und
+schickt relevante Ereignisse, Netzwerkkarten-Befunde (alle 6 h bei Änderung) und ein tägliches Lebenszeichen per
+Syslog an die Zentrale. Dort (Syslog-Empfang einschalten) erscheinen sie im Ausfallprotokoll mit Quelle
+"Agent <PC>" und unter "Quellen ..." mit dem letzten Lebenszeichen. Keine Fremdsoftware nötig.
+
 Syslog-Empfang
 --------------
 "Switches ..." -> "Syslog ...": Empfang einschalten (UDP, Standard-Port 514). In den Geräten die IP dieses PCs (bzw. des

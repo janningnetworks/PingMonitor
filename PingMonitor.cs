@@ -57,6 +57,10 @@ namespace PingMonitor
                 case "start":
                 case "stop":
                     return ServiceSetup.RunCommand(cmd, quiet);
+                case "agent":
+                    if (args.Length < 2 || args[1].StartsWith("/")) { Console.WriteLine("Aufruf: PingMonitor.exe /agent <IP-der-Zentrale>[:Port] [/quiet]"); return 1; }
+                    Agent.Setup(args[1]);
+                    return ServiceSetup.RunCommand("install", quiet);
                 default:
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
@@ -575,6 +579,7 @@ namespace PingMonitor
 
         public static void Write(LogEntry e)
         {
+            LogForward.Send(e);
             string line = string.Join(";", new string[] {
                 e.Time.ToString(Fmt.Time), Fmt.Csv(e.Name), Fmt.Csv(e.Host),
                 Fmt.Csv(e.Event), Fmt.Csv(e.Info), Fmt.Csv(e.Source) }) + "\r\n";
@@ -1773,6 +1778,10 @@ namespace PingMonitor
                 TrySave(delegate { Config.SaveSettings(d); });
             };
             actions.Controls.Add(chkLarge);
+            actions.Controls.Add(NewButton("Protokoll / Weiterleitung ...", delegate
+            {
+                using (LogSettingsForm f = new LogSettingsForm()) f.ShowDialog(this);
+            }));
             actions.Controls.Add(NewButton("Diesen PC prüfen ...", delegate
             {
                 Cursor = Cursors.WaitCursor;
@@ -1916,13 +1925,13 @@ namespace PingMonitor
             lblLogPath.Text = "Logdatei: " + CsvLog.CurrentFile;
 
             workflow = new WorkflowPanel(new Action[][] {
-                new Action[] { OpenSwitches },
+                new Action[] { OpenSwitches, ShowSources },
                 new Action[] { ScanNetwork },
                 new Action[] { delegate { StartTargets(targets); }, delegate { if (!svcStatus.HasValue) ServiceCommand("install"); else if (svcStatus == ServiceControllerStatus.Stopped) ServiceCommand("start"); else MessageBox.Show(this, "Der Dienst läuft bereits.", Text); } },
                 new Action[] { ShowMilestones },
                 new Action[] { OpenTopology, OpenDoc } },
                 new string[][] {
-                new string[] { "Switches / Controller ..." },
+                new string[] { "Switches / Controller ...", "Quellen ..." },
                 new string[] { "Netzwerk scannen ..." },
                 new string[] { "Alle starten", "Als Dienst ..." },
                 new string[] { "Was ist wann aussagekräftig?" },
@@ -1962,6 +1971,68 @@ namespace PingMonitor
         bool NetworkKnown { get { return SwitchMonitor.LoadConfig().Count > 0 || UniFi.Configured; } }
 
         TimeSpan pingTime, switchTime;
+
+        /// <summary>Übersicht aller Datenquellen mit Zustand und Alter, Vorrangregeln und aktuellen Widersprüchen.</summary>
+        void ShowSources()
+        {
+            bool svc = svcStatus == ServiceControllerStatus.Running;
+            StringBuilder sb = new StringBuilder();
+            Func<DateTime, string> age = delegate (DateTime t) { return t == DateTime.MinValue ? "nie" : "vor " + Milestones.Fmt(DateTime.Now - t); };
+            DateTime stand = SwitchMonitor.Stand(svc);
+            sb.AppendLine("Abfrage durch: " + (svc ? "Windows-Dienst" : SwitchMonitor.Running ? "diese App" : "– (läuft nicht)") + ",  letzter Stand " + age(stand) +
+                (stand != DateTime.MinValue && DateTime.Now - stand > TimeSpan.FromMinutes(5) ? "   ✖ VERALTET" : ""));
+            sb.AppendLine();
+            sb.AppendLine("=== QUELLEN ===");
+            foreach (SwitchState s in SwitchMonitor.Current(svc))
+                sb.AppendLine((s.Reachable ? "✓ " : "✖ ") + s.Name + " (" + s.Address + ")  " + (s.FromUniFi ? "UniFi-Controller" : "SNMP") + ", " + s.Kind +
+                    ",  letzte Abfrage " + age(s.LastPoll) + (s.Error.Length > 0 ? "  - " + s.Error : ""));
+            UniFiSnapshot uf = SwitchMonitor.CurrentUniFi(svc);
+            sb.AppendLine((!UniFi.Configured ? "– " : uf.Valid ? "✓ " : "✖ ") + "UniFi-Controller: " + (!UniFi.Configured ? "nicht eingerichtet" :
+                uf.Valid ? uf.Devices.Count + " Geräte, " + uf.Clients.Count + " Clients, abgefragt " + age(uf.Fetched) : "Fehler: " + uf.Error));
+            OpnSnapshot o = SwitchMonitor.CurrentOpn(svc);
+            sb.AppendLine((!Opn.Configured ? "– " : o.Valid ? "✓ " : "✖ ") + "OPNsense-API: " + (!Opn.Configured ? "nicht eingerichtet" :
+                o.Valid ? o.Gateways.Count + " Gateways, " + o.Leases.Count + " Leases, " + o.Arp.Count + " ARP, abgefragt " + age(o.Fetched) : "Fehler: " + o.Error));
+            string[] lines = SwitchMonitor.Lines(svc);
+            foreach (string l in lines)
+            {
+                List<string> f = Fmt.ParseCsv(l);
+                DateTime t = DateTime.MinValue;
+                if (f[0] == "SY" && f.Count >= 5)
+                {
+                    DateTime.TryParseExact(f[3], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out t);
+                    sb.AppendLine((f[1] == "1" ? "✓ " : Syslog.Enabled ? "✖ " : "– ") + "Syslog-Empfang: " + (f[1] == "1" ? f[2] + " Meldungen, zuletzt " + age(t) : Syslog.Enabled ? "aktiv, aber nicht empfangsbereit " + f[4] : "aus"));
+                }
+                else if (f[0] == "AG" && f.Count >= 4)
+                {
+                    DateTime.TryParseExact(f[3], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out t);
+                    sb.AppendLine((DateTime.Now - t < TimeSpan.FromHours(25) ? "✓ " : "✖ ") + "Agent " + f[1] + " (" + f[2] + "): letzte Meldung " + age(t));
+                }
+                else if (f[0] == "WE" && f.Count >= 3)
+                {
+                    DateTime.TryParseExact(f[2], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out t);
+                    sb.AppendLine((f[1] == "1" ? "✓ " : "– ") + "Windows-Ereignisse dieses PCs: " + (f[1] == "1" ? "gelesen " + age(t) : "aus"));
+                }
+            }
+            sb.AppendLine((LogForward.Target.Length > 0 ? "✓ " : "– ") + "Weiterleitung: " + (LogForward.Target.Length > 0 ? LogForward.Target + (LogForward.OnlyWindows ? " (nur Windows-Ereignisse, Agent)" : "") : "aus") +
+                ",  Aufbewahrung: " + (Retention.Days > 0 ? Retention.Days + " Tage" : "unbegrenzt"));
+            sb.AppendLine();
+            List<SwitchMonitor.Conflict> cs = SwitchMonitor.CurrentConflicts(svc);
+            sb.AppendLine("=== WIDERSPRÜCHE ZWISCHEN DEN QUELLEN (" + cs.Count + ") ===");
+            if (cs.Count == 0) sb.AppendLine("Keine - die Quellen passen zusammen.");
+            foreach (SwitchMonitor.Conflict c in cs)
+                sb.AppendLine((c.Level >= Finding.Warning ? "▲ " : "ⓘ ") + c.Title + "  (seit " + c.Since.ToString("dd.MM. HH:mm") + ")\r\n    " + c.Detail);
+            sb.AppendLine();
+            sb.AppendLine("=== WELCHE QUELLE GILT? ===");
+            sb.AppendLine("Grundsatz: eigene Messung jetzt > Live-Zustand des Geräts > Wissen des Controllers > Konfiguration > alte Daten > Vermutung.");
+            sb.AppendLine("• Erreichbarkeit: Ping/ARP dieses PCs; Controller und Switch-Link ergänzen die Diagnose.");
+            sb.AppendLine("• Port-Zustand, Fehlerzähler, VLAN-Ist, Spanning Tree: SNMP des Switches; UniFi nur, wenn kein SNMP vorhanden ist.");
+            sb.AppendLine("• Wo hängt ein Gerät: UniFi-Controller > Endgeräte-Port der MAC-Tabelle (LLDP für Switch-Verbindungen) > zuletzt gesehen > Rückschluss > Vermutung.");
+            sb.AppendLine("  Die Herkunft steht in der Spalte \"Verbindung\" (· UniFi, · MAC-Tabelle, · LLDP, · Rückschluss, \"vermutet\").");
+            sb.AppendLine("• MAC zu einer IP: aktuelle ARP-Tabelle > DHCP-Lease > Geräteliste. Weicht die Geräteliste ab, wird es als Widerspruch gemeldet.");
+            sb.AppendLine("• Veraltete Daten (Quelle antwortet nicht, Dienst schreibt nicht mehr) werden als \"veraltet\" angezeigt und nicht bewertet.");
+            sb.AppendLine("• Widersprüche werden erst gemeldet, wenn sie in zwei Abfragerunden hintereinander bestehen.");
+            HintForm.Show(this, "Datenquellen und Widersprüche", sb.ToString());
+        }
 
         void ShowMilestones()
         {
@@ -2021,8 +2092,9 @@ namespace PingMonitor
                 if (v.OutageStart.HasValue && !v.OfflineMode) prob++;
                 else if (t.QualityLevel >= Finding.Warning) warn++;
             }
+            int conf = SwitchMonitor.CurrentConflicts(svc).Count;
             string t5 = eff.TotalMinutes < 5 ? "Noch zu früh - erst nach einigen Minuten Messzeit." :
-                (prob + warn == 0 ? "Keine Auffälligkeiten." : prob + " Probleme, " + warn + " Warnungen") + (eff.TotalHours < 24 ? "\r\n(vorläufig - Messzeit unter 24 h)" : "");
+                (prob + warn == 0 ? "Keine Auffälligkeiten." : prob + " Probleme, " + warn + " Warnungen") + (conf > 0 ? ", " + conf + " Widersprüche (Quellen ...)" : "") + (eff.TotalHours < 24 ? "\r\n(vorläufig - Messzeit unter 24 h)" : "");
             int current = !step1 ? 0 : !step2 ? 1 : !step3 ? 2 : eff.TotalMinutes < 60 ? 3 : 4;
             workflow.SetState(0, step1 ? 2 : current == 0 ? 1 : 0, t1);
             workflow.SetState(1, step2 ? 2 : current == 1 ? 1 : 0, t2);
@@ -5092,6 +5164,9 @@ namespace PingMonitor
         public int Pvid;                 // ungetaggtes (natives) VLAN, 0 = unbekannt
         public readonly List<int> Tagged = new List<int>();   // getaggte VLANs
         public bool VlanFromSnmp;
+        public bool StpFromSnmp;
+        public int CfgPvid = -1, UniFiSpeed;            // laut UniFi-Konfiguration bzw. -Portliste (zum Abgleich mit SNMP)
+        public readonly List<int> CfgTagged = new List<int>();
         public readonly List<Finding> VlanIssues = new List<Finding>();
         public bool HasVlan { get { return Pvid > 0 || Tagged.Count > 0; } }
 
@@ -5186,6 +5261,7 @@ namespace PingMonitor
         public string Kind = "Switch";   // "Switch", "Access Point" oder "Firewall"
         public Dictionary<string, string> Arp = new Dictionary<string, string>();   // IP -> MAC (ARP-Tabelle der Firewall)
         public bool FromUniFi;           // nicht per SNMP abgefragt, Daten vom UniFi-Controller
+        public DateTime LastOk;          // letzte erfolgreiche Abfrage
         public Dictionary<int, string> VlanNames = new Dictionary<int, string>();
         public long StpChanges = -1;     // Zähler der Spanning-Tree-Topologieänderungen (SNMP)
         public readonly List<DateTime> StpTimes = new List<DateTime>();
@@ -5520,7 +5596,13 @@ namespace PingMonitor
                             SyncUniFi(u);
                             UniFiEvents(old, u);
                         }
-                        else u.History = old.History;
+                        else
+                        {
+                            u.History = old.History;
+                            lock (sync)
+                                foreach (SwitchState fs in switches)
+                                    if (fs.FromUniFi) { fs.Reachable = false; fs.Error = "UniFi-Controller nicht erreichbar - Daten veraltet"; }
+                        }
                         lock (sync) unifi = u;
                     }
                     else lock (sync) { unifi = new UniFiSnapshot(); switches.RemoveAll(delegate (SwitchState x) { return x.FromUniFi; }); }
@@ -5536,12 +5618,15 @@ namespace PingMonitor
                     if (Syslog.Enabled) { if (!Syslog.Running) Syslog.Start(owner); }
                     else if (Syslog.Running) Syslog.Stop();
                     try { WinEvents.Poll(owner); } catch { }
+                    try { Agent.Tick(owner); } catch { }
+                    try { Retention.Run(); } catch { }
                     AssignRoles();
                     CheckVlans();
                     MapDevices();
+                    try { CheckConsistency(); } catch { }
                     lock (sync) foreach (SwitchState s in switches) foreach (PortState p in s.Ports.Values) Evaluate(s, p);
                     // Anzeige und Statusdatei sehen nur vollständig abgeschlossene Abfragerunden.
-                    string snap = Serialize() + unifi.Serialize() + opn.Serialize();
+                    string snap = Serialize() + unifi.Serialize() + opn.Serialize() + StatusLines();
                     lock (sync) snapshot = snap;
                     if (writeStatus) WriteStatus(snap);
                 }
@@ -5614,6 +5699,7 @@ namespace PingMonitor
             }
             if (!s.Reachable && s.Polled) Event(s, null, "Switch wieder erreichbar", "");
             s.Reachable = true;
+            s.LastOk = now;
             s.Error = "";
             SnmpValue v;
             if (sys.TryGetValue(Snmp.SysName, out v)) s.SysName = v.Text;
@@ -5831,7 +5917,7 @@ namespace PingMonitor
                 {
                     int ifIndex = bridge.ContainsKey(kv.Key) ? (int)bridge[kv.Key].Number : kv.Key;
                     PortState p;
-                    if (s.Ports.TryGetValue(ifIndex, out p) && kv.Value.Number >= 1 && kv.Value.Number <= 6) p.Stp = names[kv.Value.Number];
+                    if (s.Ports.TryGetValue(ifIndex, out p) && kv.Value.Number >= 1 && kv.Value.Number <= 6) { p.Stp = names[kv.Value.Number]; p.StpFromSnmp = true; }
                 }
         }
 
@@ -6188,6 +6274,193 @@ namespace PingMonitor
 
         static string gatewayMac = "";
 
+        // ------------------------------------------------------------ Datenqualität: Widersprüche zwischen Quellen
+
+        public class Conflict { public string Key = "", Title = "", Detail = "", Ref = ""; public int Level; public DateTime Since; }
+        static readonly Dictionary<string, Conflict> conflicts = new Dictionary<string, Conflict>();
+        static readonly Dictionary<string, int> pending = new Dictionary<string, int>();
+
+        /// <summary>
+        /// Vergleicht die Quellen und meldet Widersprüche (erst wenn sie in zwei Abfragerunden hintereinander bestehen):
+        /// Standort laut UniFi ≠ MAC-Tabelle, andere MAC unter bekannter IP, LLDP ≠ MAC-Tabelle, VLAN-Konfiguration ≠ Ist,
+        /// Controller ≠ SNMP (erreichbar), Geschwindigkeit UniFi ≠ SNMP.
+        /// </summary>
+        static void CheckConsistency()
+        {
+            Dictionary<string, Conflict> found = new Dictionary<string, Conflict>();
+            List<PingTarget> hosts;
+            try { hosts = Config.LoadHosts(); } catch { hosts = new List<PingTarget>(); }
+            lock (sync)
+            {
+                List<SwitchState> snmp = switches.FindAll(delegate (SwitchState x) { return !x.FromUniFi && x.Reachable; });
+                foreach (PingTarget h in hosts)
+                {
+                    string mac = NetTools.MacHex(h.Mac);
+                    // 1. Standort: UniFi-Controller vs. Endgeräte-Port in der MAC-Tabelle
+                    UniFiClientInfo uc = unifi.Valid && mac.Length == 12 ? unifi.Client(mac, "") : null;
+                    if (uc != null && uc.Wired)
+                    {
+                        UniFiDeviceInfo ud = unifi.Device(uc.SwMac);
+                        foreach (SwitchState s in snmp)
+                            foreach (PortState p in s.Ports.Values)
+                            {
+                                if (p.Role != "" || p.Wireless || p.Macs.Count > 3 || !p.Macs.Exists(delegate (string m) { return NetTools.MacHex(m) == mac; })) continue;
+                                bool same = ud != null && Matches(s, ud) && PortByNumber(s, uc.SwPort) == p;
+                                if (same) continue;
+                                Add(found, "loc|" + mac + "|" + s.Address, Finding.Warning, "Standort von " + h.Name + " widersprüchlich",
+                                    "UniFi-Controller: " + (ud != null ? ud.Name : uc.SwMac) + " / Port " + uc.SwPort + ";  MAC-Tabelle von " + s.Name + ": Endgeräte-Port " +
+                                    p.DisplayName + ". Mögliche Ursachen: Gerät umgesteckt (eine Quelle noch alt), unverwalteter Switch/Dockingstation dazwischen, " +
+                                    "zwei Verbindungen (Schleife). Angezeigt wird die Angabe des Controllers.");
+                            }
+                    }
+                    // 2. Andere MAC unter bekannter IP (Geräteliste vs. ARP der Firewall)
+                    if (mac.Length == 12 && !Topology.RandomMac(mac))
+                    {
+                        string arp = "";
+                        foreach (SwitchState s in switches) { string a; if (s.Arp.TryGetValue(h.Host, out a)) arp = a; }
+                        if (arp.Length == 0) opn.Arp.TryGetValue(h.Host, out arp);
+                        if (!string.IsNullOrEmpty(arp) && arp.Length == 12 && arp != mac && !Topology.RandomMac(arp))
+                            Add(found, "mac|" + h.Host, Finding.Warning, "Anderes Gerät unter " + h.Host,
+                                h.Name + ": Geräteliste MAC " + Dashed(mac) + " (" + MacVendors.Lookup(mac) + "), ARP-Tabelle der Firewall jetzt " + Dashed(arp) + " (" +
+                                MacVendors.Lookup(arp) + "). Entweder hat DHCP die Adresse neu vergeben (dann \"Geräteinfo abrufen\" bzw. Gerät neu eintragen) " +
+                                "oder zwei Geräte benutzen dieselbe IP (Konflikt).");
+                    }
+                }
+                foreach (SwitchState a in snmp)
+                {
+                    UniFiDeviceInfo ud = unifi.Valid ? unifi.Devices.Find(delegate (UniFiDeviceInfo d) { return Matches(a, d); }) : null;
+                    foreach (PortState p in a.Ports.Values)
+                    {
+                        // 3. LLDP-Nachbar vs. MAC-Tabelle
+                        if (p.LldpName.Length > 0)
+                        {
+                            SwitchState b = switches.Find(delegate (SwitchState x) { return x != a && (string.Equals(x.SysName, p.LldpName, StringComparison.OrdinalIgnoreCase) || string.Equals(x.Name, p.LldpName, StringComparison.OrdinalIgnoreCase)); });
+                            PortState q = b != null ? PortToward(a, b) : null;
+                            if (q != null && q != p && !q.Wireless)
+                                Add(found, "lldp|" + a.Address + "|" + p.IfIndex, Finding.Warning, "LLDP und MAC-Tabelle widersprechen sich (" + a.Name + ")",
+                                    "LLDP meldet an " + a.Name + " / " + p.DisplayName + " den Nachbarn " + b.Name + ", die MAC-Tabelle sieht " + b.Name + " aber an " + q.DisplayName +
+                                    ". Mögliche Ursachen: zwei Verbindungen zwischen den Switches (Schleife, eine per STP gesperrt), unverwalteter Switch dazwischen, Kabel umgesteckt.");
+                        }
+                        // 4. VLAN laut UniFi-Konfiguration vs. laut Switch (SNMP)
+                        if (p.VlanFromSnmp && p.CfgPvid >= 0 && p.Up)
+                        {
+                            List<int> t1 = new List<int>(p.Tagged), t2 = new List<int>(p.CfgTagged);
+                            t1.Sort(); t2.Sort();
+                            bool nativeDiff = p.CfgPvid > 0 && p.Pvid > 0 && p.CfgPvid != p.Pvid;
+                            bool tagDiff = string.Join(",", t1.ConvertAll<string>(delegate (int v) { return v.ToString(); }).ToArray()) !=
+                                           string.Join(",", t2.ConvertAll<string>(delegate (int v) { return v.ToString(); }).ToArray());
+                            if (nativeDiff || tagDiff)
+                                Add(found, "vlan|" + a.Address + "|" + p.IfIndex, nativeDiff ? Finding.Warning : Finding.Info, "VLAN-Konfiguration nicht übernommen? (" + a.Name + " / " + p.DisplayName + ")",
+                                    "UniFi-Konfiguration: nativ " + p.CfgPvid + ", getaggt " + string.Join(",", t2.ConvertAll<string>(delegate (int v) { return v.ToString(); }).ToArray()) +
+                                    ";  Switch meldet: nativ " + p.Pvid + ", getaggt " + string.Join(",", t1.ConvertAll<string>(delegate (int v) { return v.ToString(); }).ToArray()) +
+                                    ". Provisionierung im Controller prüfen (Gerät \"Bereitstellung\"/Fehler). Für die Bewertung gilt der Ist-Zustand des Switches.");
+                        }
+                        // 6. Geschwindigkeit UniFi vs. SNMP
+                        if (p.Up && p.UniFiSpeed > 0 && p.SpeedMbps > 0 && p.UniFiSpeed != p.SpeedMbps)
+                            Add(found, "speed|" + a.Address + "|" + p.IfIndex, Finding.Info, "Geschwindigkeit widersprüchlich (" + a.Name + " / " + p.DisplayName + ")",
+                                "SNMP: " + p.SpeedMbps + " Mbit/s, UniFi: " + p.UniFiSpeed + " Mbit/s. Meist ein kurzfristiger Link-Neuaufbau zwischen den Abfragen; bleibt es, gilt der SNMP-Wert.");
+                    }
+                    // 5. Erreichbarkeit: Controller vs. SNMP (unten für nicht erreichbare)
+                    if (ud != null && !ud.Online)
+                        Add(found, "reach|" + a.Address, Finding.Warning, "Controller hat keine Verbindung zu " + a.Name,
+                            a.Name + " antwortet per SNMP, ist laut UniFi-Controller aber offline: Inform-Adresse/Adoption prüfen. Die Controller-Daten zu diesem Gerät sind veraltet.");
+                }
+                foreach (SwitchState a in switches)
+                {
+                    if (a.FromUniFi || a.Reachable || !a.Polled || !unifi.Valid) continue;
+                    UniFiDeviceInfo ud = unifi.Devices.Find(delegate (UniFiDeviceInfo d) { return Matches(a, d); });
+                    if (ud != null && ud.Online)
+                        Add(found, "reach|" + a.Address, Finding.Warning, "SNMP antwortet nicht: " + a.Name,
+                            "Laut UniFi-Controller ist " + a.Name + " online, per SNMP kommt keine Antwort: SNMP im Controller aktiviert? Community richtig? " +
+                            "Das Gerät selbst läuft - nur die Port-Überwachung ist blind.");
+                }
+                // nur Widersprüche melden, die zwei Runden hintereinander bestehen
+                List<string> keys = new List<string>(pending.Keys);
+                foreach (string k in keys) if (!found.ContainsKey(k)) pending.Remove(k);
+                foreach (KeyValuePair<string, Conflict> kv in found)
+                {
+                    int n; pending.TryGetValue(kv.Key, out n); pending[kv.Key] = n + 1;
+                    if (n + 1 < 2 || conflicts.ContainsKey(kv.Key)) { if (conflicts.ContainsKey(kv.Key)) { conflicts[kv.Key].Detail = kv.Value.Detail; } continue; }
+                    kv.Value.Since = DateTime.Now;
+                    conflicts[kv.Key] = kv.Value;
+                    LogQuality("Widerspruch: " + kv.Value.Title, kv.Value.Detail);
+                }
+                foreach (string k in new List<string>(conflicts.Keys))
+                {
+                    if (found.ContainsKey(k)) continue;
+                    // Ist die beteiligte Quelle gerade nicht erreichbar, lässt sich nichts prüfen - Widerspruch bleibt bestehen
+                    Conflict c = conflicts[k];
+                    if (c.Ref.Length > 0 && switches.Exists(delegate (SwitchState x) { return x.Address == c.Ref && !x.Reachable; })) continue;
+                    if (c.Key.StartsWith("loc|") && !unifi.Valid) continue;
+                    LogQuality("Widerspruch aufgelöst: " + c.Title, "");
+                    conflicts.Remove(k);
+                }
+            }
+        }
+
+        static void Add(Dictionary<string, Conflict> d, string key, int level, string title, string detail)
+        {
+            Conflict c = new Conflict(); c.Key = key; c.Level = level; c.Title = title; c.Detail = detail;
+            string[] k = key.Split('|');
+            if (k.Length >= 2 && (k[0] == "vlan" || k[0] == "lldp" || k[0] == "speed")) c.Ref = k[1];
+            if (k.Length >= 3 && k[0] == "loc") c.Ref = k[2];
+            d[key] = c;
+        }
+
+        static void LogQuality(string evt, string info)
+        {
+            LogEntry e = new LogEntry();
+            e.Time = DateTime.Now; e.Name = "Datenqualität"; e.Host = ""; e.Event = evt; e.Info = info;
+            e.Source = "Datenqualität (" + owner + ")";
+            try { CsvLog.Write(e); } catch { }
+        }
+
+        /// <summary>Status der Quellen (Syslog, Agenten, Windows-Ereignisse) und Widersprüche für die Oberfläche.</summary>
+        static string StatusLines()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("SY;" + (Syslog.Running ? "1" : "0") + ";" + Syslog.Received + ";" + (Syslog.LastReceived == DateTime.MinValue ? "" : Syslog.LastReceived.ToString(Fmt.Time)) +
+                ";" + Fmt.Csv(Syslog.Error) + "\r\n");
+            foreach (KeyValuePair<string, string[]> kv in Syslog.AgentList())
+                sb.Append("AG;" + Fmt.Csv(kv.Key) + ";" + kv.Value[0] + ";" + kv.Value[1] + "\r\n");
+            sb.Append("WE;" + (WinEvents.Enabled ? "1" : "0") + ";" + (WinEvents.LastPoll == DateTime.MinValue ? "" : WinEvents.LastPoll.ToString(Fmt.Time)) + "\r\n");
+            lock (sync)
+                foreach (Conflict c in conflicts.Values)
+                    sb.Append("C;" + c.Level + ";" + c.Since.ToString(Fmt.Time) + ";" + Fmt.Csv(c.Title) + ";" + Fmt.Csv(c.Detail) + "\r\n");
+            return sb.ToString();
+        }
+
+        public static string[] Lines(bool fromService) { try { return SnapshotLines(fromService); } catch { return new string[0]; } }
+
+        public static List<Conflict> CurrentConflicts(bool fromService)
+        {
+            List<Conflict> r = new List<Conflict>();
+            foreach (string l in Lines(fromService))
+            {
+                if (!l.StartsWith("C;")) continue;
+                List<string> f = Fmt.ParseCsv(l);
+                if (f.Count < 5) continue;
+                Conflict c = new Conflict();
+                int.TryParse(f[1], out c.Level);
+                DateTime.TryParseExact(f[2], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out c.Since);
+                c.Title = f[3]; c.Detail = f[4];
+                r.Add(c);
+            }
+            return r;
+        }
+
+        /// <summary>Alter der Daten des Dienstes (Zeitstempel "#Stand"), MinValue = unbekannt.</summary>
+        public static DateTime Stand(bool fromService)
+        {
+            foreach (string l in Lines(fromService))
+                if (l.StartsWith("#Stand;"))
+                {
+                    DateTime t;
+                    if (DateTime.TryParseExact(l.Substring(7).Trim(), Fmt.Time, null, System.Globalization.DateTimeStyles.None, out t)) return t;
+                }
+            return DateTime.MinValue;
+        }
+
         /// <summary>VLAN mit Namen (UniFi-Netzwerk bzw. Switch), z. B. "30 (Gäste)".</summary>
         public static string VlanLabel(int v, SwitchState s, UniFiSnapshot u)
         {
@@ -6325,8 +6598,13 @@ namespace PingMonitor
                             PortState p = PortByNumber(snmp, up.Idx);
                             if (p == null) continue;
                             p.PoeOn = up.PoeOn; p.PoeWatts = up.PoeWatts;
-                            if (up.Stp.Length > 0) p.Stp = up.Stp;
-                            if (up.VlanKnown && !p.VlanFromSnmp) { p.Pvid = up.NativeVlan; p.Tagged.Clear(); p.Tagged.AddRange(up.Tagged); }
+                            if (up.Stp.Length > 0 && !p.StpFromSnmp) p.Stp = up.Stp;
+                            p.UniFiSpeed = up.Up ? up.Speed : 0;
+                            if (up.VlanKnown)
+                            {
+                                p.CfgPvid = up.NativeVlan; p.CfgTagged.Clear(); p.CfgTagged.AddRange(up.Tagged);
+                                if (!p.VlanFromSnmp) { p.Pvid = up.NativeVlan; p.Tagged.Clear(); p.Tagged.AddRange(up.Tagged); }
+                            }
                         }
                         continue;
                     }
@@ -6344,6 +6622,7 @@ namespace PingMonitor
                     s.OwnMacs = Dashed(d.Mac);
                     s.HasFdb = true;
                     s.Reachable = d.Online;
+                    if (d.Online) s.LastOk = now;
                     s.Error = d.Online ? "" : "laut UniFi-Controller offline";
                     s.Polled = true;
                     s.LastPoll = now;
@@ -6651,6 +6930,16 @@ namespace PingMonitor
         static void Evaluate(SwitchState s, PortState p)
         {
             Assessment before = p.Rating;
+            if (!s.Reachable && s.Polled)
+            {
+                Assessment st = new Assessment();
+                st.Level = Finding.Unknown;
+                st.Short = "– Daten veraltet";
+                st.Details = "Keine aktuellen Daten von " + s.Name + ": " + s.Error + (s.LastOk != DateTime.MinValue ? " (letzte Antwort " + s.LastOk.ToString("dd.MM. HH:mm") + ")" : "") +
+                    ".\r\nZähler, Link und Zuordnung zeigen den letzten bekannten Stand und werden nicht bewertet.";
+                p.Rating = st;
+                return;
+            }
             if (p.Wireless)
             {
                 Assessment w = new Assessment();
@@ -6931,7 +7220,22 @@ namespace PingMonitor
             try
             {
                 if (fromService)
-                    return File.Exists(StatusFile) ? Deserialize(Config.ReadAllLinesShared(StatusFile)) : new List<SwitchState>();
+                {
+                    if (!File.Exists(StatusFile)) return new List<SwitchState>();
+                    string[] lines = Config.ReadAllLinesShared(StatusFile);
+                    List<SwitchState> list = Deserialize(lines);
+                    DateTime stand = DateTime.MinValue;
+                    foreach (string l in lines)
+                        if (l.StartsWith("#Stand;")) DateTime.TryParseExact(l.Substring(7).Trim(), Fmt.Time, null, System.Globalization.DateTimeStyles.None, out stand);
+                    if (stand != DateTime.MinValue && DateTime.Now - stand > TimeSpan.FromMinutes(5 + IntervalSeconds / 60))
+                        foreach (SwitchState x in list)
+                        {
+                            x.Reachable = false;
+                            x.Error = "Daten veraltet - der Dienst hat seit " + stand.ToString("dd.MM. HH:mm") + " nicht aktualisiert";
+                            foreach (PortState p in x.Ports.Values) { p.Rating = new Assessment(); p.Rating.Short = "– Daten veraltet"; p.Rating.Details = x.Error; }
+                        }
+                    return list;
+                }
                 string snap;
                 lock (sync) snap = running ? snapshot : "";
                 return Deserialize(snap.Split(new string[] { "\r\n" }, StringSplitOptions.RemoveEmptyEntries));
@@ -7967,7 +8271,7 @@ namespace PingMonitor
                     if (!uc.Wired)
                     {
                         string extra = (uc.Essid.Length > 0 ? " · " + uc.Essid : "") + (uc.SignalText.Length > 0 ? " · " + uc.SignalText : "");
-                        links[t] = Link("WLAN: " + where + extra, true, true);
+                        links[t] = Link("WLAN: " + where + extra + " · UniFi", true, true);
                         n.Wlan = true;
                         n.Title = "WLAN" + extra + "  →  " + n.Title;
                         if (uc.Signal != 0 && uc.Signal <= -80 && n.Level < Finding.Warning)
@@ -7978,7 +8282,7 @@ namespace PingMonitor
                     }
                     else
                     {
-                        links[t] = Link("LAN: " + where + (uc.SwPort > 0 ? " / Port " + uc.SwPort : ""), false, true);
+                        links[t] = Link("LAN: " + where + (uc.SwPort > 0 ? " / Port " + uc.SwPort : "") + " · UniFi", false, true);
                         n.Title = (uc.SwPort > 0 ? "Port " + uc.SwPort : "Port ?") + "  →  " + n.Title;
                         SwitchState hs;
                         PortState hp = ud != null && ufSwitch.TryGetValue(ud, out hs) ? SwitchMonitor.PortByNumber(hs, uc.SwPort) : null;
@@ -8074,7 +8378,7 @@ namespace PingMonitor
                     }
                     else
                     {
-                        links[t] = Link("LAN: " + nbName + " / Port ? (" + how + ")", false, false);
+                        links[t] = Link("LAN: " + nbName + " / Port ? (" + how + ") · Rückschluss", false, false);
                         n.Title = "Port ?  →  " + n.Title;
                     }
                     n.Tip += "\r\n" + how;
@@ -8101,7 +8405,8 @@ namespace PingMonitor
                 bool mob = MobileVendor(t.Vendor) && best.Port.Macs.Count > 1;
                 string many = best.Port.Macs.Count >= 3 && !rnd && !mob ? " (" + best.Port.Macs.Count + " Geräte am Port - dahinter vermutlich weiterer Switch/AP)" : "";
                 links[t] = Link("LAN: " + best.Switch.Name + " / " + best.Port.DisplayName +
-                    (rnd ? " (zufällige MAC - vermutlich WLAN über AP ohne SNMP)" : mob ? " (Mobilgerät - vermutlich WLAN über AP ohne SNMP)" : many), rnd || mob, !rnd && !mob && many.Length == 0);
+                    (rnd ? " (zufällige MAC - vermutlich WLAN über AP ohne SNMP)" : mob ? " (Mobilgerät - vermutlich WLAN über AP ohne SNMP)" : many) +
+                    (best.Port.LldpName.Length > 0 ? " · LLDP" : " · MAC-Tabelle"), rnd || mob, !rnd && !mob && many.Length == 0);
                 bool rndOrMob = rnd || mob;
                 n.Wlan = rndOrMob;
                 n.Title = best.Port.DisplayName + "  →  " + n.Title;
@@ -9314,6 +9619,8 @@ namespace PingMonitor
                     r.Add(new string[] { c.Signal <= -80 ? "3" : "2", t.Name + " (WLAN)", "schwaches WLAN-Signal " + c.Signal + " dBm",
                         "Das Gerät ist schlecht mit dem Access Point verbunden - Abbrüche und langsame Verbindung. Abhilfe: AP näher am Gerät, zusätzlicher AP oder Kabel." });
             }
+            foreach (SwitchMonitor.Conflict c in SwitchMonitor.CurrentConflicts(!SwitchMonitor.Running))
+                if (c.Level >= Finding.Warning) r.Add(new string[] { c.Level.ToString(), "Datenqualität", c.Title, c.Detail });
             r.Sort(delegate (string[] a, string[] b) { return b[0].CompareTo(a[0]); });
             return r;
         }
@@ -9418,6 +9725,13 @@ namespace PingMonitor
         static string owner = "";
         public static string Error = "";
         public static long Received;
+        public static DateTime LastReceived = DateTime.MinValue;
+        static readonly Dictionary<string, string[]> agents = new Dictionary<string, string[]>();   // PC -> IP, zuletzt
+
+        public static List<KeyValuePair<string, string[]>> AgentList()
+        {
+            lock (agents) return new List<KeyValuePair<string, string[]>>(agents);
+        }
         static readonly object sync = new object();
         static readonly Dictionary<string, Queue<DateTime>> rate = new Dictionary<string, Queue<DateTime>>();
         static readonly Dictionary<string, int> suppressed = new Dictionary<string, int>();
@@ -9471,6 +9785,7 @@ namespace PingMonitor
                     IPEndPoint from = new IPEndPoint(IPAddress.Any, 0);
                     byte[] data = udp.Receive(ref from);
                     Received++;
+                    LastReceived = DateTime.Now;
                     Handle(from.Address.ToString(), Encoding.UTF8.GetString(data), DateTime.Now);
                 }
                 catch (System.Net.Sockets.SocketException) { if (!running) return; }
@@ -9566,6 +9881,7 @@ namespace PingMonitor
             Message m = Parse(from, raw, now);
             string name = NameOf(from, m.Host);
             WriteRaw(m, name);
+            if (m.App == LogForward.AppName) { FromAgent(m, raw); return; }
             Dhcp(m, name);
             string text = m.App + ": " + m.Text;
             string cat = "", evt = "";
@@ -9593,6 +9909,25 @@ namespace PingMonitor
         }
 
         static string Short(string s) { return s.Length > 300 ? s.Substring(0, 300) + " ..." : s; }
+
+        /// <summary>Meldung eines PingMonitor-Agenten (bzw. einer anderen PingMonitor-Instanz) übernehmen.</summary>
+        static void FromAgent(Message m, string raw)
+        {
+            System.Text.RegularExpressions.Match sd = System.Text.RegularExpressions.Regex.Match(raw, "\\[pm@32473 name=\"((?:[^\"\\\\]|\\\\.)*)\" host=\"((?:[^\"\\\\]|\\\\.)*)\" source=\"((?:[^\"\\\\]|\\\\.)*)\"");
+            string pc = m.Host.Length > 0 ? m.Host : m.From;
+            lock (agents) agents[pc] = new string[] { m.From, m.Time.ToString(Fmt.Time) };
+            string text = m.Text;
+            int bar = text.IndexOf(" | ");
+            string evt = bar > 0 ? text.Substring(0, bar) : text, info = bar > 0 ? text.Substring(bar + 3) : "";
+            if (!Allow(m.From + "|agent")) return;
+            LogEntry e = new LogEntry();
+            e.Time = m.Time;
+            e.Name = sd.Success && sd.Groups[1].Value.Length > 0 ? sd.Groups[1].Value.Replace("\\\"", "\"") : pc;
+            e.Host = m.From;
+            e.Event = evt; e.Info = info;
+            e.Source = "Agent " + pc;
+            try { CsvLog.Write(e); } catch { }
+        }
 
         /// <summary>Höchstens 10 gleichartige Meldungen pro Gerät und Minute ins Ausfallprotokoll.</summary>
         static bool Allow(string key)
@@ -10241,6 +10576,7 @@ namespace PingMonitor
 
         // ---- Laufende Übernahme ins Ausfallprotokoll (Dienst bzw. App)
         static DateTime lastPoll = DateTime.MinValue;
+        public static DateTime LastPoll { get { return lastPoll; } }
         static readonly HashSet<string> seen = new HashSet<string>();
         public static readonly List<WinEvent> Recent = new List<WinEvent>();
 
@@ -10378,6 +10714,268 @@ namespace PingMonitor
             sb.AppendLine();
             sb.AppendLine("Hinweis: Diese Angaben stammen nur von diesem PC. Für andere Windows-PCs PingMonitor dort ausführen.");
             return sb.ToString();
+        }
+    }
+
+    /// <summary>
+    /// Weiterleitung der Protokolleinträge per Syslog (UDP, RFC 5424 mit strukturierten Daten) an ein zentrales System
+    /// (Graylog, Wazuh, Elastic, SIEM) bzw. - im Agent-Modus - an die zentrale PingMonitor-Instanz.
+    /// </summary>
+    static class LogForward
+    {
+        public const string AppName = "PingMonitor";
+        static System.Net.Sockets.UdpClient udp;
+        static string target = "";
+        static IPEndPoint endpoint;
+        static readonly object sync = new object();
+
+        public static string Target { get { return Config.Cached("Weiterleitung.Ziel", "").Trim(); } }
+        public static int MinLevel { get { int v; return int.TryParse(Config.Cached("Weiterleitung.Mindeststufe", "1"), out v) ? v : 1; } }
+        public static bool OnlyWindows { get { return Config.Cached("Weiterleitung.NurWindows", "0") == "1"; } }
+
+        /// <summary>Einstufung eines Eintrags: 3 = Problem, 2 = Warnung, 1 = Info, 0 = OK/Entwarnung.</summary>
+        public static int Level(LogEntry e)
+        {
+            string x = (e.Event ?? "").ToLowerInvariant();
+            if (x.StartsWith("wieder") || x.Contains("wieder normal") || x.Contains("wieder erreichbar") || x.Contains("wieder online") ||
+                x.Contains("link up") || x.Contains("verbunden") && !x.Contains("getrennt")) return 0;
+            if (x == Outages.EvOutage.ToLowerInvariant() || x.Contains("gestört") || x.Contains("down") || x.Contains("nicht erreichbar") || x.Contains("schleife") ||
+                x.Contains("konflikt") || x.Contains("zurückgesetzt") || x.Contains("unerwartet") || x.Contains("offline") || x.Contains("crc") ||
+                x.Contains("fehler")) return 3;
+            if (x.Contains("langsam") || x.Contains("beeinträchtigt") || x.Contains("schwach") || x.Contains("widerspruch") || x.Contains("getrennt") ||
+                x.Contains("spanning") || x.Contains("neu gestartet") || x.Contains("poe") || x.Contains("warnung") || x.Contains("abgelehnt")) return 2;
+            return 1;
+        }
+
+        public static void Send(LogEntry e)
+        {
+            try
+            {
+                string t = Target;
+                if (t.Length == 0 || e.Event == Outages.EvFailed) return;
+                if (OnlyWindows && !(e.Source ?? "").StartsWith("Windows") && !(e.Source ?? "").StartsWith("Agent")) return;
+                int lvl = Level(e);
+                if (lvl < MinLevel && lvl != 0) return;
+                if (lvl == 0 && MinLevel > 1) return;
+                // keine Schleife: Meldungen, die wir selbst per Syslog empfangen haben, nicht an den eigenen Empfänger zurückschicken
+                if ((e.Source ?? "").StartsWith(Syslog.Source) && IsSelf(t)) return;
+                int sev = lvl == 3 ? 3 : lvl == 2 ? 4 : lvl == 0 ? 5 : 6;
+                string msg = Format(e, sev);
+                lock (sync)
+                {
+                    if (t != target || endpoint == null) { endpoint = Resolve(t); target = t; }
+                    if (endpoint == null) return;
+                    if (udp == null) udp = new System.Net.Sockets.UdpClient();
+                    byte[] b = Encoding.UTF8.GetBytes(msg);
+                    udp.Send(b, b.Length, endpoint);
+                }
+            }
+            catch { }
+        }
+
+        static bool IsSelf(string t)
+        {
+            IPEndPoint ep = Resolve(t);
+            return ep != null && IPAddress.IsLoopback(ep.Address) && ep.Port == Syslog.Port;
+        }
+
+        public static IPEndPoint Resolve(string t)
+        {
+            string host = t;
+            int port = 514;
+            int c = t.LastIndexOf(':');
+            if (c > 0 && int.TryParse(t.Substring(c + 1), out port)) host = t.Substring(0, c); else port = 514;
+            string src;
+            IPAddress ip = Resolver.Lookup(host, out src);
+            return ip == null ? null : new IPEndPoint(ip, port);
+        }
+
+        static string Sd(string s) { return (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("]", "\\]"); }
+
+        /// <summary>RFC 5424: &lt;PRI&gt;1 ZEIT HOST PingMonitor - EREIGNIS [pm@32473 ...] Ereignis | Details</summary>
+        public static string Format(LogEntry e, int severity)
+        {
+            int pri = 16 * 8 + severity;   // Facility local0
+            string ts = e.Time.ToString("yyyy-MM-ddTHH:mm:ss.fffzzz", System.Globalization.CultureInfo.InvariantCulture);
+            string host = Environment.MachineName.Replace(" ", "_");
+            return "<" + pri + ">1 " + ts + " " + host + " " + AppName + " - EVENT [pm@32473 name=\"" + Sd(e.Name) + "\" host=\"" + Sd(e.Host) +
+                "\" source=\"" + Sd(e.Source) + "\" level=\"" + (severity <= 3 ? "problem" : severity == 4 ? "warning" : severity == 5 ? "ok" : "info") + "\"] " +
+                (e.Event ?? "").Replace("|", "/") + " | " + (e.Info ?? "").Replace("\r", " ").Replace("\n", " ");
+        }
+    }
+
+    /// <summary>Aufbewahrung: alte Protokolle (Ausfallprotokoll, Syslog) nach N Tagen löschen.</summary>
+    static class Retention
+    {
+        static DateTime last = DateTime.MinValue;
+
+        public static int Days { get { int v; return int.TryParse(Config.Cached("Aufbewahrung.Tage", "90"), out v) ? v : 90; } }
+
+        public static void Run()
+        {
+            if ((DateTime.Now - last).TotalHours < 1) return;
+            last = DateTime.Now;
+            int days = Days;
+            if (days <= 0 || !Directory.Exists(Config.LogDir)) return;
+            DateTime limit = DateTime.Today.AddDays(-days);
+            foreach (string f in Directory.GetFiles(Config.LogDir))
+            {
+                string n = Path.GetFileNameWithoutExtension(f);
+                int u = n.LastIndexOf('_');
+                DateTime d;
+                if ((n.StartsWith("PingLog_") || n.StartsWith("Syslog_")) && u > 0 &&
+                    DateTime.TryParseExact(n.Substring(u + 1), "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out d) && d < limit)
+                    try { File.Delete(f); } catch { }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Agent-Modus: Auf einem einzelnen Windows-PC liest PingMonitor (als Dienst) nur dessen Ereignisprotokoll und prüft die
+    /// Netzwerkkarte und schickt relevante Ereignisse per Syslog an die zentrale PingMonitor-Instanz.
+    /// </summary>
+    static class Agent
+    {
+        public static bool Active { get { return Config.Cached("Agent.Aktiv", "0") == "1"; } }
+        static DateTime lastBeat = DateTime.MinValue, lastNic = DateTime.MinValue;
+        static string lastNicText = "";
+
+        /// <summary>Einrichten: Weiterleitung nur der Windows-Ereignisse an die Zentrale, Dienst installieren und starten.</summary>
+        public static string Setup(string central)
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            d["Agent.Aktiv"] = "1";
+            d["Weiterleitung.Ziel"] = central.Trim();
+            d["Weiterleitung.NurWindows"] = "1";
+            d["Weiterleitung.Mindeststufe"] = "0";
+            d["Windows.Ereignisse"] = "1";
+            Config.SaveSettings(d);
+            return "Agent eingerichtet: Windows-Ereignisse und Netzwerkkarten-Prüfung dieses PCs gehen an " + central + ".";
+        }
+
+        /// <summary>Im Agent-Modus: täglicher Lebenszeichen-Eintrag und Netzwerkkarten-Befunde (bei Änderung, sonst alle 24 h).</summary>
+        public static void Tick(string owner)
+        {
+            if (!Active) return;
+            if ((DateTime.Now - lastBeat).TotalHours >= 24)
+            {
+                lastBeat = DateTime.Now;
+                Write("Agent aktiv", "PingMonitor-Agent auf " + Environment.MachineName + " (" + Environment.OSVersion.VersionString + ") meldet an " + LogForward.Target, owner);
+            }
+            if ((DateTime.Now - lastNic).TotalHours >= 6)
+            {
+                lastNic = DateTime.Now;
+                List<string> nics = WinEvents.NicSettings();
+                string text = string.Join(" / ", nics.ToArray()).Replace("\r\n", " ").Replace("    ", " ");
+                if (text != lastNicText && text.Contains("▲")) Write("Netzwerkkarte: Energiespar-/Geschwindigkeitseinstellungen", text, owner);
+                lastNicText = text;
+            }
+        }
+
+        static void Write(string evt, string info, string owner)
+        {
+            LogEntry e = new LogEntry();
+            e.Time = DateTime.Now; e.Name = Environment.MachineName; e.Host = "Windows"; e.Event = "Windows: " + evt; e.Info = info;
+            e.Source = "Windows (" + owner + ")";
+            try { CsvLog.Write(e); } catch { }
+        }
+    }
+
+    /// <summary>Protokolle: Aufbewahrung, Weiterleitung (Syslog/SIEM), Agent-Modus.</summary>
+    class LogSettingsForm : Form
+    {
+        NumericUpDown numDays;
+        TextBox txtTarget;
+        ComboBox cboLevel;
+        CheckBox chkWin;
+
+        public LogSettingsForm()
+        {
+            Text = "Protokoll, Weiterleitung und Agent";
+            Font = new Font("Segoe UI", 9.5F);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            AutoSize = true; AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            TableLayoutPanel t = new TableLayoutPanel(); t.ColumnCount = 2; t.AutoSize = true; t.Padding = new Padding(12);
+            Dictionary<string, string> d = Config.LoadSettings();
+            int days; int.TryParse(Config.Get(d, "Aufbewahrung.Tage", "90"), out days);
+            numDays = new NumericUpDown(); numDays.Minimum = 0; numDays.Maximum = 3650; numDays.Value = Math.Max(0, Math.Min(3650, days)); numDays.Width = 70;
+            AddRow(t, 0, "Protokolle aufbewahren (Tage):", numDays, "0 = unbegrenzt. Betrifft Ausfallprotokoll und Syslog-Dateien. Datenschutz: so kurz wie für die Fehlersuche nötig.");
+            txtTarget = new TextBox(); txtTarget.Width = 260; txtTarget.Text = Config.Get(d, "Weiterleitung.Ziel", "");
+            AddRow(t, 1, "Weiterleiten an (Syslog):", txtTarget, "Host oder IP, optional :Port (Standard 514), z. B. graylog.firma.local:1514. Leer = aus.");
+            cboLevel = new ComboBox(); cboLevel.DropDownStyle = ComboBoxStyle.DropDownList; cboLevel.Width = 260;
+            cboLevel.Items.AddRange(new object[] { "Alles (inkl. Entwarnungen)", "Informationen, Warnungen, Probleme", "Warnungen und Probleme", "Nur Probleme" });
+            int lv; int.TryParse(Config.Get(d, "Weiterleitung.Mindeststufe", "1"), out lv);
+            cboLevel.SelectedIndex = Math.Max(0, Math.Min(3, lv));
+            AddRow(t, 2, "Mindeststufe:", cboLevel, "Format: RFC 5424 mit strukturierten Daten (name, host, source, level) - lesbar für Graylog, Wazuh, Elastic, Splunk.");
+            chkWin = new CheckBox(); chkWin.Text = "Nur Windows-Ereignisse dieses PCs weiterleiten (Agent)"; chkWin.AutoSize = true;
+            chkWin.Checked = Config.Get(d, "Weiterleitung.NurWindows", "0") == "1";
+            AddRow(t, 3, "", chkWin, "");
+            FlowLayoutPanel b = new FlowLayoutPanel(); b.AutoSize = true; b.Margin = new Padding(0, 10, 0, 0);
+            Button test = new Button(); test.Text = "Testmeldung senden"; test.AutoSize = true;
+            test.Click += delegate
+            {
+                IPEndPoint ep = txtTarget.Text.Trim().Length > 0 ? LogForward.Resolve(txtTarget.Text.Trim()) : null;
+                if (ep == null) { MessageBox.Show(this, "Ziel nicht auflösbar.", Text); return; }
+                LogEntry e = new LogEntry(); e.Time = DateTime.Now; e.Name = Environment.MachineName; e.Host = "Test"; e.Event = "Testmeldung"; e.Info = "Test der Weiterleitung von PingMonitor"; e.Source = "Test";
+                using (System.Net.Sockets.UdpClient u = new System.Net.Sockets.UdpClient())
+                {
+                    byte[] bytes = Encoding.UTF8.GetBytes(LogForward.Format(e, 6));
+                    u.Send(bytes, bytes.Length, ep);
+                }
+                MessageBox.Show(this, "Testmeldung an " + ep + " gesendet (UDP - eine Empfangsbestätigung gibt es nicht).", Text);
+            };
+            Button agent = new Button(); agent.Text = "Diesen PC als Agent einrichten ..."; agent.AutoSize = true;
+            agent.Click += delegate
+            {
+                if (txtTarget.Text.Trim().Length == 0) { MessageBox.Show(this, "Bitte zuerst bei \"Weiterleiten an\" die IP des zentralen PingMonitor-PCs eintragen.", Text); return; }
+                if (MessageBox.Show(this, "Dieser PC wird als Agent eingerichtet:\n\n• Windows-Ereignisse (Standby, Netzwerkkarte, DHCP, IP-Konflikte, WLAN) und die " +
+                    "Netzwerkkarten-Prüfung gehen per Syslog an " + txtTarget.Text.Trim() + "\n• der PingMonitor-Dienst wird installiert und gestartet\n\n" +
+                    "Auf der Zentrale muss der Syslog-Empfang eingeschaltet sein. Fortfahren?", Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                try
+                {
+                    string r = Agent.Setup(txtTarget.Text.Trim());
+                    chkWin.Checked = true; cboLevel.SelectedIndex = 0;
+                    ServiceSetup.RunCommand("install", false);
+                    MessageBox.Show(this, r, Text);
+                }
+                catch (Exception ex) { MessageBox.Show(this, ex.Message, Text); }
+            };
+            Button save = new Button(); save.Text = "Speichern"; save.AutoSize = true;
+            save.Click += delegate
+            {
+                Dictionary<string, string> s = new Dictionary<string, string>();
+                s["Aufbewahrung.Tage"] = numDays.Value.ToString();
+                s["Weiterleitung.Ziel"] = txtTarget.Text.Trim();
+                s["Weiterleitung.Mindeststufe"] = cboLevel.SelectedIndex.ToString();
+                s["Weiterleitung.NurWindows"] = chkWin.Checked ? "1" : "0";
+                if (!chkWin.Checked) s["Agent.Aktiv"] = "0";
+                try { Config.SaveSettings(s); DialogResult = DialogResult.OK; } catch (Exception ex) { MessageBox.Show(this, ex.Message, Text); }
+            };
+            Button cancel = new Button(); cancel.Text = "Abbrechen"; cancel.AutoSize = true; cancel.DialogResult = DialogResult.Cancel;
+            b.Controls.Add(test); b.Controls.Add(agent); b.Controls.Add(save); b.Controls.Add(cancel);
+            t.Controls.Add(b, 0, 4); t.SetColumnSpan(b, 2);
+            Label note = new Label(); note.AutoSize = true; note.MaximumSize = new Size(620, 0); note.ForeColor = SystemColors.GrayText;
+            note.Text = "Datenschutz: Protokolle mit WLAN-An-/Abmeldungen und Windows-Ereignissen von Arbeitsplätzen sind personenbezogene Daten. " +
+                "Dauerhafte Aufzeichnung bei Kunden vorher absprechen (DSGVO; mit Betriebsrat: Mitbestimmung nach § 87 Abs. 1 Nr. 6 BetrVG). " +
+                "Für eine befristete Fehlersuche eine kurze Aufbewahrung wählen.\r\nAgent per Skript/GPO: PingMonitor.exe /agent <IP-der-Zentrale>[:Port] /quiet";
+            t.Controls.Add(note, 0, 5); t.SetColumnSpan(note, 2);
+            Controls.Add(t);
+            CancelButton = cancel;
+        }
+
+        static void AddRow(TableLayoutPanel t, int row, string label, Control c, string hint)
+        {
+            Label l = new Label(); l.Text = label; l.AutoSize = true; l.Margin = new Padding(3, 7, 3, 3);
+            FlowLayoutPanel f = new FlowLayoutPanel(); f.AutoSize = true; f.Margin = new Padding(0); f.WrapContents = false;
+            f.Controls.Add(c);
+            if (hint.Length > 0)
+            {
+                Label h = new Label(); h.Text = hint; h.AutoSize = true; h.MaximumSize = new Size(360, 0); h.ForeColor = SystemColors.GrayText; h.Margin = new Padding(8, 4, 3, 3);
+                f.Controls.Add(h);
+            }
+            t.Controls.Add(l, 0, row); t.Controls.Add(f, 1, row);
         }
     }
 
@@ -11817,6 +12415,56 @@ namespace PingMonitor
             }
         }
 
+        /// <summary>
+        /// Uhrzeit-Abweichung zwischen Mitschnitt (Uhr des mitschneidenden Geräts, z. B. Firewall) und diesem PC: DHCP-Bestätigungen (ACK),
+        /// die sowohl im Mitschnitt als auch im Syslog des DHCP-Servers (Empfangszeit auf diesem PC) stehen. Ergebnis in Sekunden (PC minus Mitschnitt).
+        /// </summary>
+        double ClockOffset()
+        {
+            List<double> diffs = new List<double>();
+            Dictionary<string, List<DateTime>> acks = new Dictionary<string, List<DateTime>>();
+            for (DateTime day = First.Date.AddDays(-1); day <= Last.Date.AddDays(1); day = day.AddDays(1))
+            {
+                string f = Syslog.FileFor(day);
+                if (!System.IO.File.Exists(f)) continue;
+                foreach (string line in Config.ReadAllLinesShared(f))
+                {
+                    if (line.IndexOf("DHCPACK", StringComparison.Ordinal) < 0) continue;
+                    string[] c = line.Split('\t');
+                    DateTime t;
+                    System.Text.RegularExpressions.Match m = System.Text.RegularExpressions.Regex.Match(line, @"([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}");
+                    if (c.Length < 6 || !m.Success || !DateTime.TryParseExact(c[0], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out t)) continue;
+                    string k = NetTools.MacHex(m.Value);
+                    if (!acks.ContainsKey(k)) acks[k] = new List<DateTime>();
+                    acks[k].Add(t);
+                }
+            }
+            foreach (DhcpSession s in DhcpSessions)
+            {
+                List<DateTime> l;
+                if (!s.Done || !acks.TryGetValue(NetTools.MacHex(s.Mac), out l)) continue;
+                double best = double.MaxValue;
+                foreach (DateTime t in l) { double d = (t - s.End).TotalSeconds; if (Math.Abs(d) < Math.Abs(best)) best = d; }
+                if (Math.Abs(best) < 600) diffs.Add(best);
+            }
+            if (diffs.Count == 0)
+            {
+                Overview += "\r\nZeitabgleich: nicht prüfbar (kein Syslog des DHCP-Servers zur selben Zeit). Uhr von Firewall und PC per NTP synchron halten - " +
+                    "Abweichungen über 15 s verfälschen den Abgleich mit dem Ausfallprotokoll.\r\n";
+                return 0;
+            }
+            diffs.Sort();
+            double off = diffs[diffs.Count / 2];
+            Overview += "\r\nZeitabgleich: Uhr dieses PCs " + (off >= 0 ? "+" : "") + off.ToString("0.0") + " s gegenüber dem Mitschnitt (aus " + diffs.Count +
+                " DHCP-Bestätigungen in Mitschnitt und Syslog)" + (Math.Abs(off) >= 2 ? " - beim Abgleich korrigiert." : " - in Ordnung.") + "\r\n";
+            if (Math.Abs(off) >= 2)
+                Findings.Add(new Finding(Math.Abs(off) >= 30 ? Finding.Warning : Finding.Info, "Uhrzeiten weichen " + Math.Abs(off).ToString("0") + " s ab",
+                    "Die Uhr des mitschneidenden Geräts und dieses PCs gehen " + Math.Abs(off).ToString("0.0") + " s auseinander (ermittelt aus " + diffs.Count +
+                    " DHCP-Bestätigungen, die sowohl im Mitschnitt als auch im Syslog stehen). Für den Abgleich mit dem Ausfallprotokoll wurde das korrigiert. " +
+                    "Abhilfe: Firewall und PCs per NTP synchronisieren (OPNsense: Dienste → Network Time)."));
+            return off;
+        }
+
         /// <summary>Ereignisse aus dem Ausfallprotokoll für den Zeitraum des Mitschnitts dazunehmen und mit dem Mitschnitt abgleichen.</summary>
         public void MergeLog()
         {
@@ -11840,6 +12488,9 @@ namespace PingMonitor
                     log.Add(e);
                 }
             }
+            double offset = ClockOffset();
+            if (Math.Abs(offset) >= 2)
+                foreach (TimelineEvent e in log) e.Time = e.Time.AddSeconds(-offset);
             CorrelateDhcp(log);
             // Zu jedem Ausfall: Was zeigt der Mitschnitt in den 15 Sekunden davor/danach?
             List<TimelineEvent> capture = new List<TimelineEvent>(Timeline);
