@@ -1,4 +1,4 @@
-PingMonitor 4 - Geräte per Ping überwachen, Netzwerkfehler finden (App und optional Windows-Dienst)
+PingMonitor 4.3 - Geräte per Ping überwachen, Netzwerkfehler finden (App und optional Windows-Dienst)
 ==========================================================================
 
 Ablage
@@ -17,10 +17,25 @@ Bedienung (App)
 2. Geräte markieren (Strg/Shift für mehrere) und "Start" - oder "Alle starten".
    Jedes Gerät wird in einem eigenen Thread parallel gepingt.
 3. Farben: grün = erreichbar, rot = Ausfall, gelb = gestartet, noch keine Antwort.
+4. Unter der Eingabe: Start, Stopp, Alle starten, Alle stoppen, Entfernen, Aktualisieren, Details, Werkzeuge,
+   Befunde. Rechtsklick auf ein Gerät: Details, Netzwerk-Werkzeuge für dieses Gerät, Start/Stopp,
+   Aktualisieren, Statistik zurücksetzen, Entfernen.
+5. "Aktualisieren": holt die Geräteinfos (DNS, NetBIOS, mDNS, SNMP, Webseite) der markierten bzw. aller Geräte
+   neu UND stößt die Abfrage der Switches/Controller/Firewall sofort an (auch im Dienst). Beim Start und beim
+   Hinzufügen holt PingMonitor fehlende Geräteinfos automatisch - "Aktualisieren" ist nur für Änderungen nötig.
+6. Alles Weitere steht im Menü:
+     Datei          Log-Ordner, Dokumentation für den Kunden, Zurücksetzen, Beenden
+     Geräte         hinzufügen, Netzwerk scannen, Start/Stopp, Aktualisieren, Statistik zurücksetzen, Entfernen
+     Netzwerk       Switches / Controller / Firewall, Datenquellen und Widersprüche, Netzwerkplan
+     Analyse        Befunde und Maßnahmen, Netzwerk-Werkzeuge, Mitschnitt analysieren, Diesen PC prüfen,
+                    "Was ist wann aussagekräftig?"
+     Einstellungen  Optionen (DNS-Server, jeden Fehlschlag protokollieren, Leitungstest), Benachrichtigungen,
+                    Protokoll / Weiterleitung / Aufbewahrung
+     Dienst         installieren, starten, stoppen, deinstallieren (Status unten links in der Statusleiste)
 
 Netzwerkscanner
 ---------------
-Schaltfläche "Netzwerk scannen ..." in der App.
+Geräte -> "Netzwerk scannen ..." (oder Arbeitsablauf Schritt 2).
 - Bereich wählen: Die Subnetze der eigenen Netzwerkkarten stehen in der Auswahlliste, oder frei eingeben:
     192.168.1.0/24              ganzes Subnetz (höchstens /16 = 65.536 Adressen)
     192.168.1.10-192.168.1.50   Von-Bis
@@ -42,7 +57,7 @@ Schaltfläche "Netzwerk scannen ..." in der App.
 
 Namensauflösung und Geräteinfos
 -------------------------------
-- DNS-Server (Hauptfenster): "Automatisch" nutzt die DNS-Server aus den Windows-Netzwerkeinstellungen.
+- DNS-Server (Einstellungen -> Optionen): "Automatisch" nutzt die DNS-Server aus den Windows-Netzwerkeinstellungen.
   Zur Auswahl stehen außerdem das Gateway/die Firewall, Google, Cloudflare, Quad9 - oder eigene
   Adressen eintippen (mehrere mit Komma). Gilt für App, Dienst und Scanner.
 - Kennt der gewählte Server einen Namen nicht oder antwortet nicht, werden automatisch nacheinander
@@ -50,8 +65,9 @@ Namensauflösung und Geräteinfos
   NetBIOS) gefragt. Findet niemand einen Namen, steht "-" in der Spalte.
   Hinweis: Öffentliche DNS-Server (Google & Co.) kennen keine internen Namen - dafür die Firewall
   bzw. den internen DNS-Server wählen.
-- "DNS testen" zeigt für jeden Server, ob er antwortet, wie schnell, und ob er interne Namen kennt.
-- Geräteinfos (Scanner und "Geräteinfo abrufen"): Es wird alles abgefragt, was das Gerät verrät:
+- Analyse -> Netzwerk-Werkzeuge -> DNS: "Alle Server vergleichen" zeigt für jeden Server, ob er antwortet, wie
+  schnell und mit welchem Ergebnis; "Namensauflösung von PingMonitor testen" zeigt die Reihenfolge oben.
+- Geräteinfos (Scanner und "Aktualisieren"): Es wird alles abgefragt, was das Gerät verrät:
     DNS-Name     über die DNS-Server oben
     NetBIOS      Windows-Rechnername + Arbeitsgruppe (UDP 137), liefert auch die MAC über Router hinweg
     mDNS         Bonjour-Name (z. B. Drucker, Apple-Geräte, NAS, IoT)
@@ -77,7 +93,7 @@ Spalte "Leitungsqualität" in der Geräteliste. Bewertet werden die letzten 900 
 
 Netzwerkfehler finden: Switch-Ports per SNMP (Stufe 2)
 -----------------------------------------------------
-Schaltfläche "Switches ...": Switches mit IP-Adresse und SNMP-Community eintragen.
+Menü Netzwerk -> "Switches / Controller / Firewall ...": Switches mit IP-Adresse und SNMP-Community eintragen.
 - Automatisch finden: "Switches suchen ..." fragt jede Adresse eines Bereichs (Vorschlag: eigenes Subnetz)
   per SNMP mit den angegebenen Communities (z. B. "public, firma123"). Ping ist nicht nötig.
   Gefundene Geräte werden eingeordnet (Switch, Access Point, Router/Firewall, Drucker, Server/NAS) -
@@ -101,7 +117,7 @@ Schaltfläche "Switches ...": Switches mit IP-Adresse und SNMP-Community eintrag
 - Geräte der Liste werden ihrem Switch-Port zugeordnet (Spalte "Switch-Port" im Hauptfenster). Liegt
   ein Ausfall zeitlich auf einem Link-Wechsel dieses Ports, ist das Kabel/der Port der Verdächtige.
 - Ereignisse (Link DOWN/UP, CRC-Fehler, Switch neu gestartet/nicht erreichbar) stehen im Protokoll
-  (Quelle "Switch"). Optional Benachrichtigung, wenn ein Port als Problem bewertet wird.
+  (Quelle "Switch"). Benachrichtigt wird über die Befunde (nur sichere, siehe "Befunde").
 - Läuft der Windows-Dienst, fragt er die Switches rund um die Uhr ab; sonst die App, solange sie offen ist.
 - Abfrage standardmäßig alle 60 Sekunden (einstellbar). Zähler gelten "seit Überwachungsbeginn".
 - Hinweis: Welche Werte ein Switch liefert, hängt vom Modell ab. Fehlende Werte (z. B. Duplex oder
@@ -123,7 +139,7 @@ Suchen, Filtern, WLAN-Geräte
 
 Netzwerkplan
 ------------
-Schaltfläche "Netzwerkplan ...": Baum Internet -> Gateway/Firewall -> Switches -> Access Points -> Geräte.
+Netzwerk -> "Netzwerkplan" (oder Arbeitsablauf Schritt 5): Baum Internet -> Gateway/Firewall -> Switches -> Access Points -> Geräte.
 - Verbindungen zwischen Switches über LLDP (direkte Nachbarn), sonst aus den MAC-Tabellen abgeleitet.
 - Geräte erscheinen an ihrem Port; WLAN-Geräte unter dem Access Point, zusammengefasst als
   "n WLAN-Clients" (aufklappbar; klappt bei Problemen automatisch auf).
@@ -213,7 +229,7 @@ gelten als virtuelle Schnittstelle (VM/Container/Docker) und nicht als WLAN-Ger�
 
 UniFi-Controller (genaue Zuordnung LAN-Port und WLAN)
 ------------------------------------------------------
-"Switches ..." -> "UniFi-Controller ...": Adresse (UDM/UDR/Cloud Key/UniFi OS Server: einfach die IP,
+Netzwerk -> "Switches / Controller / Firewall ..." -> "UniFi-Controller ...": Adresse (UDM/UDR/Cloud Key/UniFi OS Server: einfach die IP,
 klassischer Controller: https://name:8443), Benutzer, Passwort, Site.
   - Site: einfach den Namen wie im Controller eintragen (z. B. "janning networks", auch mit Leerzeichen) -
     intern verwendet UniFi eine Kennung ("default" oder z. B. "x7k2m9qa"), die PingMonitor selbst ermittelt.
@@ -256,12 +272,68 @@ Arbeitsablauf (oben im Hauptfenster)
   4 Beobachten          Messzeit mit Meilensteinen: 5 min Port-Zuordnung/VLAN-Abgleich, 15 min Leitungsqualität,
                         1 h Fehler-Trends/STP/WLAN-Verlauf, 24 h Tagesverlauf/Ausfall-Statistik/Doku, 7 Tage Wochenmuster.
                         "Was ist wann aussagekräftig?" erklärt es im Detail.
-  5 Auswerten           Netzwerkplan, Dokumentation; Anzahl Probleme/Warnungen (unter 24 h als vorläufig markiert).
+  5 Auswerten           Befunde (sicher / wahrscheinlich / Hinweise, Maßnahmen in Nachprüfung), Netzwerkplan,
+                        Dokumentation (unter 24 h als vorläufig markiert).
 Die Karten zeigen erledigt (grün), nächster Schritt (gelb) und offene Schritte.
+
+Befunde: Sicherheit, Belege, Maßnahmenplan, Nachprüfung
+-------------------------------------------------------
+Analyse -> "Befunde und Maßnahmen" (oder Schaltfläche "Befunde"). Jede Abfragerunde führt PingMonitor alle Quellen
+zusammen (SNMP, UniFi, OPNsense, Ping, Syslog, Windows-Ereignisse, Widersprüche) und bildet daraus Befunde:
+CRC-Fehler, Sendefehler, Halbduplex, Link-Wechsel, langsame/gefallene Link-Geschwindigkeit, Broadcast-Sturm,
+Auslastung, Spanning-Tree-Änderungen/blockierte Ports, VLAN-Fehler, WAN ohne Link, Switch/Firewall nicht erreichbar,
+Firewall-Last, Geräte-Ausfall (> 2 min), instabile Geräte, Leitungsqualität, schwaches WLAN, Roaming-Ping-Pong,
+langsame DHCP-Vergabe (Syslog), Internet-Leitung (OPNsense-Gateway), CG-NAT/doppeltes NAT, Netzwerkkarten-Resets und
+IP-Konflikte dieses PCs, Widersprüche zwischen den Quellen.
+- Sicherheit:  ●●● Sicher          mehrfach gemessen (z. B. CRC-Fehler in 3 Abfragen, 3 Link-Wechsel in 24 h, Halbduplex in
+                                  2 Abfragen) oder von einer zweiten Quelle bestätigt (Ping-Ausfall zur selben Zeit wie
+                                  der Link-Wechsel, Verlust großer Pakete passend zu CRC-Fehlern, schwaches WLAN-Signal)
+               ●●○ Wahrscheinlich  deutliche Anzeichen, noch nicht bestätigt
+               ●○○ Hinweis         einmalig oder möglicherweise gewollt (z. B. blockierter STP-Port bei Redundanz)
+  Nicht gewertet werden z. B. einzelne Fehler beim Ein-/Ausstecken und Link-Wechsel von ausgeschalteten Geräten.
+- Belege: warum diese Einschätzung (Zählerstände, Zeiten, Quelle).
+- Zeitliches Muster aus den Langzeitdaten (z. B. "meist zwischen 07 und 10 Uhr - Arbeitsbeginn", "nur werktags").
+- Plan mit den echten Werten des Netzes:
+    Mögliche Ursachen, Beheben (Schritte der Reihe nach), Eingrenzen, Ergebnis lesen. Beim Eingrenzen z. B.:
+    * Port-Spiegelung genau dieses Ports auf einen freien Port desselben Switches (UniFi: Weg im Controller,
+      sonst Port-Mirroring/SPAN in der Weboberfläche),
+    * Mitschnitt an der Firewall (OPNsense Paketmitschnitt mit Schnittstelle, Host und Filter; tcpdump-Befehl mit
+      der richtigen Schnittstelle, z. B. igb1),
+    * Wireshark mit Mitschnitt- und Anzeigefilter, pktmon-Befehle für Windows-Geräte (ohne Installation),
+    * und wie das Ergebnis zu lesen ist. Mitschnitte danach unter "Mitschnitt analysieren" laden.
+  Hinweis: Beschädigte Pakete (CRC) sieht man in keinem Mitschnitt - dort wird über Zähler und Tauschen eingegrenzt.
+- "Maßnahme durchgeführt ...": Schritt auswählen, Notiz eingeben. PingMonitor beobachtet danach je nach Art
+  15 min (z. B. Halbduplex, VLAN) bis 24 h (z. B. Link-Wechsel, instabile Geräte) und meldet
+    ✓ behoben (mit Vorher/Nachher aus den Langzeitdaten) oder
+    ✖ nicht behoben, mit dem nächsten Schritt des Plans.
+  Tritt ein behobener Befund später wieder auf, wird er erneut geöffnet. Bei Leitungsqualität werden die
+  Messwerte nach der Maßnahme neu begonnen. Weitere Knöpfe: Ignorieren, Wieder öffnen, Als erledigt markieren,
+  Kopieren, Netzwerk-Werkzeuge, Mitschnitt analysieren. Maßnahmen stehen im Protokoll (Quelle "Befunde") und in
+  der Dokumentation.
+- Langzeitdaten: stündlich Logs\Verlauf_JJJJ-MM-TT.csv (je Port: Empfangs-/Sendefehler, Link-Wechsel, Auslastung und
+  Broadcasts (Spitze); je Gerät: Verlust %, Ausfälle; je WLAN-Gerät: Signal, AP-Wechsel; je Gateway: Verlust, Latenz).
+  Die Aufbewahrung (Einstellungen -> Protokoll) gilt auch für diese Dateien.
+
+Netzwerk-Werkzeuge (manuell)
+----------------------------
+Analyse -> "Netzwerk-Werkzeuge" (Rechtsklick auf ein Gerät füllt das Ziel vor). Ausgabe kopieren oder
+"Ins Protokoll übernehmen" (Quelle "Werkzeuge").
+- DNS: Abfrage wie dig (A, AAAA, MX, TXT, NS, SOA, CNAME, PTR, SRV, CAA; IP-Adresse = Rückwärtsauflösung) an einen
+  wählbaren Server mit Status und Antwortzeit; alle Server vergleichen (abweichend/langsam); Windows-Auflösung
+  (nslookup-Weg); Namensauflösung von PingMonitor testen.
+- Ping (Anzahl, Größe, nicht fragmentieren), Traceroute (mit privat / CG-NAT / öffentlich je Hop), MTU ermitteln.
+- Port / Protokoll / TLS: TCP verbinden mit Begrüßung (SSH, FTP, Telnet ...), UDP senden, HTTP, HTTPS/TLS
+  (Protokoll, Verschlüsselung, Zertifikat: Aussteller, Namen, Ablauf, Kette), SMTP mit STARTTLS, SMTPS (465),
+  IMAP/IMAPS, POP3/POP3S, RDP, LDAP, DNS, NTP (Uhrzeit-Abweichung dieses PCs), SNMP.
+- E-Mail (MX): MX-Einträge, Rückwärtsauflösung, Verbindung auf Port 25, STARTTLS + Zertifikat, SPF, DMARC, MTA-STS.
+  Viele Provider sperren ausgehend Port 25 - dann schlägt nur dieser Teil fehl.
+- Internet (WAN-IP / CG-NAT): öffentliche IPv4 (per DNS bei Google/OpenDNS, sonst HTTP), WAN-Adresse der Firewall
+  (SNMP), Traceroute. Ergebnis: direkte öffentliche IP, Carrier-Grade-NAT (100.64.0.0/10, ggf. DS-Lite), doppeltes
+  NAT oder Provider-NAT - mit Folgen und Abhilfe. Das Ergebnis fließt in die Befunde und die Dokumentation ein.
 
 Datenquellen, Vorrang und Widersprüche
 --------------------------------------
-Arbeitsablauf Schritt 1 -> "Quellen ...": Zustand und Alter jeder Quelle (Switches per SNMP/UniFi, UniFi-Controller,
+Arbeitsablauf Schritt 1 -> "Quellen ..." (bzw. Netzwerk -> "Datenquellen und Widersprüche"): Zustand und Alter jeder Quelle (Switches per SNMP/UniFi, UniFi-Controller,
 OPNsense-API, Syslog-Empfang, Agenten, Windows-Ereignisse, Weiterleitung), aktuelle Widersprüche und die Vorrangregeln.
 Grundsatz: eigene Messung jetzt > Live-Zustand des Geräts (SNMP) > Wissen des Controllers > Konfiguration > alte Daten
 > Vermutung. Im Einzelnen:
@@ -285,7 +357,7 @@ Mitschnitt UND im Syslog des DHCP-Servers stehen, und beim Abgleich mit dem Ausf
 
 Protokoll, Weiterleitung (SIEM), Aufbewahrung
 ---------------------------------------------
-"Protokoll / Weiterleitung ...":
+Einstellungen -> "Protokoll / Weiterleitung ...":
   - Aufbewahrung in Tagen (Standard 90, 0 = unbegrenzt): ältere Ausfallprotokolle und Syslog-Dateien werden
     automatisch gelöscht.
   - Weiterleitung jedes Protokolleintrags per Syslog (UDP, RFC 5424, Facility local0) an Graylog, Wazuh, Elastic,
@@ -296,7 +368,7 @@ Protokoll, Weiterleitung (SIEM), Aufbewahrung
 
 Agent-Modus (Windows-Ereignisse anderer PCs)
 --------------------------------------------
-Auf einem Problem-PC: "Protokoll / Weiterleitung ..." -> IP der Zentrale eintragen -> "Diesen PC als Agent
+Auf einem Problem-PC: Einstellungen -> "Protokoll / Weiterleitung ..." -> IP der Zentrale eintragen -> "Diesen PC als Agent
 einrichten ..." oder per Skript/GPO:  PingMonitor.exe /agent <IP-der-Zentrale>[:Port] /quiet
 Der Agent (PingMonitor-Dienst) liest das Ereignisprotokoll und die Netzwerkkarten-Einstellungen dieses PCs und
 schickt relevante Ereignisse, Netzwerkkarten-Befunde (alle 6 h bei Änderung) und ein tägliches Lebenszeichen per
@@ -305,7 +377,7 @@ Syslog an die Zentrale. Dort (Syslog-Empfang einschalten) erscheinen sie im Ausf
 
 Syslog-Empfang
 --------------
-"Switches ..." -> "Syslog ...": Empfang einschalten (UDP, Standard-Port 514). In den Geräten die IP dieses PCs (bzw. des
+Netzwerk -> "Switches / Controller / Firewall ..." -> "Syslog ...": Empfang einschalten (UDP, Standard-Port 514). In den Geräten die IP dieses PCs (bzw. des
 PCs mit dem Dienst) als Syslog-Server eintragen: UniFi Network (Einstellungen -> System/CyberSecure -> Remote Logging),
 OPNsense (System -> Einstellungen -> Protokollierung -> Remote; Anwendungen u. a. dhcpd/kea/dnsmasq, dpinger, kernel),
 TP-Link/HP (System Log / Syslog Server).
@@ -321,7 +393,7 @@ TP-Link/HP (System Log / Syslog Server).
 
 OPNsense-API
 ------------
-"Switches ..." -> "OPNsense-API ...": Adresse, API-Schlüssel und -Geheimnis (System -> Zugang -> Benutzer -> eigener
+Netzwerk -> "Switches / Controller / Firewall ..." -> "OPNsense-API ...": Adresse, API-Schlüssel und -Geheimnis (System -> Zugang -> Benutzer -> eigener
 Benutzer mit Leserechten "Status: Gateways", "Diagnostics: ARP Table", DHCP-Leases (ISC/Kea/Dnsmasq) -> API-Schlüssel).
 Das Geheimnis wird verschlüsselt gespeichert. Genutzt für:
   - Gateway-Überwachung (dpinger): Paketverlust, Latenz, Status zum Provider. "Internet-Leitung beeinträchtigt"
@@ -332,7 +404,7 @@ Das Geheimnis wird verschlüsselt gespeichert. Genutzt für:
 
 Diesen PC prüfen (Windows-Ereignisprotokoll und Netzwerkkarten)
 ---------------------------------------------------------------
-Schaltfläche "Diesen PC prüfen ...": Bericht über die letzten 7 Tage DIESES PCs:
+Analyse -> "Diesen PC prüfen ...": Bericht über die letzten 7 Tage DIESES PCs:
   - Netzwerkkarten-Einstellungen: Energy Efficient Ethernet, Green Ethernet/Energiesparmodi, "Windows darf die Karte
     abschalten", fest eingestellte Geschwindigkeit/Duplex - jeweils mit Empfehlung.
   - Ereignisse: Standby/Aufwachen, unerwartete Neustarts, Netzwerkkarte zurückgesetzt (Treiber hing), Link
@@ -385,14 +457,14 @@ Die Angaben werden für den nächsten Export gemerkt (settings.txt).
 
 Diagnosedaten speichern
 -----------------------
-"Switches ..." -> "Diagnosedaten speichern ..." schreibt eine Textdatei mit allem, was die Zuordnung
+Netzwerk -> "Switches / Controller / Firewall ..." -> "Diagnosedaten speichern ..." schreibt eine Textdatei mit allem, was die Zuordnung
 bestimmt: je Switch Typ, eigene MACs, ob eine MAC-Tabelle geliefert wird, je Port Rolle/Nachbarn/LLDP/MACs,
 die UniFi-Daten, die Zuordnung jedes Geräts und den Netzwerkplan. Enthält IP-/MAC-Adressen und Namen,
 aber keine Passwörter oder Communities. Hilfreich, wenn ein Gerät falsch zugeordnet wird.
 
 Mitschnitt analysieren (pcap / pcapng)
 --------------------------------------
-Schaltfläche "Mitschnitt analysieren ..." (Datei öffnen oder ins Fenster ziehen), oder direkt:
+Analyse -> "Mitschnitt analysieren ..." (Datei öffnen oder ins Fenster ziehen), oder direkt:
     PingMonitor.exe /analyze datei.pcapng
 Formate: .pcap / .pcapng von Wireshark, tcpdump, OPNsense und Windows pktmon (Ethernet, VLAN, Linux-SLL).
 Wo mitschneiden?
@@ -429,7 +501,7 @@ Zu jedem Befund gibt es einen Wireshark-Filter zum Nachsehen und - wo sinnvoll -
 
 Windows-Dienst (optional)
 -------------------------
-- In der App: "Dienst installieren" (Windows fragt nach Administratorrechten).
+- In der App: Menü Dienst -> "Dienst installieren und starten" (Windows fragt nach Administratorrechten).
   Der Dienst "Ping Monitor" startet automatisch mit Windows - auch ohne Anmeldung -
   und überwacht ALLE Geräte aus der Liste (hosts.txt).
 - Geräte in der App hinzufügen/entfernen: Der Dienst übernimmt die Änderung
@@ -437,7 +509,7 @@ Windows-Dienst (optional)
 - Läuft der Dienst, zeigt die App dessen Status ("Dienst: Erreichbar" / "Dienst: AUSFALL")
   und dessen Protokolleinträge (Spalte "Quelle" = Dienst) live an.
   Die App muss dafür nicht in der App selbst pingen.
-- "Dienst stoppen" / "Dienst starten" / "Dienst deinstallieren" ebenfalls in der App.
+- "Dienst stoppen" / "Dienst starten" / "Dienst deinstallieren" ebenfalls im Menü Dienst.
 - Bei einem Absturz startet Windows den Dienst nach 1 Minute automatisch neu.
 - Ohne Oberfläche per Kommandozeile (als Administrator):
     PingMonitor.exe /install      installieren und starten
@@ -451,7 +523,7 @@ Windows-Dienst (optional)
 
 Benachrichtigungen (Webhook / E-Mail)
 ------------------------------------
-Schaltfläche "Benachrichtigungen ..." in der App. Gilt für App UND Dienst (gespeichert in settings.txt,
+Einstellungen -> "Benachrichtigungen ..." in der App. Gilt für App UND Dienst (gespeichert in settings.txt,
 der Dienst übernimmt Änderungen automatisch).
 - Wann: bei Ausfall und/oder wenn das Gerät wieder erreichbar ist (mit Ausfalldauer).
   Pro Gerät gibt es genau 1 Offline- und 1 Online-Meldung - nicht eine pro verlorenem Ping.
@@ -459,6 +531,19 @@ der Dienst übernimmt Änderungen automatisch).
     keine Meldung aus (1 = sofort). Protokolliert wird trotzdem jeder Ausfall.
   * "Online melden nach X erfolgreichen Pings in Folge" (Standard 3): ein "flatterndes" Gerät
     gilt so lange weiter als offline - keine neue Offline-Meldung bei jedem Aussetzer.
+  * Mindestdauer (Standard 2 Minuten): kürzere Aussetzer werden nicht gemeldet. In dieser Zeit erkennt die
+    Ausfall-Diagnose ausgeschaltete Geräte - die werden gar nicht gemeldet.
+- Nur melden, wenn ...:
+  * "Gerät enthält": nur Geräte, deren Name, IP oder Kommentar einen der Begriffe enthält (z. B. "Server, NAS, 10.0.0.").
+  * "Nie melden": diese Geräte nie.
+  * WLAN- und Mobilgeräte (Handys, Tablets, zufällige MAC) nicht melden.
+- Befunde (siehe "Befunde"): Standard nur "sicher" und mindestens Warnung; wählbar "ab wahrscheinlich" bzw. "auch
+  Hinweise" und "nur Probleme", Bereiche (Port, Gerät, WLAN, Internet, Netz, Dieser PC, Datenquellen). Jeder Befund wird
+  nur einmal gemeldet (mit Belegen und erstem Schritt); optional "BEHOBEN", wenn ein gemeldeter Befund nach einer
+  Maßnahme bestätigt behoben bzw. nicht mehr festgestellt ist.
+- Ruhezeit (z. B. 22-6 Uhr): Meldungen werden gesammelt und danach als eine Zusammenfassung gesendet; Ausfälle auf
+  Wunsch trotzdem sofort.
+- Täglicher Bericht zur gewählten Uhrzeit: offene Befunde nach Sicherheit, Nachprüfungen, Ausfälle der letzten 24 h.
 - Sammeln und begrenzen:
   * Sammelzeit (Standard 15 s): alle Ereignisse innerhalb dieser Zeit - auch von mehreren
     Geräten - gehen als EINE Nachricht raus, z. B. "3 Geräte AUSGEFALLEN" mit Liste.
@@ -470,7 +555,7 @@ der Dienst übernimmt Änderungen automatisch).
     {"event":"outage","title":"AUSFALL","name":"Drucker","host":"192.168.1.50",
      "time":"2026-10-07T14:03:12+02:00","since":null,"details":"Zeitüberschreitung",
      "computer":"SERVER01","source":"Dienst","text":"AUSFALL: Drucker ...","content":"AUSFALL: Drucker ..."}
-  event = outage | recovered | test | summary. Bei "summary" (Sammelmeldung) enthält "events" die
+  event = outage | recovered | issue (Befund) | fixed (behoben) | notfixed (nicht behoben) | digest (Tagesbericht) | test | summary. Bei "summary" (Sammelmeldung) enthält "events" die
   Liste der einzelnen Ereignisse, "count" deren Anzahl, "note" ggf. den Hinweis auf die Begrenzung. "text"/"content" enthalten die fertige Nachricht, damit
   Slack, Microsoft Teams (Workflows), Discord, Mattermost usw. sie direkt anzeigen.
 - E-Mail: über SMTP, Port 587 mit STARTTLS (z. B. Microsoft 365, GMX, web.de) oder Port 25 ohne
@@ -485,7 +570,7 @@ der Dienst übernimmt Änderungen automatisch).
 Protokoll
 ---------
 - Beim ersten fehlgeschlagenen Ping: Eintrag "Ausfall" mit Zeitstempel.
-- Weitere Fehlschläge: "Ping fehlgeschlagen" (abschaltbar per Checkbox, gilt auch für den Dienst).
+- Weitere Fehlschläge: "Ping fehlgeschlagen" (abschaltbar unter Einstellungen -> Optionen, gilt auch für den Dienst).
 - Wenn das Gerät wieder antwortet: "Wieder erreichbar" inkl. Ausfalldauer.
 - Logdatei: Ordner "Logs" neben der EXE, eine CSV-Datei pro Tag (PingLog_JJJJ-MM-TT.csv,
   Trennzeichen ";" - direkt in Excel öffnen). Spalte "Quelle": App oder Dienst.
@@ -494,7 +579,10 @@ Dateien
 -------
 hosts.txt          Geräteliste (Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller;Kommentar;DNS-Name;NetBIOS;Geräteinfo)
 settings.txt       Einstellungen inkl. Benachrichtigungen, DNS-Server, SNMP-Community
-Logs\              Ausfallprotokolle
+Logs\              Ausfallprotokolle (PingLog_*), Syslog (Syslog_*), Langzeitdaten (Verlauf_*)
+befunde.txt        Befunde mit Status und Maßnahmen (schreibt die Überwachung)
+massnahmen.txt     gemeldete Maßnahmen aus der Oberfläche (wird von der Überwachung übernommen und gelöscht)
+abfragen.txt       Signal "sofort neu abfragen" (Aktualisieren) an den Dienst
 switches.txt       Switch-Liste (Name;IP;Community)
 mac_ports.txt      zuletzt bekannter Switch-Port je Geräte-MAC
 Switch_Status.csv  aktueller Switch-Status des Dienstes (für die Anzeige in der App)
