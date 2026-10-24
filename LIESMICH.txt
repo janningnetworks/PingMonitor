@@ -1,4 +1,4 @@
-PingMonitor - Geräte per Ping überwachen (App und optional Windows-Dienst)
+PingMonitor 4 - Geräte per Ping überwachen, Netzwerkfehler finden (App und optional Windows-Dienst)
 ==========================================================================
 
 Ablage
@@ -150,6 +150,64 @@ Zurücksetzen
 ------------
 "Zurücksetzen ..." löscht wahlweise Geräteliste (hosts.txt), Switch-Liste (switches.txt, mac_ports.txt),
 alle Protokolle und optional die Einstellungen. Nicht rückgängig zu machen.
+
+Firewall (OPNsense) per SNMP
+----------------------------
+Die Firewall wie einen Switch unter "Switches ..." eintragen (oder per "Switches suchen ..." finden).
+OPNsense: Plugin "os-net-snmp" installieren (System -> Firmware -> Plugins), unter Dienste -> Net-SNMP
+aktivieren und eine Community vergeben.
+- Wird automatisch als "Firewall" erkannt. Gelesen werden alle Schnittstellen (auch PPPoE, VLAN, VPN),
+  die WAN-Schnittstelle (über die Standardroute), Datenrate und Auslastung, CPU, RAM, Systemlast und
+  Anzahl offener TCP-Verbindungen. Neustarts werden protokolliert.
+- Bewertung: WAN ohne Link ("Internet-Leitung weg"), Leitung ausgelastet (>= 80 %), CPU >= 75/90 %,
+  RAM >= 90 %, Fehler und Link-Wechsel wie bei Switch-Ports.
+- Im Netzwerkplan erscheinen diese Werte am Gateway bzw. beim Internet-Knoten.
+- Firewall-Regeln/Paketfilter-Statistiken liefert das SNMP-Plugin nicht (nur über die OPNsense-API).
+Auslastung (Datenrate je Port) wird jetzt auch bei Switches angezeigt (Spalte "Datenrate").
+
+Port-Zuordnung (welches Gerät hängt an welchem Switch-Port)
+----------------------------------------------------------
+Ein Switch lernt die MAC eines Geräts nicht nur an dessen Port, sondern auch an jedem Port, der zu einem
+anderen Switch führt. Die App bestimmt deshalb zuerst die Rolle jedes Ports:
+  Uplink               am Port wird das Gateway gesehen
+  Switch-Verbindung    am Port wird ein anderer eingetragener Switch gesehen, oder LLDP meldet einen
+                       Switch/Router (Bridge-/Router-Fähigkeit)
+  Access Point         LLDP meldet einen WLAN-AP bzw. ein als AP erkanntes Gerät hängt dort
+  Endgerät             alles andere
+Geräte werden bevorzugt Endgeräte-Ports zugeordnet. Wird ein Gerät nur an Switch-Verbindungen gesehen,
+steht dort "nur an Switch-Verbindung gesehen - hängt an einem nicht eingetragenen Switch/AP".
+Tipp: Alle verwalteten Switches eintragen und LLDP an den Switches eingeschaltet lassen (UniFi: Standard).
+
+Mitschnitt analysieren (pcap / pcapng)
+--------------------------------------
+Schaltfläche "Mitschnitt analysieren ..." (Datei öffnen oder ins Fenster ziehen), oder direkt:
+    PingMonitor.exe /analyze datei.pcapng
+Formate: .pcap / .pcapng von Wireshark, tcpdump, OPNsense und Windows pktmon (Ethernet, VLAN, Linux-SLL).
+Wo mitschneiden?
+  * OPNsense: Schnittstellen -> Diagnose -> Paketmitschnitt, LAN-Schnittstelle, danach herunterladen.
+    Dort sieht man den Verkehr aller Geräte zum Gateway/Internet.
+  * Wireshark am betroffenen PC, oder an einem Spiegel-Port (Port Mirroring) des Switches.
+  * Windows ohne Zusatzsoftware (Eingabeaufforderung als Administrator):
+        pktmon start --capture --pkt-size 0
+        ... Problem abwarten ...
+        pktmon stop
+        pktmon etl2pcap PktMon.etl          (erzeugt PktMon.pcapng)
+Erkannt und in Klartext erklärt werden u. a.:
+  - mehrere DHCP-Server (z. B. mitgebrachter Router/FRITZ!Box) inkl. Hersteller und verteiltem Gateway
+  - DHCP-Server antwortet nicht, DHCP-Ablehnungen (NAK), mehrere DHCPv6-Server
+  - doppelte IP-Adressen, Adressen ohne ARP-Antwort (Gerät nicht im Netz)
+  - Ping-Verluste im Mitschnitt (mit Zeitpunkten), "Ziel nicht erreichbar", ICMP-Umleitungen, MTU-Probleme
+  - TCP-Wiederholungen (Paketverlust auf der Strecke) inkl. betroffener Verbindungen, Zero-Window,
+    Dienste, die nicht antworten
+  - Spanning-Tree-Topologie-Änderungen (ein Link war kurz weg), Wechsel der Root-Bridge
+  - Broadcast-Spitzen / Broadcast-Sturm (Netzwerkschleife)
+  - DNS-Server, die nicht oder mit Fehlern antworten
+  - mehrere IPv6-Router (Router Advertisements)
+  - an welchem Switch/Port der mitschneidende Anschluss hängt (LLDP/CDP)
+Zeitleiste: Ereignisse aus dem Mitschnitt und aus dem Ausfallprotokoll (gleicher Zeitraum) nebeneinander.
+"Zusammenhang": Zu jedem Ausfall im Protokoll zeigt die App, was im Mitschnitt zur selben Zeit (±15 s)
+passiert ist - z. B. "STP-Topologie-Änderung 2 s vor dem Ausfall" = ein Link war kurz weg.
+Zu jedem Befund gibt es einen Wireshark-Filter zum Nachsehen und - wo sinnvoll - einen Link.
 
 Windows-Dienst (optional)
 -------------------------
