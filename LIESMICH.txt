@@ -205,7 +205,10 @@ gelten als virtuelle Schnittstelle (VM/Container/Docker) und nicht als WLAN-Ger�
 UniFi-Controller (genaue Zuordnung LAN-Port und WLAN)
 ------------------------------------------------------
 "Switches ..." -> "UniFi-Controller ...": Adresse (UDM/UDR/Cloud Key/UniFi OS Server: einfach die IP,
-klassischer Controller: https://name:8443), Benutzer, Passwort, Site (Standard "default").
+klassischer Controller: https://name:8443), Benutzer, Passwort, Site.
+  - Site: einfach den Namen wie im Controller eintragen (z. B. "janning networks", auch mit Leerzeichen) -
+    intern verwendet UniFi eine Kennung ("default" oder z. B. "x7k2m9qa"), die PingMonitor selbst ermittelt.
+    "Verbindung testen" l채dt die Liste aller Sites in das Auswahlfeld. Gibt es nur eine Site, gen체gt "default".
   - Im Controller einen eigenen LOKALEN Benutzer anlegen (Admins -> Benutzer hinzuf체gen, "Restrict to local
     access only"), Rolle "View Only" bzw. "Nur lesen". UI-Cloud-Konten mit Zwei-Faktor gehen nicht.
   - PingMonitor liest nur (Ger채te- und Clientliste), 채ndert nichts. Das Passwort wird verschl체sselt

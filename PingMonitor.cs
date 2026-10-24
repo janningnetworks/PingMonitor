@@ -8858,6 +8858,8 @@ namespace PingMonitor
     {
         public readonly List<UniFiClientInfo> Clients = new List<UniFiClientInfo>();
         public readonly List<UniFiDeviceInfo> Devices = new List<UniFiDeviceInfo>();
+        public readonly List<KeyValuePair<string, string>> Sites = new List<KeyValuePair<string, string>>();   // interne Kennung -> Anzeigename
+        public string Site = "";        // tatsächlich verwendete Site (interne Kennung)
         public string Error = "";
         public DateTime Fetched = DateTime.MinValue;
 
@@ -8984,11 +8986,35 @@ namespace PingMonitor
                     continue;
                 }
 
-                string api = b + prefix + "/api/s/" + Uri.EscapeDataString(site.Trim());
+                // Sites: in der API zählt die interne Kennung ("default" oder z. B. "x7k2m9qa"), angezeigt wird der Name
+                string sitesJson, siteId = SiteKey(site);
+                if (Http("GET", b + prefix + "/api/self/sites", null, cookies, csrf, out status, out sitesJson, out headers) && status == 200)
+                {
+                    try
+                    {
+                        foreach (object o in Data(sitesJson))
+                        {
+                            Dictionary<string, object> so = o as Dictionary<string, object>;
+                            if (so != null && Json.S(so, "name").Length > 0)
+                                snap.Sites.Add(new KeyValuePair<string, string>(Json.S(so, "name"), Json.S(so, "desc").Length > 0 ? Json.S(so, "desc") : Json.S(so, "name")));
+                        }
+                    }
+                    catch (FormatException) { }
+                    siteId = ResolveSite(snap.Sites, site);
+                    if (siteId.Length == 0)
+                    {
+                        List<string> names = new List<string>();
+                        foreach (KeyValuePair<string, string> kv in snap.Sites) names.Add("\"" + kv.Value + "\"");
+                        errors.Add(b + ": Site \"" + site.Trim() + "\" nicht gefunden. Vorhanden: " + string.Join(", ", names.ToArray()));
+                        continue;
+                    }
+                }
+                snap.Site = siteId;
+                string api = b + prefix + "/api/s/" + Uri.EscapeDataString(siteId);
                 string devJson, staJson;
                 if (!Http("GET", api + "/stat/device", null, cookies, csrf, out status, out devJson, out headers) || status != 200)
                 {
-                    errors.Add(b + ": Geräteliste nicht lesbar (HTTP " + status + ") - Site-Name richtig? (Standard: default)");
+                    errors.Add(b + ": Geräteliste nicht lesbar (HTTP " + status + ") - Site richtig?");
                     continue;
                 }
                 if (!Http("GET", api + "/stat/sta", null, cookies, csrf, out status, out staJson, out headers) || status != 200)
@@ -9011,6 +9037,31 @@ namespace PingMonitor
             }
             snap.Error = string.Join(" | ", errors.ToArray());
             return snap;
+        }
+
+        /// <summary>Eingegebene Site (Kennung, Anzeigename oder "Name [kennung]") der internen Kennung zuordnen.
+        /// Leer = nicht gefunden. Gibt es nur eine Site und ist nichts bzw. "default" eingetragen, wird diese verwendet.</summary>
+        public static string ResolveSite(List<KeyValuePair<string, string>> sites, string entered)
+        {
+            string e = SiteKey(entered);
+            foreach (KeyValuePair<string, string> kv in sites) if (string.Equals(kv.Key, e, StringComparison.OrdinalIgnoreCase)) return kv.Key;
+            foreach (KeyValuePair<string, string> kv in sites) if (string.Equals(kv.Value.Trim(), e, StringComparison.OrdinalIgnoreCase)) return kv.Key;
+            if (sites.Count == 1 && (e.Length == 0 || e == "default")) return sites[0].Key;
+            if (sites.Count == 0) return e.Length > 0 ? e : "default";
+            return "";
+        }
+
+        /// <summary>"janning networks  [default]" -> "default"; sonst der Text selbst.</summary>
+        public static string SiteKey(string text)
+        {
+            string t = (text ?? "").Trim();
+            int a = t.LastIndexOf('['), z = t.LastIndexOf(']');
+            return a >= 0 && z == t.Length - 1 && z > a + 1 ? t.Substring(a + 1, z - a - 1).Trim() : t;
+        }
+
+        public static string SiteText(KeyValuePair<string, string> site)
+        {
+            return site.Value == site.Key ? site.Key : site.Value + "  [" + site.Key + "]";
         }
 
         static List<object> Data(string json)
@@ -9162,7 +9213,8 @@ namespace PingMonitor
     /// <summary>Zugangsdaten für den UniFi-Controller.</summary>
     class UniFiForm : Form
     {
-        TextBox txtUrl, txtUser, txtPassword, txtSite;
+        TextBox txtUrl, txtUser, txtPassword;
+        ComboBox txtSite;
         Button btnTest;
 
         public UniFiForm()
@@ -9198,7 +9250,23 @@ namespace PingMonitor
             txtUser = Row(t, 3, "Benutzer:", Config.Get(d, "UniFi.Benutzer", ""), 200);
             txtPassword = Row(t, 4, "Passwort:", NotifyConfig.Unprotect(Config.Get(d, "UniFi.Passwort", "")), 200);
             txtPassword.UseSystemPasswordChar = true;
-            txtSite = Row(t, 5, "Site:", Config.Get(d, "UniFi.Site", "default"), 120);
+            Label ls = new Label(); ls.Text = "Site:"; ls.AutoSize = true; ls.Margin = new Padding(3, 7, 3, 3);
+            txtSite = new ComboBox();
+            txtSite.DropDownStyle = ComboBoxStyle.DropDown;
+            txtSite.Width = 260;
+            txtSite.Text = Config.Get(d, "UniFi.Site", "default");
+            FlowLayoutPanel sitePanel = new FlowLayoutPanel();
+            sitePanel.AutoSize = true;
+            sitePanel.Margin = new Padding(0);
+            sitePanel.Controls.Add(txtSite);
+            Label siteHint = new Label();
+            siteHint.AutoSize = true;
+            siteHint.ForeColor = SystemColors.GrayText;
+            siteHint.Margin = new Padding(6, 6, 3, 3);
+            siteHint.Text = "Name wie im Controller - \"Verbindung testen\" lädt die Liste";
+            sitePanel.Controls.Add(siteHint);
+            t.Controls.Add(ls, 0, 5);
+            t.Controls.Add(sitePanel, 1, 5);
 
             FlowLayoutPanel b = new FlowLayoutPanel();
             b.AutoSize = true;
@@ -9240,7 +9308,7 @@ namespace PingMonitor
                     int wlan = 0, aps = 0, sw = 0;
                     foreach (UniFiClientInfo c in s.Clients) if (!c.Wired) wlan++;
                     foreach (UniFiDeviceInfo d in s.Devices) { if (d.IsAp) aps++; else if (d.Type == "usw") sw++; }
-                    msg = "Verbindung OK.\n\n" + s.Devices.Count + " UniFi-Geräte (" + sw + " Switches, " + aps + " Access Points)\n" +
+                    msg = "Verbindung OK.\n\nSite: " + SiteName(s) + "\n" + s.Devices.Count + " UniFi-Geräte (" + sw + " Switches, " + aps + " Access Points)\n" +
                           s.Clients.Count + " Clients, davon " + wlan + " per WLAN";
                 }
                 else msg = "Keine Verbindung:\n" + s.Error.Replace(" | ", "\n");
@@ -9250,6 +9318,15 @@ namespace PingMonitor
                     {
                         Cursor = Cursors.Default;
                         btnTest.Enabled = true;
+                        if (s.Sites.Count > 0)
+                        {
+                            string typed = txtSite.Text;
+                            txtSite.Items.Clear();
+                            foreach (KeyValuePair<string, string> kv in s.Sites) txtSite.Items.Add(UniFi.SiteText(kv));
+                            KeyValuePair<string, string> used = s.Sites.Find(delegate (KeyValuePair<string, string> kv) { return kv.Key == s.Site; });
+                            txtSite.Text = s.Valid && used.Key != null ? UniFi.SiteText(used) : typed;
+                            if (!s.Valid) txtSite.DroppedDown = true;
+                        }
                         MessageBox.Show(this, msg, Text, MessageBoxButtons.OK, s.Valid ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
                     }));
                 }
@@ -9257,6 +9334,12 @@ namespace PingMonitor
             });
             th.IsBackground = true;
             th.Start();
+        }
+
+        static string SiteName(UniFiSnapshot s)
+        {
+            foreach (KeyValuePair<string, string> kv in s.Sites) if (kv.Key == s.Site) return UniFi.SiteText(kv);
+            return s.Site;
         }
 
         void Save()
