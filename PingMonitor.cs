@@ -5588,6 +5588,7 @@ namespace PingMonitor
         public bool FromUniFi;           // nicht per SNMP abgefragt, Daten vom UniFi-Controller
         public DateTime LastOk;          // letzte erfolgreiche Abfrage
         public Dictionary<int, string> VlanNames = new Dictionary<int, string>();
+        public bool EgressKnown;         // SNMP liefert getaggte VLANs je Port (Q-BRIDGE Egress) - bei UniFi oft nicht/unvollständig
         public List<string> IfAddrs = new List<string>();   // eigene IP-Adressen (Firewall): "IP/Präfix/ifIndex"
 
         /// <summary>Schnittstelle (ifIndex) der Firewall, in deren Netz die IP liegt; -1 = unbekannt.</summary>
@@ -6450,6 +6451,7 @@ namespace PingMonitor
             lock (sync)
             {
                 s.VlanNames = names;
+                s.EgressKnown = egress.Count > 1 || egress.Count == 1 && !egress.ContainsKey(1);   // nur VLAN 1 = Tabelle unbrauchbar
                 foreach (PortState p in s.Ports.Values) { if (!p.Wireless) { p.Pvid = 0; p.Tagged.Clear(); p.VlanFromSnmp = false; } }
                 foreach (KeyValuePair<int, SnmpValue> kv in pvid)
                 {
@@ -6960,10 +6962,18 @@ namespace PingMonitor
         static void CheckApPort(SwitchState s, PortState p, SwitchState ap)
         {
             if (unifi.Wlans.Count == 0) return;
+            UniFiDeviceInfo apDev = unifi.Devices.Find(delegate (UniFiDeviceInfo d) { return d.IsAp && Matches(ap, d); });
             List<string> missing = new List<string>();
             foreach (KeyValuePair<string, int> w in unifi.Wlans)
-                if (w.Value > 0 && w.Value != p.Pvid && !p.Tagged.Contains(w.Value) && !missing.Contains(w.Key + " (VLAN " + w.Value + ")"))
-                    missing.Add("\"" + w.Key + "\" (VLAN " + VlanLabel(w.Value, s, unifi) + ")");
+            {
+                if (w.Value <= 0 || w.Value == p.Pvid || p.Tagged.Contains(w.Value) || missing.Contains("\"" + w.Key + "\" (VLAN " + VlanLabel(w.Value, s, unifi) + ")")) continue;
+                // Gegenprobe mit der Wirklichkeit: Haben Clients dieses WLANs an diesem AP eine gültige Adresse, kommt das VLAN an
+                // (die VLAN-Tabelle des Switches per SNMP ist dann unvollständig - bei UniFi-Switches häufig).
+                string ssid = w.Key;
+                if (apDev != null && unifi.Clients.Exists(delegate (UniFiClientInfo c) { return !c.Wired && c.Essid == ssid && NetTools.MacHex(c.ApMac) == NetTools.MacHex(apDev.Mac) &&
+                    c.Ip.Length > 0 && !c.Ip.StartsWith("169.254."); })) continue;
+                missing.Add("\"" + w.Key + "\" (VLAN " + VlanLabel(w.Value, s, unifi) + ")");
+            }
             if (missing.Count > 0)
                 p.VlanIssues.Add(new Finding(Finding.Problem, "WLAN-VLAN fehlt zum AP",
                     "Der Access Point " + ap.Name + " strahlt " + string.Join(", ", missing.ToArray()) + " aus, das VLAN kommt an diesem Port aber nicht an. " +
@@ -7014,6 +7024,12 @@ namespace PingMonitor
                             {
                                 p.CfgPvid = up.NativeVlan; p.CfgTagged.Clear(); p.CfgTagged.AddRange(up.Tagged);
                                 if (!p.VlanFromSnmp) { p.Pvid = up.NativeVlan; p.Tagged.Clear(); p.Tagged.AddRange(up.Tagged); }
+                                else if (!snmp.EgressKnown)
+                                {
+                                    // SNMP kennt nur das native VLAN: getaggte VLANs aus der Controller-Konfiguration übernehmen
+                                    p.Tagged.Clear();
+                                    foreach (int v in up.Tagged) if (v != p.Pvid) p.Tagged.Add(v);
+                                }
                             }
                         }
                         continue;
