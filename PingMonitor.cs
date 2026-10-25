@@ -15009,9 +15009,8 @@ namespace PingMonitor
             foreach (Syslog.SlowDhcp d in list.Count > 5 ? list.GetRange(list.Count - 5, 5) : list)
                 i.Evidence.Add("Syslog " + d.Server + " " + d.Time.ToString("dd.MM. HH:mm:ss") + ": " + d.Seconds.ToString("0.0") + " s bis zum ACK, " + d.Discovers + "× DISCOVER, " + d.Offers + "× OFFER, " + d.Requests + "× REQUEST");
             if (multiOffer > 0) i.Evidence.Add("Der Server hat jede Anfrage beantwortet, das Gerät fragte trotzdem erneut → Antworten gehen auf dem Rückweg verloren");
-            KeyValuePair<SwitchState, PortState> port;
+            KeyValuePair<SwitchState, PortState> port = new KeyValuePair<SwitchState, PortState>(null, null);
             bool hasPort = t != null && PortOf(t, out port);
-            if (!hasPort) port = new KeyValuePair<SwitchState, PortState>(null, null);
             i.Causes.Add("Spanning Tree: Endgeräte-Port braucht nach dem Link bis zu 30 s bis \"forwarding\" (kein Edge/PortFast) - die ersten Anfragen gehen verloren");
             i.Causes.Add("DHCP Guarding/Snooping verwirft die Antworten (Server nicht als vertrauenswürdig eingetragen)");
             i.Causes.Add("VLAN/WLAN: Antworten landen im falschen VLAN bzw. WLAN-Anmeldung dauert");
