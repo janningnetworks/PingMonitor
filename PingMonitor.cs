@@ -2221,6 +2221,18 @@ namespace PingMonitor
             }
             sb.AppendLine((LogForward.Target.Length > 0 ? "✓ " : "– ") + "Weiterleitung: " + (LogForward.Target.Length > 0 ? LogForward.Target + (LogForward.OnlyWindows ? " (nur Windows-Ereignisse, Agent)" : "") : "aus") +
                 ",  Aufbewahrung: " + (Retention.Days > 0 ? Retention.Days + " Tage" : "unbegrenzt"));
+            Dictionary<string, int> contrib = new Dictionary<string, int>();
+            int openIssues = 0;
+            foreach (Issue i in SwitchMonitor.CurrentIssues(svc))
+            {
+                if (!(i.State == Issue.Open || i.State == Issue.NotFixed || i.State == Issue.Checking)) continue;
+                openIssues++;
+                foreach (string q in i.Sources.Split(new string[] { " + " }, StringSplitOptions.RemoveEmptyEntries)) { int n; contrib.TryGetValue(q, out n); contrib[q] = n + 1; }
+            }
+            List<string> cl = new List<string>();
+            foreach (KeyValuePair<string, int> kv in contrib) cl.Add(kv.Key + " " + kv.Value);
+            sb.AppendLine("Beitrag zu den " + openIssues + " offenen Befunden: " + (cl.Count > 0 ? string.Join(", ", cl.ToArray()) : "-") +
+                "  (ein Befund kann mehrere Quellen haben; Details je Befund unter \"Belege\")");
             sb.AppendLine();
             List<SwitchMonitor.Conflict> cs = SwitchMonitor.CurrentConflicts(svc);
             sb.AppendLine("=== WIDERSPRÜCHE ZWISCHEN DEN QUELLEN (" + cs.Count + ") ===");
@@ -9334,6 +9346,12 @@ namespace PingMonitor
             if (wan.Length > 0) lines.Add(wan);
             string own = WinEvents.Near(DateTime.Now.AddSeconds(-20), TimeSpan.FromMinutes(2));
             if (own.Length > 0) lines.Add("ⓘ Dieser PC (" + Environment.MachineName + "): " + own + " - betrifft die Messung selbst.");
+            Syslog.AgentEvent ag = Syslog.AgentNear(t, DateTime.Now.AddSeconds(-20), TimeSpan.FromMinutes(2), false);
+            if (ag != null)
+            {
+                lines.Add("● Agent auf " + ag.Pc + " meldet um " + ag.Time.ToString("HH:mm:ss") + ": " + ag.Event);
+                if (ag.Kind == "power") verdict = "vermutlich aus: " + ag.Event + " (laut Agent)";
+            }
             string wlan = SwitchMonitor.WlanDiagnosis(t);
             if (wlan.Length > 0) lines.Add(wlan);
             else if (Topology.RandomMac(t.Mac) || Topology.MobileVendor(t.Vendor))
@@ -10663,7 +10681,49 @@ namespace PingMonitor
             e.Host = m.From;
             e.Event = evt; e.Info = info;
             e.Source = "Agent " + pc;
+            AgentEvent ae = new AgentEvent();
+            ae.Time = m.Time; ae.Pc = pc; ae.From = m.From; ae.Event = evt.StartsWith("Windows: ") ? evt.Substring(9) : evt; ae.Info = info;
+            lock (AgentEvents) { AgentEvents.Add(ae); AgentEvents.RemoveAll(delegate (AgentEvent x) { return DateTime.Now - x.Time > TimeSpan.FromDays(2); }); if (AgentEvents.Count > 2000) AgentEvents.RemoveAt(0); }
             try { CsvLog.Write(e); } catch { }
+        }
+
+        /// <summary>Windows-Ereignis eines Agent-PCs (für Befunde und Ausfall-Diagnose).</summary>
+        public class AgentEvent
+        {
+            public DateTime Time; public string Pc = "", From = "", Event = "", Info = "";
+            public string Kind
+            {
+                get
+                {
+                    string t = Event.ToLowerInvariant();
+                    if (t.Contains("zurückgesetzt")) return "nicreset";
+                    if (t.Contains("adresskonflikt")) return "ipconflict";
+                    if (t.Contains("energiespar-/geschwindigkeit")) return "nicpower";
+                    if (t.Contains("standby") || t.Contains("ruhezustand") || t.Contains("aufgewacht") || t.Contains("heruntergefahren") || t.Contains("neustart") || t.Contains("gestartet")) return "power";
+                    if (t.Contains("getrennt") || t.Contains("link") || t.Contains("treiber")) return "link";
+                    return "";
+                }
+            }
+        }
+        public static readonly List<AgentEvent> AgentEvents = new List<AgentEvent>();
+
+        /// <summary>Gehört ein Agent-Ereignis zu diesem Gerät der Liste? (IP des Absenders oder Rechnername)</summary>
+        public static bool AgentMatches(AgentEvent a, PingTarget t)
+        {
+            if (a.From == t.Host) return true;
+            string pc = a.Pc.Split('.')[0];
+            foreach (string n in new string[] { t.Name, t.NetBiosName, t.DnsName, t.Host })
+                if (!string.IsNullOrEmpty(n) && n != "-" && string.Equals(n.Split('.')[0], pc, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        /// <summary>Energie-/Netzwerk-Ereignis eines Agent-PCs um einen Zeitpunkt, sonst null.</summary>
+        public static AgentEvent AgentNear(PingTarget t, DateTime when, TimeSpan window, bool powerOnly)
+        {
+            lock (AgentEvents)
+                foreach (AgentEvent a in AgentEvents)
+                    if (Math.Abs((a.Time - when).TotalSeconds) <= window.TotalSeconds && (a.Kind == "power" || !powerOnly && a.Kind.Length > 0) && AgentMatches(a, t)) return a;
+            return null;
         }
 
         /// <summary>Höchstens 10 gleichartige Meldungen pro Gerät und Minute ins Ausfallprotokoll.</summary>
@@ -11432,8 +11492,31 @@ namespace PingMonitor
                                 int pv; int.TryParse(pnp, out pv);
                                 if ((pv & 0x10) == 0 && (pv & 0x8) == 0)
                                     f.Add("Windows darf die Karte zum Energiesparen abschalten (Geräte-Manager → Karte → Energieverwaltung → Haken entfernen)");
-                                r.Add((ifType == "71" ? "WLAN: " : "LAN: ") + desc + (f.Count == 0 ? "\r\n    ✓ keine Energiesparfunktionen aktiv, Geschwindigkeit automatisch"
-                                    : "\r\n    ▲ " + string.Join("\r\n    ▲ ", f.ToArray())));
+                                // Paketgröße: Jumbo Frames und MTU
+                                int jumbo; int.TryParse(Str(k, "*JumboPacket"), out jumbo);
+                                if (jumbo > 1514)
+                                    f.Add("Jumbo Frames an (" + jumbo + " Byte) - nur richtig, wenn ALLE Geräte und Switches auf dem Weg das ebenfalls können; sonst gehen große Pakete " +
+                                        "verloren (Kopieren/Backups langsam oder brechen ab, Webseiten hängen). Im normalen Netz: \"Deaktiviert\" bzw. 1514");
+                                int mtu = Mtu(desc);
+                                if (mtu > 0 && mtu != 1500 && !(jumbo > 1514 && mtu > 1500))
+                                    f.Add("MTU " + mtu + " statt 1500 - kleinere MTU (VPN-Software, Tuning-Tools) macht Übertragungen langsamer, größere ohne Jumbo-Unterstützung " +
+                                        "führt zu Verlusten. Prüfen: netsh interface ipv4 show subinterfaces; zurücksetzen: netsh interface ipv4 set subinterface \"<Name>\" mtu=1500 store=persistent");
+                                string vlan = Str(k, "VlanID");
+                                if (vlan.Length == 0) vlan = Str(k, "*VlanId");
+                                int vid; int.TryParse(vlan, out vid);
+                                if (vid > 0) f.Add("Die Karte sendet getaggt in VLAN " + vid + " - der Switch-Port muss VLAN " + vid + " getaggt zulassen, sonst keine Verbindung (gewollt?)");
+                                // Offloading: normalerweise gut - nur Hinweise, da bei bestimmten Treibern/VPN/Hyper-V Ursache für langsame oder hängende Übertragungen
+                                List<string> info = new List<string>();
+                                if (Str(k, "*LsoV2IPv4") == "1" || Str(k, "*LsoV2IPv6") == "1" || Str(k, "*LsoV1IPv4") == "1")
+                                    info.Add("Large Send Offload (LSO) an - normal; bei langsamen/hängenden Übertragungen mit VPN, Hyper-V oder älteren Realtek-/Intel-Treibern testweise abschalten");
+                                if (Str(k, "*RscIPv4") == "1" || Str(k, "*RscIPv6") == "1")
+                                    info.Add("Receive Segment Coalescing (RSC) an - normal; bei Problemen mit VMs/Firewalls (falsch zusammengesetzte Pakete) testweise abschalten");
+                                if (Str(k, "*TCPChecksumOffloadIPv4") == "0" || Str(k, "*IPChecksumOffloadIPv4") == "0")
+                                    info.Add("Prüfsummen-Offload aus - funktioniert, belastet aber die CPU; meist durch frühere Fehlersuche abgeschaltet");
+                                string fc = Str(k, "*FlowControl");
+                                if (fc == "0") info.Add("Flusskontrolle aus - normal; bei Microbursts (verworfene Pakete am Switch-Port) kann \"Rx & Tx aktiviert\" helfen");
+                                r.Add((ifType == "71" ? "WLAN: " : "LAN: ") + desc + (f.Count == 0 ? "\r\n    ✓ Energiesparen aus, Geschwindigkeit automatisch, MTU/Jumbo Frames normal"
+                                    : "\r\n    ▲ " + string.Join("\r\n    ▲ ", f.ToArray())) + (info.Count > 0 ? "\r\n    ⓘ " + string.Join("\r\n    ⓘ ", info.ToArray()) : ""));
                             }
                         }
                         catch { }
@@ -11442,6 +11525,22 @@ namespace PingMonitor
             }
             catch { }
             return r;
+        }
+
+        /// <summary>IPv4-MTU der Schnittstelle mit dieser Treiberbeschreibung, 0 = unbekannt.</summary>
+        static int Mtu(string driverDesc)
+        {
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                    if (string.Equals(ni.Description, driverDesc, StringComparison.OrdinalIgnoreCase) && ni.OperationalStatus == OperationalStatus.Up)
+                    {
+                        IPv4InterfaceProperties p = ni.GetIPProperties().GetIPv4Properties();
+                        return p != null ? p.Mtu : 0;
+                    }
+            }
+            catch { }
+            return 0;
         }
 
         static string Str(Microsoft.Win32.RegistryKey k, string name)
@@ -13560,8 +13659,9 @@ namespace PingMonitor
     class AnalysisForm : Form
     {
         Label lblFile, lblCapture;
-        Button btnOpen, btnCapture;
+        Button btnOpen, btnCapture, btnImport;
         System.Windows.Forms.Timer captureTimer;
+        string currentFile = "";
         TabControl tabs;
         DataGridView gridFindings, gridTimeline, gridPings;
         RichTextBox txtDetail, txtOverview;
@@ -13588,6 +13688,12 @@ namespace PingMonitor
             btnCapture.AutoSize = true;
             btnCapture.Click += delegate { ToggleCapture(); };
             top.Controls.Add(btnCapture);
+            btnImport = new Button();
+            btnImport.AutoSize = true;
+            btnImport.Text = "Markierte in Befunde übernehmen";
+            btnImport.Enabled = false;
+            btnImport.Click += delegate { ImportSelected(); };
+            top.Controls.Add(btnImport);
             lblCapture = new Label();
             lblCapture.AutoSize = true;
             lblCapture.Margin = new Padding(6, 8, 3, 3);
@@ -13740,6 +13846,21 @@ namespace PingMonitor
             }
         }
 
+        /// <summary>Markierte Mitschnitt-Befunde in die Befundliste übernehmen (mit Plan und Nachprüfung).</summary>
+        void ImportSelected()
+        {
+            int n = 0;
+            foreach (DataGridViewRow r in gridFindings.SelectedRows)
+            {
+                Finding f = r.Tag as Finding;
+                if (f == null) continue;
+                try { Issues.ImportCapture(f.Level, f.Title, f.Text, currentFile); n++; } catch { }
+            }
+            MessageBox.Show(this, n == 0 ? "Bitte zuerst Befunde in der Liste markieren (Strg/Shift für mehrere)." :
+                n + " Befund(e) übernommen. Sie erscheinen nach der nächsten Abfragerunde unter Analyse → Befunde (Quelle \"Mitschnitt\") - mit \"Maßnahme durchgeführt\" " +
+                "und Nachprüfung; bestätigt wird dort durch einen neuen Mitschnitt.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
         void UpdateCapture()
         {
             string etl = LocalCapture.RunningEtl;
@@ -13802,6 +13923,7 @@ namespace PingMonitor
 
         public void Analyze(string file)
         {
+            currentFile = file;
             btnOpen.Enabled = false;
             lblFile.Text = "Werte aus: " + file + " ...";
             Cursor = Cursors.WaitCursor;
@@ -13851,6 +13973,7 @@ namespace PingMonitor
             foreach (Finding f in a.Findings)
             {
                 int i = gridFindings.Rows.Add(Finding.Symbol(f.Level), f.Title);
+                btnImport.Enabled = true;
                 DataGridViewRow row = gridFindings.Rows[i];
                 row.Tag = f;
                 row.DefaultCellStyle.BackColor = Finding.Back(f.Level);
@@ -14702,6 +14825,28 @@ namespace PingMonitor
         public bool IsOpen { get { return State == Open || State == NotFixed || State == Checking; } }
 
         public static string ConfText(int c) { return c >= Certain ? "Sicher" : c == Likely ? "Wahrscheinlich" : "Hinweis"; }
+
+        /// <summary>Welche Quellen tragen zu diesem Befund bei (aus Art und Belegen), z. B. "SNMP + Ping".</summary>
+        public string Sources
+        {
+            get
+            {
+                List<string> r = new List<string>();
+                string all = string.Join(" ", Evidence.ToArray());
+                Action<bool, string> add = delegate (bool c, string n) { if (c && !r.Contains(n)) r.Add(n); };
+                add(all.Contains("SNMP") || all.Contains("Zähler") || all.Contains("MAC-Tabelle") || all.Contains("ifLastChange") || all.Contains("laut Switch"), "SNMP");
+                add(all.Contains("UniFi"), "UniFi");
+                add(all.Contains("OPNsense") || all.Contains("Firewall"), "OPNsense");
+                add(all.Contains("Ping"), "Ping");
+                add(all.Contains("Syslog"), "Syslog");
+                add(all.Contains("Windows-Ereignis") || all.Contains("Windows meldet") || Kind == "nicpower" && Category == "Dieser PC", "Windows");
+                add(all.Contains("Agent"), "Agent");
+                add(all.Contains("Mitschnitt") || Kind == "capture", "Mitschnitt");
+                add(all.Contains("Netzwerk-Werkzeuge"), "Werkzeuge");
+                add(Kind == "conflict", "Abgleich");
+                return r.Count > 0 ? string.Join(" + ", r.ToArray()) : "-";
+            }
+        }
         public static string ConfSymbol(int c) { return c >= Certain ? "●●●" : c == Likely ? "●●○" : "●○○"; }
 
         public static Color ConfColor(int c, int severity)
@@ -14751,6 +14896,7 @@ namespace PingMonitor
             StringBuilder sb = new StringBuilder();
             sb.AppendLine(Title);
             sb.AppendLine(Object);
+            sb.AppendLine("Quellen: " + Sources);
             sb.AppendLine("Sicherheit: " + ConfText(Confidence) + " " + ConfSymbol(Confidence) + "   ·   Schwere: " +
                 (Severity >= Finding.Problem ? "Problem" : Severity == Finding.Warning ? "Warnung" : "Info") + "   ·   Status: " + State);
             sb.AppendLine("Festgestellt seit " + FirstSeen.ToString("dd.MM. HH:mm") + ", zuletzt " + LastSeen.ToString("dd.MM. HH:mm") +
@@ -14823,6 +14969,7 @@ namespace PingMonitor
                 try { DetectNetwork(found); } catch { }
                 try { DetectThisPc(found); } catch { }
                 foreach (SwitchMonitor.Conflict c in conflicts) try { found.Add(ConflictIssue(c)); } catch { }
+                try { ImportCaptures(); } catch { }
                 Merge(found);
                 Accumulate();
                 try { History(); } catch { }
@@ -14927,6 +15074,50 @@ namespace PingMonitor
             }
         }
 
+        public static string ImportFile { get { return Path.Combine(Config.BaseDir, "befunde_mitschnitt.txt"); } }
+
+        /// <summary>Oberfläche: Befund aus einem Mitschnitt übernehmen (Stufe, Titel, Text, Wireshark-Filter, Datei).</summary>
+        public static void ImportCapture(int level, string title, string text, string file)
+        {
+            string line = DateTime.Now.ToString(Fmt.Time) + ";" + level + ";" + Fmt.Csv(title) + ";" + Fmt.Csv(text.Replace("\r", "").Replace("\n", "\u001E")) + ";" + Fmt.Csv(file) + "\r\n";
+            File.AppendAllText(ImportFile, line, new UTF8Encoding(false));
+            SwitchMonitor.RequestPoll();
+        }
+
+        static void ImportCaptures()
+        {
+            if (!File.Exists(ImportFile)) return;
+            string work = ImportFile + ".work";
+            string[] lines;
+            try { if (File.Exists(work)) File.Delete(work); File.Move(ImportFile, work); lines = Config.ReadAllLinesShared(work); File.Delete(work); }
+            catch { return; }
+            foreach (string l in lines)
+            {
+                List<string> f = Fmt.ParseCsv(l);
+                if (f.Count < 5) continue;
+                DateTime at; DateTime.TryParseExact(f[0], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out at);
+                int level; int.TryParse(f[1], out level);
+                string title = f[2], file = f[4];
+                List<string> text = new List<string>(f[3].Split(new char[] { '\u001E' }, StringSplitOptions.RemoveEmptyEntries));
+                Issue i = New("capture", title + "|" + Path.GetFileName(file), "Netz", "Mitschnitt: " + title, "Mitschnitt " + Path.GetFileName(file), Math.Max(Finding.Info, level),
+                    level >= Finding.Problem ? Issue.Certain : Issue.Likely);
+                i.Occurred = at; i.FirstSeen = at; i.LastSeen = at; i.Rounds = 1; i.Seen = true;
+                i.Evidence.Add("Mitschnitt-Analyse (" + Path.GetFileName(file) + ", übernommen " + at.ToString("dd.MM. HH:mm") + "): " + (text.Count > 0 ? text[0] : title));
+                for (int k = 1; k < text.Count; k++)
+                {
+                    string x = text[k].Trim();
+                    if (x.StartsWith("Vorgehen") || x.StartsWith("Abhilfe")) i.Fix.Add(x);
+                    else if (x.StartsWith("Wireshark-Filter")) i.Narrow.Add(x);
+                    else if (x.StartsWith("Mehr dazu")) i.Read.Add(x);
+                    else if (x.Length > 0) i.Evidence.Add(x);
+                }
+                i.Fix.Add("Nach der Maßnahme erneut mitschneiden (gleiche Stelle, gleiche Dauer) und auswerten - ein Mitschnitt-Befund kann nur durch einen neuen Mitschnitt bestätigt werden.");
+                i.Narrow.Add("Mitschnitt erneut in \"Mitschnitt analysieren\" laden; Zeitleiste und Zusammenhang mit dem Ausfallprotokoll ansehen.");
+                if (!all.ContainsKey(i.Key)) all[i.Key] = i;
+                Log(i, "Befund aus Mitschnitt übernommen", title);
+            }
+        }
+
         static void Log(Issue i, string evt, string info)
         {
             LogEntry e = new LogEntry();
@@ -14961,6 +15152,7 @@ namespace PingMonitor
             {
                 if (e.Seen) continue;
                 e.Rounds = 0;
+                if (e.Kind == "capture") continue;   // aus einem Mitschnitt übernommen - bleibt bis zur Maßnahme/Erledigung offen
                 if ((e.State == Issue.Open || e.State == Issue.NotFixed) && now - e.LastSeen > TimeSpan.FromSeconds(2 * interval + 60))
                 {
                     e.State = Issue.Gone;
@@ -14982,6 +15174,7 @@ namespace PingMonitor
                 case "duplex": case "slowlink": case "vlan": case "wan": case "snmp": case "conflict": case "nicpower": case "cgnat": return TimeSpan.FromMinutes(15);
                 case "bcast": case "stpblock": case "outage": case "pps": case "mcast": case "mcflood": case "indrops": return TimeSpan.FromMinutes(30);
                 case "drops": case "temp": return TimeSpan.FromHours(2);
+                case "capture": return TimeSpan.FromHours(1);
                 case "quality": case "fwload": return TimeSpan.FromHours(1);
                 case "crc": case "txerr": case "util": case "stp": case "wlan": case "gateway": return TimeSpan.FromHours(2);
                 default: return TimeSpan.FromHours(24);   // flap, unstable, roam, dhcp, nicreset, ipconflict
@@ -15014,7 +15207,8 @@ namespace PingMonitor
                     {
                         e.State = Issue.Fixed;
                         e.Verify = "✓ BEHOBEN: Seit der Maßnahme vom " + e.ActionAt.ToString("dd.MM. HH:mm") + " (" + Milestones.Fmt(now - e.ActionAt) + ") nicht mehr aufgetreten." +
-                            (ba.Length > 0 ? "\r\n" + ba : "") + "\r\nPingMonitor beobachtet weiter und meldet, falls es wieder auftritt.";
+                            (ba.Length > 0 ? "\r\n" + ba : "") + (e.Kind == "capture" ? "\r\nHinweis: Befund aus einem Mitschnitt - zur Bestätigung erneut mitschneiden." :
+                            "\r\nPingMonitor beobachtet weiter und meldet, falls es wieder auftritt.");
                         Log(e, "Maßnahme erfolgreich", e.Title + " - " + Milestones.Fmt(now - e.ActionAt) + " ohne erneutes Auftreten");
                         if (e.Notified && cfg.OnFixed) Notifier.Enqueue(Notification.FromIssue(e, true, owner));
                     }
@@ -15759,8 +15953,16 @@ namespace PingMonitor
                 if (!t.Running || t.Sent == 0) continue;
                 if (t.OutageStart.HasValue && !t.OfflineMode && now - t.OutageStart.Value >= TimeSpan.FromMinutes(2)) found.Add(OutageIssue(t));
                 int n = 0; DateTime last = DateTime.MinValue;
-                lock (t.OutageTimes) foreach (DateTime d in t.OutageTimes) if (now - d < TimeSpan.FromDays(1)) { n++; last = d; }
-                if (n >= 2) found.Add(UnstableIssue(t, n, last));
+                int asleep = 0;
+                lock (t.OutageTimes)
+                    foreach (DateTime d in t.OutageTimes)
+                        if (now - d < TimeSpan.FromDays(1))
+                        {
+                            if (Syslog.AgentNear(t, d, TimeSpan.FromMinutes(3), true) != null) { asleep++; continue; }   // Standby/Neustart laut Agent - keine Störung
+                            n++; last = d;
+                        }
+                if (n >= 2) { Issue ui = UnstableIssue(t, n, last); if (asleep > 0) ui.Evidence.Add(asleep + " weitere Ausfälle nicht gezählt: Der Agent auf dem Gerät meldete zu der Zeit Standby/Neustart"); found.Add(ui); }
+                AgentIssues(t, found);
                 Assessment q = t.Quality.Evaluate();
                 if (q.Level >= Finding.Warning && !t.OutageStart.HasValue) found.Add(QualityIssue(t, q));
                 if (uf.Valid)
@@ -16044,8 +16246,95 @@ namespace PingMonitor
             return i;
         }
 
+        /// <summary>Befunde aus den Windows-Ereignissen eines Agent-PCs: Netzwerkkarten-Resets, IP-Konflikte, Energiespar-Einstellungen, Verbindungsabbrüche.</summary>
+        static void AgentIssues(PingTarget t, List<Issue> found)
+        {
+            List<Syslog.AgentEvent> ev;
+            lock (Syslog.AgentEvents) ev = Syslog.AgentEvents.FindAll(delegate (Syslog.AgentEvent a) { return DateTime.Now - a.Time < TimeSpan.FromDays(1) && Syslog.AgentMatches(a, t); });
+            if (ev.Count == 0) return;
+            List<Syslog.AgentEvent> resets = ev.FindAll(delegate (Syslog.AgentEvent a) { return a.Kind == "nicreset"; });
+            List<Syslog.AgentEvent> links = ev.FindAll(delegate (Syslog.AgentEvent a) { return a.Kind == "link"; });
+            List<Syslog.AgentEvent> conflicts = ev.FindAll(delegate (Syslog.AgentEvent a) { return a.Kind == "ipconflict"; });
+            Syslog.AgentEvent power = ev.FindLast(delegate (Syslog.AgentEvent a) { return a.Kind == "nicpower"; });
+            if (resets.Count > 0)
+            {
+                Issue i = New("nicreset", t.Host, "Gerät", resets.Count + "× Netzwerkkarte zurückgesetzt (24 h)", DevObj(t), resets.Count >= 2 ? Finding.Problem : Finding.Warning,
+                    resets.Count >= 2 ? Issue.Certain : Issue.Likely);
+                i.Ref = t.Host; i.Occurred = resets[resets.Count - 1].Time;
+                foreach (Syslog.AgentEvent a in resets.Count > 5 ? resets.GetRange(resets.Count - 5, 5) : resets) i.Evidence.Add("Agent " + a.Pc + ", Windows-Ereignis " + a.Time.ToString("dd.MM. HH:mm:ss") + ": " + a.Event);
+                i.Causes.Add("Netzwerkkarten-Treiber hängt (veraltet/fehlerhaft)"); i.Causes.Add("Energiesparfunktionen der Karte"); i.Causes.Add("Karte, Kabel oder Switch-Port defekt");
+                i.Fix.Add("Auf " + t.Name + ": Treiber direkt vom Hersteller aktualisieren."); i.Fix.Add("Energiesparfunktionen der Netzwerkkarte abschalten."); i.Fix.Add("Andere Netzwerkkarte bzw. Kabel/Port testen.");
+                i.Read.Add("Keine Resets mehr in 24 h → behoben.");
+                found.Add(i);
+            }
+            if (conflicts.Count > 0)
+            {
+                Issue i = New("ipconflict", t.Host, "Gerät", "IP-Adresskonflikt (laut Windows auf " + t.Name + ")", DevObj(t), Finding.Problem, Issue.Certain);
+                i.Ref = t.Host; i.Occurred = conflicts[conflicts.Count - 1].Time;
+                i.Evidence.Add("Agent " + conflicts[0].Pc + " meldet " + conflicts[conflicts.Count - 1].Time.ToString("dd.MM. HH:mm") + ": " + conflicts[conflicts.Count - 1].Info);
+                i.Causes.Add("Feste IP im DHCP-Bereich"); i.Causes.Add("Zweiter DHCP-Server"); i.Causes.Add("Zwei Geräte mit derselben festen IP");
+                i.Fix.Add("Konfliktpartner anhand der MAC in der Meldung suchen (Suchfeld/Netzwerkplan)."); i.Fix.Add("Feste IPs außerhalb des DHCP-Bereichs bzw. als Reservierung.");
+                found.Add(i);
+            }
+            if (links.Count >= 3)
+            {
+                Issue i = New("agentlink", t.Host, "Gerät", links.Count + "× Verbindung getrennt laut Windows (24 h)", DevObj(t), Finding.Warning, links.Count >= 5 ? Issue.Certain : Issue.Likely);
+                i.Ref = t.Host; i.Occurred = links[links.Count - 1].Time;
+                foreach (Syslog.AgentEvent a in links.Count > 5 ? links.GetRange(links.Count - 5, 5) : links) i.Evidence.Add("Agent " + a.Pc + " " + a.Time.ToString("dd.MM. HH:mm:ss") + ": " + a.Event);
+                i.Causes.Add("Kabel/Stecker/Port (LAN) bzw. Signal/Roaming (WLAN)"); i.Causes.Add("Energiesparfunktionen der Netzwerkkarte"); i.Causes.Add("Treiber");
+                i.Fix.Add("Zeiten mit Link-Wechseln am Switch-Port bzw. AP-Wechseln vergleichen (Details des Geräts)."); i.Fix.Add("Treiber aktualisieren, Energiesparen abschalten."); i.Fix.Add("Kabel/Port bzw. WLAN-Empfang prüfen.");
+                found.Add(i);
+            }
+            if (power != null) found.Add(NicPowerIssue(t.Host, DevObj(t), "Agent " + power.Pc + " (" + power.Time.ToString("dd.MM. HH:mm") + ")", power.Info, resets.Count + links.Count, "Gerät"));
+        }
+
+        static Issue NicPowerIssue(string key, string obj, string source, string text, int related, string category)
+        {
+            bool size = text.Contains("Jumbo") || text.Contains("MTU");
+            Issue i = New("nicpower", key, category, "Netzwerkkarte: ungünstige Einstellungen" + (size ? " (MTU/Jumbo Frames)" : " (Energiesparen)"), obj, size ? Finding.Warning : Finding.Info,
+                related > 0 ? Issue.Likely : Issue.Hint);
+            if (related > 0) i.Severity = Finding.Warning;
+            i.Ref = key; i.Occurred = DateTime.Now;
+            foreach (string part in text.Split(new string[] { "▲" }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string x = part;
+                int cut = x.IndexOf("ⓘ"); if (cut >= 0) x = x.Substring(0, cut);
+                cut = x.IndexOf(" / "); if (cut >= 0) x = x.Substring(0, cut);
+                x = x.Trim();
+                if (x.Length > 0 && !x.StartsWith("LAN:") && !x.StartsWith("WLAN:")) i.Evidence.Add(source + ": " + x);
+            }
+            if (related > 0) i.Evidence.Add("Zusammen mit " + related + " Verbindungsabbrüchen/Resets der Netzwerkkarte in 24 h → wahrscheinlich die Ursache");
+            else i.Evidence.Add("Bisher keine Abbrüche gemessen → nur Hinweis");
+            i.Causes.Add("Energy Efficient Ethernet/Green Ethernet: Link schläft bei wenig Verkehr, manche Switches reagieren mit Aussetzern");
+            i.Causes.Add("\"Computer kann das Gerät ausschalten\": Windows schaltet die Karte im Leerlauf ab");
+            i.Causes.Add("Fest eingestellte Geschwindigkeit/Duplex: Gefahr einer Duplex-Fehlanpassung");
+            if (size) i.Causes.Add("Jumbo Frames/abweichende MTU: große Pakete passen nicht durch Switches/Geräte ohne Jumbo-Unterstützung und werden verworfen");
+            i.Fix.Add("Geräte-Manager → Netzwerkadapter → Eigenschaften → Erweitert: Energy Efficient Ethernet/Green Ethernet/Energiesparmodus auf \"Aus\", Speed & Duplex auf \"Auto\".");
+            i.Fix.Add("Registerkarte Energieverwaltung: Haken \"Computer kann das Gerät ausschalten, um Energie zu sparen\" entfernen.");
+            if (size) i.Fix.Add("Jumbo Packet auf \"Deaktiviert\"/1514 und MTU auf 1500 (netsh interface ipv4 set subinterface \"<Name>\" mtu=1500 store=persistent) - außer das ganze Netz ist bewusst auf Jumbo Frames eingerichtet.");
+            i.Fix.Add("Alternativ für viele PCs per Gruppenrichtlinie/PowerShell: Set-NetAdapterAdvancedProperty bzw. Disable-NetAdapterPowerManagement.");
+            i.Read.Add("Nach der Änderung keine Abbrüche/Resets mehr → behoben; PingMonitor prüft die Einstellungen alle 6 Stunden erneut.");
+            return i;
+        }
+
+        static DateTime nicCheck = DateTime.MinValue;
+        static List<string> nicLines = new List<string>();
+
         static void DetectThisPc(List<Issue> found)
         {
+            // Energiespar-Einstellungen der Netzwerkkarten dieses PCs (Registry, alle 6 Stunden)
+            if (WinEvents.Enabled && (DateTime.Now - nicCheck).TotalHours >= 6) { nicCheck = DateTime.Now; try { nicLines = WinEvents.NicSettings(); } catch { nicLines = new List<string>(); } }
+            List<WinEvent> recentEv;
+            lock (WinEvents.Recent) recentEv = new List<WinEvent>(WinEvents.Recent);
+            int related = recentEv.FindAll(delegate (WinEvent e) { return DateTime.Now - e.Time < TimeSpan.FromDays(1) && (e.Category == "Netzwerkkarte" || e.Category == "WLAN" && e.Title.Contains("getrennt")); }).Count;
+            foreach (string l in nicLines)
+            {
+                if (!l.Contains("▲")) continue;   // ⓘ (Offloading usw.) nur im Bericht "Diesen PC prüfen"
+                string adapter = l.Split(new string[] { "\r\n" }, StringSplitOptions.None)[0];
+                Issue np = NicPowerIssue(Environment.MachineName + "|" + adapter, Environment.MachineName + " (dieser PC) · " + adapter, "Registry der Netzwerkkarte",
+                    l.Substring(adapter.Length).Replace("\r\n", " "), related, "Dieser PC");
+                found.Add(np);
+            }
             DateTime now = DateTime.Now;
             List<WinEvent> ev;
             lock (WinEvents.Recent) ev = new List<WinEvent>(WinEvents.Recent);
@@ -16506,7 +16795,7 @@ namespace PingMonitor
             grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
             grid.BackgroundColor = SystemColors.Window;
             AddCol("Conf", "Sicherheit", 70); AddCol("Sev", "Schwere", 55); AddCol("Cat", "Bereich", 65); AddCol("Title", "Befund", 210);
-            AddCol("Obj", "Wo / Gerät", 260); AddCol("Since", "Seit", 70); AddCol("Last", "Zuletzt", 70); AddCol("State", "Status", 80);
+            AddCol("Obj", "Wo / Gerät", 240); AddCol("Src", "Quellen", 90); AddCol("Since", "Seit", 70); AddCol("Last", "Zuletzt", 70); AddCol("State", "Status", 80);
             grid.SelectionChanged += delegate { ShowSelected(); };
 
             details.Dock = DockStyle.Fill; details.Multiline = true; details.ReadOnly = true; details.ScrollBars = ScrollBars.Vertical;
@@ -16608,7 +16897,7 @@ namespace PingMonitor
             foreach (Issue i in list)
             {
                 int r = grid.Rows.Add(Issue.ConfSymbol(i.Confidence) + " " + Issue.ConfText(i.Confidence),
-                    i.Severity >= Finding.Problem ? "Problem" : i.Severity == Finding.Warning ? "Warnung" : "Info", i.Category, i.Title, i.Object,
+                    i.Severity >= Finding.Problem ? "Problem" : i.Severity == Finding.Warning ? "Warnung" : "Info", i.Category, i.Title, i.Object, i.Sources,
                     i.FirstSeen.ToString("dd.MM. HH:mm"), i.LastSeen.ToString("dd.MM. HH:mm"), i.State);
                 DataGridViewRow row = grid.Rows[r];
                 row.Tag = i;

@@ -297,6 +297,14 @@ ausgeschöpftes PoE-Budget (UniFi).
                ●○○ Hinweis         einmalig oder möglicherweise gewollt (z. B. blockierter STP-Port bei Redundanz)
   Nicht gewertet werden z. B. einzelne Fehler beim Ein-/Ausstecken und Link-Wechsel von ausgeschalteten Geräten.
 - Belege: warum diese Einschätzung (Zählerstände, Zeiten, Quelle).
+- Quellen: Spalte "Quellen" im Befunde-Fenster (z. B. "SNMP + Ping", "UniFi", "Agent", "Mitschnitt"); die Übersicht
+  Netzwerk -> "Datenquellen und Widersprüche" zeigt zusätzlich, wie viele offene Befunde jede Quelle stützt.
+- Windows-PCs: Netzwerkkarten-Resets, IP-Konflikte und ungünstige Netzwerkkarten-Einstellungen (Energiesparen, EEE, fest
+  eingestellte Geschwindigkeit, Jumbo Frames/abweichende MTU, VLAN-ID an der Karte) werden zu Befunden - für diesen PC direkt,
+  für andere PCs über den Agenten. Offloading (LSO, RSC, Prüfsummen) und Flusskontrolle stehen als Hinweise im Bericht
+  "Diesen PC prüfen". Standby/Neustart laut Agent zählt nicht als Störung (Ausfall-Diagnose und Befund "instabil").
+- Mitschnitt-Befunde: im Fenster "Mitschnitt analysieren" markieren -> "Markierte in Befunde übernehmen" - dann mit Plan,
+  Maßnahme und Nachprüfung wie alle anderen (bestätigt wird durch einen neuen Mitschnitt).
 - Zeitliches Muster aus den Langzeitdaten (z. B. "meist zwischen 07 und 10 Uhr - Arbeitsbeginn", "nur werktags").
 - Plan mit den echten Werten des Netzes:
     Mögliche Ursachen, Beheben (Schritte der Reihe nach), Eingrenzen, Ergebnis lesen. Beim Eingrenzen z. B.:
