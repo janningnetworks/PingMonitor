@@ -2704,6 +2704,8 @@ namespace PingMonitor
             PingTarget sv = !t.Running && t.ServiceView != null ? t.ServiceView : t;
             if (sv.OutageStart.HasValue)
                 sb.Append("\r\n\r\n=== AUSFALL-DIAGNOSE ===\r\n" + (sv.Diagnosis.Length > 0 ? sv.Diagnosis + "\r\n" + sv.DiagnosisDetails : "läuft (ca. 20 Sekunden nach Ausfallbeginn) ..."));
+            string rel = RelatedIssues(t);
+            if (rel.Length > 0) sb.Append("\r\n\r\n=== BEFUNDE UND WIDERSPRÜCHE ZU DIESEM GERÄT ===\r\n" + rel);
             string wl = WlanDetails(t);
             if (wl.Length > 0) sb.Append("\r\n\r\n=== WLAN (UniFi-Controller) ===\r\n" + wl);
             Assessment q = t.Running ? t.Quality.Evaluate() : (t.ServiceView != null ? t.ServiceView.ServiceQuality : null);
@@ -2717,6 +2719,30 @@ namespace PingMonitor
             else
                 sb.Append("Nicht zugeordnet. Dafür Switches unter \"Switches ...\" eintragen (SNMP); die Zuordnung erfolgt über die MAC-Adresse.");
             HintForm.Show(this, "Gerät: " + t.Name, sb.ToString());
+        }
+
+        /// <summary>Offene Befunde und Widersprüche, die dieses Gerät betreffen (IP, MAC oder Name).</summary>
+        string RelatedIssues(PingTarget t)
+        {
+            bool svc = svcStatus == ServiceControllerStatus.Running;
+            string mac = NetTools.MacHex(t.Mac), dashed = NetTools.FormatMac(t.Mac);
+            Predicate<string> hit = delegate (string x)
+            {
+                if (string.IsNullOrEmpty(x)) return false;
+                if (System.Text.RegularExpressions.Regex.IsMatch(x, @"(^|[^\d.])" + System.Text.RegularExpressions.Regex.Escape(t.Host) + @"($|[^\d])")) return true;
+                return mac.Length == 12 && (x.IndexOf(dashed, StringComparison.OrdinalIgnoreCase) >= 0 || x.IndexOf(mac, StringComparison.OrdinalIgnoreCase) >= 0);
+            };
+            StringBuilder sb = new StringBuilder();
+            foreach (Issue i in SwitchMonitor.CurrentIssues(svc))
+                if ((i.State == Issue.Open || i.State == Issue.NotFixed || i.State == Issue.Checking) && (i.Ref == t.Host || hit(i.Object) || i.Kind == "conflict" && i.Evidence.Exists(hit)))
+                    sb.AppendLine(Finding.Symbol(i.Severity) + " [" + Issue.ConfText(i.Confidence) + ", " + i.State + "] " + i.Title + (i.Evidence.Count > 0 ? "\r\n   " + i.Evidence[0] : ""));
+            foreach (SwitchMonitor.Conflict c in SwitchMonitor.CurrentConflicts(svc))
+                if (hit(c.Title) || hit(c.Detail))
+                {
+                    string line = (c.Level >= Finding.Warning ? "▲ " : "ⓘ ") + c.Title + " (seit " + c.Since.ToString("dd.MM. HH:mm") + ")\r\n   " + c.Detail;
+                    if (sb.ToString().IndexOf(c.Title) < 0) sb.AppendLine(line);
+                }
+            return sb.ToString().TrimEnd();
         }
 
         /// <summary>WLAN-Zustand und -Verlauf eines Geräts laut UniFi-Controller, mit Bewertung.</summary>
@@ -6875,10 +6901,29 @@ namespace PingMonitor
                         foreach (SwitchState s in switches) { string a; if (s.Arp.TryGetValue(h.Host, out a)) arp = a; }
                         if (arp.Length == 0) opn.Arp.TryGetValue(h.Host, out arp);
                         if (!string.IsNullOrEmpty(arp) && arp.Length == 12 && arp != mac && !Topology.RandomMac(arp))
-                            Add(found, "mac|" + h.Host, Finding.Warning, "Anderes Gerät unter " + h.Host,
+                        {
+                            // Hängen beide MACs am selben Switch-Port? Dann ist es fast immer EIN Gerät mit zwei Netzwerkkarten.
+                            string portA = "", portB = "";
+                            foreach (SwitchState s in snmp)
+                                foreach (PortState p in s.Ports.Values)
+                                {
+                                    if (p.IsInfrastructure || p.Wireless) continue;
+                                    foreach (string m in p.Macs)
+                                    {
+                                        if (NetTools.MacHex(m) == mac) portA = s.Name + " / " + p.DisplayName;
+                                        if (NetTools.MacHex(m) == arp) portB = s.Name + " / " + p.DisplayName;
+                                    }
+                                }
+                            bool same = portA.Length > 0 && portA == portB;
+                            Add(found, "mac|" + h.Host, same ? Finding.Info : Finding.Warning, (same ? "Zwei Netzwerkkarten unter " : "Anderes Gerät unter ") + h.Host,
                                 h.Name + ": Geräteliste MAC " + Dashed(mac) + " (" + MacVendors.Lookup(mac) + "), ARP-Tabelle der Firewall jetzt " + Dashed(arp) + " (" +
-                                MacVendors.Lookup(arp) + "). Entweder hat DHCP die Adresse neu vergeben (dann \"Geräteinfo abrufen\" bzw. Gerät neu eintragen) " +
-                                "oder zwei Geräte benutzen dieselbe IP (Konflikt).");
+                                MacVendors.Lookup(arp) + ")" + (portA.Length > 0 || portB.Length > 0 ? "; Switch-Port " + (portA.Length > 0 ? portA : "?") + " bzw. " + (portB.Length > 0 ? portB : "?") : "") + ". " +
+                                (same ? "Beide MACs hängen am selben Port → sehr wahrscheinlich EIN Gerät (Server, NAS, Hypervisor) mit zwei Netzwerkkarten bzw. VMs, " +
+                                        "das die IP mal über die eine, mal über die andere Karte beantwortet (\"ARP-Flux\"). Meist harmlos; kann aber zu kurzen Aussetzern führen. " +
+                                        "Abhilfe: Bonding/Teaming sauber einrichten oder unter Linux arp_ignore=1 / arp_announce=2 setzen; in der Geräteliste die richtige MAC eintragen (Aktualisieren)."
+                                      : "Entweder hat DHCP die Adresse neu vergeben (dann \"Aktualisieren\" bzw. Gerät neu eintragen), das Gerät hat zwei Netzwerkkarten " +
+                                        "(z. B. LAN und WLAN, Server mit zwei Karten), oder zwei Geräte benutzen dieselbe IP (Konflikt - dann sind Aussetzer zu erwarten)."));
+                        }
                     }
                 }
                 foreach (SwitchState a in snmp)
