@@ -10508,6 +10508,7 @@ namespace PingMonitor
         public readonly Dictionary<string, string> ArpHost = new Dictionary<string, string>();   // IP -> Hostname
         public readonly Dictionary<string, string> ArpIntf = new Dictionary<string, string>();   // IP -> Schnittstelle ("igb1 (LAN)")
         public string Error = "";
+        public string ArpError = "";     // warum keine ARP-Einträge (nur für "Verbindung testen")
         public DateTime Fetched = DateTime.MinValue;
         public bool Valid { get { return Fetched != DateTime.MinValue && Error.Length == 0; } }
 
@@ -10622,28 +10623,49 @@ namespace PingMonitor
             Leases(o, url + "/api/kea/leases4/search", auth, "Kea", "hwaddr", "expire");
             Leases(o, url + "/api/dhcpv4/leases/searchLease", auth, "ISC", "mac", "ends");
             Leases(o, url + "/api/dnsmasq/leases/search", auth, "dnsmasq", "hwaddr", "expire");
-            // ARP-Tabelle
-            if (Get(url + "/api/diagnostics/interface/getArp", auth, out status, out json))
-                try
-                {
-                    object root = Json.Parse(json);
-                    List<object> rows = root as List<object>;
-                    if (rows == null) rows = Json.Arr(root as Dictionary<string, object>, "rows");
-                    foreach (object x in rows)
-                    {
-                        Dictionary<string, object> a = x as Dictionary<string, object>;
-                        if (a == null) continue;
-                        string ip = Json.S(a, "ip"), mac = NetTools.MacHex(Json.S(a, "mac"));
-                        if (ip.Length == 0 || mac.Length != 12) continue;
-                        o.Arp[ip] = mac;
-                        if (Json.S(a, "hostname").Length > 0) o.ArpHost[ip] = Json.S(a, "hostname");
-                        string itf = Json.S(a, "intf"), itd = Json.S(a, "intf_description");
-                        if (itf.Length > 0) o.ArpIntf[ip] = itf + (itd.Length > 0 && itd != itf ? " (" + itd + ")" : "");
-                    }
-                }
-                catch { }
+            // ARP-Tabelle: ältere Versionen getArp (Liste), neuere search_arp (Tabelle mit "rows", per POST)
+            List<string> tried = new List<string>();
+            if (!Arp(o, url + "/api/diagnostics/interface/getArp", null, auth, tried) || o.Arp.Count == 0)
+                if (!Arp(o, url + "/api/diagnostics/interface/search_arp", "{\"current\":1,\"rowCount\":-1,\"searchPhrase\":\"\"}", auth, tried) || o.Arp.Count == 0)
+                    Arp(o, url + "/api/diagnostics/interface/search_arp", null, auth, tried);
+            if (o.Arp.Count == 0) o.ArpError = string.Join(", ", tried.ToArray());
             o.Fetched = DateTime.Now;
             return o;
+        }
+
+        static bool Arp(OpnSnapshot o, string url, string post, string auth, List<string> tried)
+        {
+            int status;
+            string json;
+            bool ok = Get(url, auth, out status, out json, post);
+            tried.Add(url.Substring(url.LastIndexOf('/') + 1) + (post != null ? " (POST)" : "") + ": " + (ok ? "OK" : status == 0 ? json : "HTTP " + status +
+                (status == 401 || status == 403 ? " - Recht \"Diagnostics: ARP Table\" fehlt" : "")));
+            if (!ok) return false;
+            try
+            {
+                object root = Json.Parse(json);
+                List<object> rows = root as List<object>;
+                Dictionary<string, object> d = root as Dictionary<string, object>;
+                if (rows == null && d != null)
+                {
+                    rows = Json.Arr(d, "rows");
+                    if (rows.Count == 0) foreach (object v in d.Values) if (v is Dictionary<string, object>) rows.Add(v);   // manche Versionen: Objekt statt Liste
+                }
+                if (rows == null) return false;
+                foreach (object x in rows)
+                {
+                    Dictionary<string, object> a = x as Dictionary<string, object>;
+                    if (a == null) continue;
+                    string ip = Json.S(a, "ip"), mac = NetTools.MacHex(Json.S(a, "mac"));
+                    if (ip.Length == 0 || mac.Length != 12) continue;
+                    o.Arp[ip] = mac;
+                    if (Json.S(a, "hostname").Length > 0) o.ArpHost[ip] = Json.S(a, "hostname");
+                    string itf = Json.S(a, "intf"), itd = Json.S(a, "intf_description");
+                    if (itf.Length > 0) o.ArpIntf[ip] = itf + (itd.Length > 0 && itd != itf ? " (" + itd + ")" : "");
+                }
+                return true;
+            }
+            catch (Exception ex) { tried.Add("nicht lesbar: " + ex.Message); return false; }
         }
 
         static double Num(string s)
@@ -10674,12 +10696,17 @@ namespace PingMonitor
 
         static bool Get(string url, string auth, out int status, out string body)
         {
+            return Get(url, auth, out status, out body, null);
+        }
+
+        static bool Get(string url, string auth, out int status, out string body, string post)
+        {
             status = 0; body = "";
             try
             {
                 ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
                 HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
-                req.Method = "GET";
+                req.Method = post != null ? "POST" : "GET";
                 req.Accept = "application/json";
                 req.UserAgent = "PingMonitor";
                 req.Timeout = 10000;
@@ -10688,6 +10715,13 @@ namespace PingMonitor
                 req.Headers["Authorization"] = auth;
                 // Firewalls haben meist ein selbstsigniertes Zertifikat - nur für diese Verbindung akzeptieren.
                 req.ServerCertificateValidationCallback = delegate { return true; };
+                if (post != null)
+                {
+                    byte[] data = Encoding.UTF8.GetBytes(post);
+                    req.ContentType = "application/json";
+                    req.ContentLength = data.Length;
+                    using (Stream rs = req.GetRequestStream()) rs.Write(data, 0, data.Length);
+                }
                 HttpWebResponse resp;
                 try { resp = (HttpWebResponse)req.GetResponse(); }
                 catch (WebException ex)
@@ -10751,6 +10785,7 @@ namespace PingMonitor
                     foreach (OpnGateway g in o.Gateways)
                         sb.AppendLine("Gateway " + g.Name + ": " + g.Status + (g.Loss >= 0 ? ", Verlust " + g.Loss + " %" : "") + (g.Delay >= 0 ? ", Latenz " + g.Delay + " ms" : ""));
                     sb.AppendLine(o.Leases.Count + " DHCP-Leases, " + o.Arp.Count + " ARP-Einträge");
+                    if (o.Arp.Count == 0 && o.ArpError.Length > 0) sb.AppendLine("ARP-Abfrage: " + o.ArpError);
                     if (o.Leases.Count == 0) sb.AppendLine("(Keine Leases lesbar - Rechte für DHCP/Kea/Dnsmasq prüfen.)");
                 }
                 MessageBox.Show(this, sb.ToString(), Text, MessageBoxButtons.OK, o.Valid ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
