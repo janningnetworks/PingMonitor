@@ -338,7 +338,9 @@ OPNsense-API, Syslog-Empfang, Agenten, Windows-Ereignisse, Weiterleitung), aktue
 Grundsatz: eigene Messung jetzt > Live-Zustand des Geräts (SNMP) > Wissen des Controllers > Konfiguration > alte Daten
 > Vermutung. Im Einzelnen:
   - Erreichbarkeit: Ping/ARP dieses PCs; Controller und Switch-Link ergänzen die Diagnose.
-  - Port-Zustand, Fehlerzähler, VLAN-Ist, Spanning Tree: SNMP; UniFi nur, wo kein SNMP vorhanden ist.
+  - Port-Zustand, Fehlerzähler, Spanning Tree: SNMP; UniFi nur, wo kein SNMP vorhanden ist.
+  - VLANs: bei UniFi-Geräten die Port-Konfiguration des Controllers ("Allow All", Profile) - die VLAN-Tabelle,
+    die UniFi-Switches per SNMP liefern, ist unvollständig. Bei anderen Switches (TP-Link, HP) die SNMP-Tabelle.
   - Standort eines Geräts: UniFi > Endgeräte-Port der MAC-Tabelle (LLDP für Switch-Verbindungen) > zuletzt gesehen
     > Rückschluss > Vermutung. Die Herkunft steht in der Spalte "Verbindung" (· UniFi, · MAC-Tabelle, · LLDP, · Rückschluss).
   - MAC zu einer IP: aktuelle ARP-Tabelle > DHCP-Lease > Geräteliste.

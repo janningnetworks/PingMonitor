@@ -2222,7 +2222,8 @@ namespace PingMonitor
             sb.AppendLine("=== WELCHE QUELLE GILT? ===");
             sb.AppendLine("Grundsatz: eigene Messung jetzt > Live-Zustand des Geräts > Wissen des Controllers > Konfiguration > alte Daten > Vermutung.");
             sb.AppendLine("• Erreichbarkeit: Ping/ARP dieses PCs; Controller und Switch-Link ergänzen die Diagnose.");
-            sb.AppendLine("• Port-Zustand, Fehlerzähler, VLAN-Ist, Spanning Tree: SNMP des Switches; UniFi nur, wenn kein SNMP vorhanden ist.");
+            sb.AppendLine("• Port-Zustand, Fehlerzähler, Spanning Tree: SNMP des Switches; UniFi nur, wenn kein SNMP vorhanden ist.");
+            sb.AppendLine("• VLANs: bei UniFi-Geräten die Port-Konfiguration des Controllers (die SNMP-VLAN-Tabelle von UniFi-Switches ist unvollständig), sonst SNMP.");
             sb.AppendLine("• Wo hängt ein Gerät: UniFi-Controller > Endgeräte-Port der MAC-Tabelle (LLDP für Switch-Verbindungen) > zuletzt gesehen > Rückschluss > Vermutung.");
             sb.AppendLine("  Die Herkunft steht in der Spalte \"Verbindung\" (· UniFi, · MAC-Tabelle, · LLDP, · Rückschluss, \"vermutet\").");
             sb.AppendLine("• MAC zu einer IP: aktuelle ARP-Tabelle > DHCP-Lease > Geräteliste. Weicht die Geräteliste ab, wird es als Widerspruch gemeldet.");
@@ -7069,13 +7070,9 @@ namespace PingMonitor
                             if (up.VlanKnown)
                             {
                                 p.CfgPvid = up.NativeVlan; p.CfgTagged.Clear(); p.CfgTagged.AddRange(up.Tagged);
-                                if (!p.VlanFromSnmp) { p.Pvid = up.NativeVlan; p.Tagged.Clear(); p.Tagged.AddRange(up.Tagged); }
-                                else if (!snmp.EgressKnown)
-                                {
-                                    // SNMP kennt nur das native VLAN: getaggte VLANs aus der Controller-Konfiguration übernehmen
-                                    p.Tagged.Clear();
-                                    foreach (int v in up.Tagged) if (v != p.Pvid) p.Tagged.Add(v);
-                                }
+                                // UniFi-Switches: Die VLAN-Tabelle per SNMP (Q-BRIDGE) ist unvollständig/unzuverlässig (z. B. "Allow All" fehlt ganz).
+                                // Der Controller provisioniert die Ports - seine Konfiguration ist hier der Ist-Zustand.
+                                p.Pvid = up.NativeVlan; p.Tagged.Clear(); p.Tagged.AddRange(up.Tagged); p.VlanFromSnmp = false;
                             }
                         }
                         continue;
