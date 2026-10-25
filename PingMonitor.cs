@@ -2792,9 +2792,22 @@ namespace PingMonitor
                 {
                     PortState p = port.Value;
                     string rating = p.Rating.Level > Finding.Ok ? "  " + p.Rating.Short : "";
+                    int level = p.Rating.Level;
+                    string tip = p.Rating.Details;
+                    if (p.Wireless)
+                    {
+                        // WLAN-Gerät: Probleme am Kabel des Access Points betreffen es mit
+                        foreach (PortState w in port.Key.Ports.Values)
+                            if (!w.Wireless && w.Rating.Level >= Finding.Warning)
+                            {
+                                rating += "  · AP-Kabel " + w.DisplayName + ": " + w.Rating.Short;
+                                level = Math.Max(level, w.Rating.Level);
+                                tip += "\r\n\r\n=== Kabel des Access Points (" + w.DisplayName + ") ===\r\n" + w.Rating.Details;
+                            }
+                    }
                     c.Value = port.Key.Name + " / " + p.DisplayName + rating;
-                    c.ToolTipText = p.Rating.Details;
-                    c.Style.BackColor = p.Rating.Level <= Finding.Ok ? Color.Empty : Finding.Back(p.Rating.Level);
+                    c.ToolTipText = tip;
+                    c.Style.BackColor = level <= Finding.Ok ? Color.Empty : Finding.Back(level);
                 }
                 else if (Convert.ToString(c.Value).Length > 0)
                 {
@@ -6981,6 +6994,39 @@ namespace PingMonitor
                     "ein Profil ohne dieses VLAN.\r\nVorgehen: Port-Profil des Ports " + p.DisplayName + " auf \"Alle\" bzw. um das VLAN erweitern."));
         }
 
+        /// <summary>Switch-Port, an dem ein Access Point hängt (Port-Rolle, LLDP oder UniFi-Uplink), z. B. "Bro / 0/3".</summary>
+        static string ApPeer(SwitchState ap)
+        {
+            foreach (SwitchState s in switches)
+                if (s != ap)
+                    foreach (PortState p in s.Ports.Values)
+                        if (p.Role == "ap" && Array.IndexOf(p.RoleTarget.Split(','), ap.Address) >= 0) return s.Name + " / " + p.DisplayName;
+            foreach (SwitchState s in switches)
+                if (s != ap)
+                    foreach (PortState p in s.Ports.Values)
+                        if (p.LldpName.Length > 0 && (string.Equals(p.LldpName, ap.SysName, StringComparison.OrdinalIgnoreCase) || string.Equals(p.LldpName, ap.Name, StringComparison.OrdinalIgnoreCase)))
+                            return s.Name + " / " + p.DisplayName;
+            List<string> own = new List<string>();
+            foreach (string m in ap.OwnMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) own.Add(NetTools.MacHex(m));
+            foreach (SwitchState s in switches)
+                if (s != ap && s.Kind != "Access Point")
+                    foreach (PortState p in s.Ports.Values)
+                        if (!p.IsInfrastructure && !p.Wireless && p.Macs.Exists(delegate (string m) { return own.Contains(NetTools.MacHex(m)); }))
+                            return s.Name + " / " + p.DisplayName;   // MAC des APs an einem Endgeräte-Port
+            if (unifi.Valid)
+            {
+                UniFiDeviceInfo d = unifi.Devices.Find(delegate (UniFiDeviceInfo x) { return Matches(ap, x); });
+                if (d != null && d.UplinkMac.Length == 12)
+                {
+                    UniFiDeviceInfo up = unifi.Device(d.UplinkMac);
+                    SwitchState us = up != null ? switches.Find(delegate (SwitchState x) { return x != ap && Matches(x, up); }) : null;
+                    PortState pp = us != null ? PortByNumber(us, d.UplinkPort) : null;
+                    return (us != null ? us.Name : up != null ? up.Name : Dashed(d.UplinkMac)) + " / " + (pp != null ? pp.DisplayName : "Port " + d.UplinkPort);
+                }
+            }
+            return "";
+        }
+
         static bool IsSwitchMac(string macHex)
         {
             foreach (SwitchState s in switches)
@@ -7346,6 +7392,15 @@ namespace PingMonitor
                         else if (p.Macs.Count > 1)
                             p.Attached = p.Macs.Count + " Geräte" + (p.Macs.Count > 5 ? " (Uplink / weiterer Switch?)" : "");
                     }
+                // Kabelanschluss eines Access Points (eth0 ...) = sein Uplink: Gegenstelle am Switch benennen
+                foreach (SwitchState s in switches)
+                {
+                    if (s.Kind != "Access Point") continue;
+                    string peer = ApPeer(s);
+                    foreach (PortState p in s.Ports.Values)
+                        if (!p.Wireless && p.Role == "" && (p.Up || p.Flaps.Count > 0))
+                            p.Attached = "Kabel des Access Points zum Switch" + (peer.Length > 0 ? ": " + peer : "");
+                }
                 if (changed && writeStatus || changed && owner == "App") SaveLastPorts();
             }
         }
@@ -14567,6 +14622,19 @@ namespace PingMonitor
             if (p.Duplex == 2) i.Causes.Add("Duplex-Fehlanpassung (Port läuft im Halbduplex)");
             string devName = dev != null ? dev.Name : p.ConnectedText.Length > 0 ? p.ConnectedText : "dem angeschlossenen Gerät";
             PortState free = FreePort(s);
+            if (s.Kind == "Access Point" && !p.Wireless)
+            {
+                string peer = p.Attached.IndexOf(": ") > 0 ? p.Attached.Substring(p.Attached.IndexOf(": ") + 2) : "Switch-Port des APs";
+                i.Evidence.Add("Gezählt hat der Access Point an seinem Kabelanschluss " + p.DisplayName + ": Die Pakete vom Switch (" + peer + ") kommen beschädigt an. " +
+                    "Betroffen sind alle WLAN-Geräte an diesem AP.");
+                i.Fix.Add("Kabel zwischen Access Point " + s.Name + " und " + peer + " tauschen: Patchkabel am Switch/Patchfeld UND am AP bzw. an der Dose.");
+                i.Fix.Add("Am Switch einen anderen Port für den AP verwenden (PoE beachten) - bleiben die Fehler, liegt es am Kabelweg zum AP.");
+                i.Fix.Add("Netzwerkdose und Verlegekabel zum AP mit einem Kabeltester prüfen (bei PoE oft schlechte Kontakte an der Dose).");
+                i.Fix.Add("Bleibt alles: AP tauschen (Netzwerkanschluss des APs defekt).");
+                i.Narrow.Add("Wichtig: Beschädigte Pakete sieht man in keinem Mitschnitt. Eingegrenzt wird über die Zähler (Switch-Ansicht, " + s.Name + " / " + p.DisplayName + ") und durch Tauschen.");
+                i.Read.Add("Zähler steigt nach dem Kabeltausch nicht mehr → Kabel war defekt. Steigt weiter an einem anderen Switch-Port → Kabelweg/Dose oder AP.");
+                return i;
+            }
             i.Fix.Add("Patchkabel am Switch (" + s.Name + " " + p.DisplayName + ") UND am Gerät (" + devName + ") gegen ein neues, geprüftes Kabel tauschen.");
             i.Fix.Add("Gerät testweise an einen anderen Port stecken" + (free != null ? " (frei: " + free.DisplayName + ")" : "") +
                 " - wandern die Fehler mit, liegt es am Kabelweg oder Gerät; bleiben sie am alten Port, am Switch-Port.");
