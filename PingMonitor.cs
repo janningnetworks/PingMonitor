@@ -5721,7 +5721,8 @@ namespace PingMonitor
                 if (Temp > 0) p.Add(Temp + " °C" + (Overheating ? " ÜBERHITZT" : ""));
                 if (PoeBudget > 0) p.Add("PoE " + PoeUsed.ToString("0") + " / " + PoeBudget.ToString("0") + " W");
                 if (Load.Length > 0) p.Add("Last " + Load);
-                if (Connections >= 0) p.Add(Connections + " TCP-Verbindungen");
+                // tcpCurrEstab zählt nur Verbindungen ZUM Gerät (Weboberfläche, SSH, API) - nicht den Verkehr durch die Firewall
+                if (Connections > 0 || Connections == 0 && Kind == "Firewall") p.Add(Connections + " TCP-Verbindungen zum Gerät selbst");
                 return string.Join("  ·  ", p.ToArray());
             }
         }
