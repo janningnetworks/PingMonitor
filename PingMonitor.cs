@@ -28,6 +28,15 @@ using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 
+// Versionsinformationen (Datei-Eigenschaften → Details). Unsignierte EXE ohne diese Angaben stufen Virenscanner eher als verdächtig ein.
+[assembly: System.Reflection.AssemblyTitle("PingMonitor")]
+[assembly: System.Reflection.AssemblyDescription("Netzwerküberwachung und Fehlersuche (Ping, SNMP, UniFi, OPNsense)")]
+[assembly: System.Reflection.AssemblyCompany("janning networks")]
+[assembly: System.Reflection.AssemblyProduct("PingMonitor")]
+[assembly: System.Reflection.AssemblyCopyright("janning networks")]
+[assembly: System.Reflection.AssemblyVersion("4.3.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("4.3.0.0")]
+
 namespace PingMonitor
 {
     static class Program
