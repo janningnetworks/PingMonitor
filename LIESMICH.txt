@@ -285,6 +285,11 @@ Auslastung, Spanning-Tree-Änderungen/blockierte Ports, VLAN-Fehler, WAN ohne Li
 Firewall-Last, Geräte-Ausfall (> 2 min), instabile Geräte, Leitungsqualität, schwaches WLAN, Roaming-Ping-Pong,
 langsame DHCP-Vergabe (Syslog), Internet-Leitung (OPNsense-Gateway), CG-NAT/doppeltes NAT, Netzwerkkarten-Resets und
 IP-Konflikte dieses PCs, Widersprüche zwischen den Quellen.
+Überlast: im Ausgang verworfene Pakete (Puffer voll, Microbursts - mit Anteil an den gesendeten Paketen), im Eingang
+verworfene Pakete (meist Filter/VLAN, nur Hinweis), Paketflut kleiner Pakete, Multicast-Quelle und Multicast-Flutung an
+mehrere Ports (fehlendes IGMP-Snooping/Querier), MAC-Adressen, die zwischen zwei Ports springen (Schleife), CPU/RAM von
+Switches, APs und Firewall (bei UniFi vom Controller, weil die Switches das per SNMP nicht liefern), Überhitzung und
+ausgeschöpftes PoE-Budget (UniFi).
 - Sicherheit:  ●●● Sicher          mehrfach gemessen (z. B. CRC-Fehler in 3 Abfragen, 3 Link-Wechsel in 24 h, Halbduplex in
                                   2 Abfragen) oder von einer zweiten Quelle bestätigt (Ping-Ausfall zur selben Zeit wie
                                   der Link-Wechsel, Verlust großer Pakete passend zu CRC-Fehlern, schwaches WLAN-Signal)
@@ -310,8 +315,8 @@ IP-Konflikte dieses PCs, Widersprüche zwischen den Quellen.
   Messwerte nach der Maßnahme neu begonnen. Weitere Knöpfe: Ignorieren, Wieder öffnen, Als erledigt markieren,
   Kopieren, Netzwerk-Werkzeuge, Mitschnitt analysieren. Maßnahmen stehen im Protokoll (Quelle "Befunde") und in
   der Dokumentation.
-- Langzeitdaten: stündlich Logs\Verlauf_JJJJ-MM-TT.csv (je Port: Empfangs-/Sendefehler, Link-Wechsel, Auslastung und
-  Broadcasts (Spitze); je Gerät: Verlust %, Ausfälle; je WLAN-Gerät: Signal, AP-Wechsel; je Gateway: Verlust, Latenz).
+- Langzeitdaten: stündlich Logs\Verlauf_JJJJ-MM-TT.csv (je Port: Empfangs-/Sendefehler, Link-Wechsel, Auslastung,
+  Broadcasts (Spitze), im Ausgang verworfene Pakete, Multicast (Spitze); je Gerät: Verlust %, Ausfälle; je WLAN-Gerät: Signal, AP-Wechsel; je Gateway: Verlust, Latenz).
   Die Aufbewahrung (Einstellungen -> Protokoll) gilt auch für diese Dateien.
 
 Netzwerk-Werkzeuge (manuell)
@@ -493,6 +498,9 @@ Erkannt und in Klartext erklärt werden u. a.:
     Dienste, die nicht antworten
   - Spanning-Tree-Topologie-Änderungen (ein Link war kurz weg), Wechsel der Root-Bridge
   - Broadcast-Spitzen / Broadcast-Sturm (Netzwerkschleife)
+  - identische Pakete, die mehrfach vorbeikommen (Paket läuft im Kreis = Schleife; Spiegel-Port-Doppelungen herausgerechnet)
+  - Paket-Spitzen (viele kleine Pakete = Flut/Scan), Multicast-Spitzen mit den größten Gruppen (mDNS, SSDP, IPTV ...)
+  - "Wer sendet am meisten": Absender nach Paketen mit Anteil, Datenmenge, Paketgröße und Name/Switch-Port
   - DNS-Server, die nicht oder mit Fehlern antworten
   - mehrere IPv6-Router (Router Advertisements)
   - an welchem Switch/Port der mitschneidende Anschluss hängt (LLDP/CDP)

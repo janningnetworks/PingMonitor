@@ -5493,6 +5493,27 @@ namespace PingMonitor
         public readonly List<KeyValuePair<DateTime, long>> TxHist = new List<KeyValuePair<DateTime, long>>();
         public DateTime LastErrAt = DateTime.MinValue;
         public long MaxSpeedSeen;        // höchste beobachtete Geschwindigkeit (erkennt "von 1 Gbit/s auf 100 Mbit/s gefallen")
+        // Paketzähler (Stand) und daraus Raten: alle Pakete, Multicast, verworfene Pakete getrennt nach Eingang/Ausgang
+        public long PInPkts = -1, POutPkts = -1, PInMcast = -1, POutMcast = -1, PInDisc = -1, POutDisc = -1;
+        public DateTime PktsAt;
+        public double InPps, OutPps, McastInPps, McastOutPps;
+        public readonly Queue<double> RecentPps = new Queue<double>(), RecentMcastIn = new Queue<double>(), RecentMcastOut = new Queue<double>();
+        public readonly List<long[]> PktHist = new List<long[]>();   // je Abfrage: Zeit (Ticks), +Eingang verworfen, +Ausgang verworfen, +Pakete ein, +Pakete aus
+        public long DropsHour = -1;      // im Ausgang verworfene Pakete der letzten Stunde (für Anzeige/Statusdatei)
+
+        public long Sum(int idx, TimeSpan span)
+        {
+            long n = 0, from = (DateTime.Now - span).Ticks;
+            foreach (long[] x in PktHist) if (x[0] >= from) n += x[idx];
+            return n;
+        }
+
+        public int Polls(int idx, TimeSpan span)
+        {
+            int n = 0; long from = (DateTime.Now - span).Ticks;
+            foreach (long[] x in PktHist) if (x[0] >= from && x[idx] > 0) n++;
+            return n;
+        }
         public readonly List<string> Macs = new List<string>();
         public bool Wireless;            // WLAN-Schnittstelle eines Access Points
         public bool IsWan;               // Schnittstelle mit der Standardroute (Firewall/Router)
@@ -5611,7 +5632,15 @@ namespace PingMonitor
         public bool FromUniFi;           // nicht per SNMP abgefragt, Daten vom UniFi-Controller
         public DateTime LastOk;          // letzte erfolgreiche Abfrage
         public Dictionary<int, string> VlanNames = new Dictionary<int, string>();
-        public bool EgressKnown;         // SNMP liefert getaggte VLANs je Port (Q-BRIDGE Egress) - bei UniFi oft nicht/unvollständig
+        public bool EgressKnown;
+        public bool CpuFromUniFi, MemFromUniFi;   // CPU/RAM stammen vom UniFi-Controller (Switch liefert sie nicht per SNMP)
+        public int Temp = -1;            // Temperatur °C (UniFi), -1 = unbekannt
+        public bool Overheating;         // UniFi meldet Überhitzung
+        public double PoeBudget = -1;    // PoE-Budget des Switches in Watt (UniFi)
+        public double PoeUsed
+        {
+            get { double w = 0; foreach (PortState p in Ports.Values) if (p.PoeOn) w += p.PoeWatts; return w; }
+        }         // SNMP liefert getaggte VLANs je Port (Q-BRIDGE Egress) - bei UniFi oft nicht/unvollständig
         public List<string> IfAddrs = new List<string>();   // eigene IP-Adressen (Firewall): "IP/Präfix/ifIndex"
 
         /// <summary>Schnittstelle (ifIndex) der Firewall, in deren Netz die IP liegt; -1 = unbekannt.</summary>
@@ -5651,6 +5680,8 @@ namespace PingMonitor
                 List<string> p = new List<string>();
                 if (Cpu >= 0) p.Add("CPU " + Cpu + " %");
                 if (MemPct >= 0) p.Add("RAM " + MemPct + " %");
+                if (Temp > 0) p.Add(Temp + " °C" + (Overheating ? " ÜBERHITZT" : ""));
+                if (PoeBudget > 0) p.Add("PoE " + PoeUsed.ToString("0") + " / " + PoeBudget.ToString("0") + " W");
                 if (Load.Length > 0) p.Add("Last " + Load);
                 if (Connections >= 0) p.Add(Connections + " TCP-Verbindungen");
                 return string.Join("  ·  ", p.ToArray());
@@ -5685,7 +5716,11 @@ namespace PingMonitor
                      IfOper = "1.3.6.1.2.1.2.2.1.8", IfLastChange = "1.3.6.1.2.1.2.2.1.9", IfInDiscards = "1.3.6.1.2.1.2.2.1.13",
                      IfInErrors = "1.3.6.1.2.1.2.2.1.14", IfOutDiscards = "1.3.6.1.2.1.2.2.1.19", IfOutErrors = "1.3.6.1.2.1.2.2.1.20",
                      IfName = "1.3.6.1.2.1.31.1.1.1.1", IfHighSpeed = "1.3.6.1.2.1.31.1.1.1.15", IfAlias = "1.3.6.1.2.1.31.1.1.1.18",
-                     IfInBcast = "1.3.6.1.2.1.31.1.1.1.3", IfHCInBcast = "1.3.6.1.2.1.31.1.1.1.9";
+                     IfInBcast = "1.3.6.1.2.1.31.1.1.1.3", IfHCInBcast = "1.3.6.1.2.1.31.1.1.1.9",
+                     IfHCInUcast = "1.3.6.1.2.1.31.1.1.1.7", IfHCInMcast = "1.3.6.1.2.1.31.1.1.1.8", IfHCOutUcast = "1.3.6.1.2.1.31.1.1.1.11",
+                     IfHCOutMcast = "1.3.6.1.2.1.31.1.1.1.12", IfHCOutBcast = "1.3.6.1.2.1.31.1.1.1.13",
+                     IfInUcast = "1.3.6.1.2.1.2.2.1.11", IfOutUcast = "1.3.6.1.2.1.2.2.1.17", IfInMcast = "1.3.6.1.2.1.31.1.1.1.2",
+                     IfOutMcast = "1.3.6.1.2.1.31.1.1.1.4", IfOutBcast = "1.3.6.1.2.1.31.1.1.1.5";
         // BRIDGE-MIB: Spanning Tree
         const string StpTopChanges = "1.3.6.1.2.1.17.2.4.0", StpPortState = "1.3.6.1.2.1.17.2.15.1.3";
         // Q-BRIDGE-MIB: VLANs
@@ -5948,6 +5983,56 @@ namespace PingMonitor
 
         public static List<Issue> CurrentIssues(bool fromService) { return Issues.Parse(Lines(fromService)); }
 
+        /// <summary>Wanderung einer MAC-Adresse zwischen zwei Ports desselben Switches (Hinweis auf Schleife).</summary>
+        public class MacMove { public DateTime Time; public string Switch = "", Mac = ""; public int From, To; }
+        static readonly Dictionary<string, int> macLoc = new Dictionary<string, int>();
+        static readonly List<MacMove> macMoves = new List<MacMove>();
+
+        public static List<MacMove> MacMoves() { lock (macMoves) return new List<MacMove>(macMoves); }
+
+        /// <summary>
+        /// Vergleicht die MAC-Tabellen mit der letzten Runde. Nicht gewertet: eigene MACs der Switches/APs, WLAN-Clients (Roaming
+        /// wechselt den Port legitim), zufällige MACs, Switches ohne eigene MAC-Tabelle (Daten vom Controller).
+        /// </summary>
+        static void TrackMacMoves()
+        {
+            DateTime now = DateTime.Now;
+            HashSet<string> skip = new HashSet<string>();
+            lock (sync)
+            {
+                foreach (SwitchState s in switches)
+                    foreach (string m in s.OwnMacs.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) skip.Add(NetTools.MacHex(m));
+                if (unifi.Valid)
+                {
+                    foreach (UniFiClientInfo c in unifi.Clients) if (!c.Wired) skip.Add(NetTools.MacHex(c.Mac));
+                    foreach (UniFiDeviceInfo d in unifi.Devices) skip.Add(d.Mac);
+                }
+                foreach (SwitchState s in switches)
+                {
+                    if (s.FromUniFi || !s.HasFdb || !s.Reachable || s.Kind != "Switch") continue;
+                    foreach (PortState p in s.Ports.Values)
+                    {
+                        if (p.Wireless) continue;
+                        foreach (string m in p.Macs)
+                        {
+                            string h = NetTools.MacHex(m);
+                            if (h.Length != 12 || skip.Contains(h) || Topology.RandomMac(m)) continue;
+                            string key = s.Address + "|" + h;
+                            int old;
+                            if (macLoc.TryGetValue(key, out old) && old != p.IfIndex)
+                            {
+                                MacMove mv = new MacMove();
+                                mv.Time = now; mv.Switch = s.Address; mv.Mac = h; mv.From = old; mv.To = p.IfIndex;
+                                lock (macMoves) macMoves.Add(mv);
+                            }
+                            macLoc[key] = p.IfIndex;
+                        }
+                    }
+                }
+            }
+            lock (macMoves) macMoves.RemoveAll(delegate (MacMove x) { return now - x.Time > TimeSpan.FromHours(24); });
+        }
+
         static void Loop()
         {
             while (running)
@@ -6012,6 +6097,7 @@ namespace PingMonitor
                     AssignRoles();
                     CheckVlans();
                     MapDevices();
+                    try { TrackMacMoves(); } catch { }
                     try { CheckConsistency(); } catch { }
                     lock (sync) foreach (SwitchState s in switches) foreach (PortState p in s.Ports.Values) Evaluate(s, p);
                     try
@@ -6150,6 +6236,13 @@ namespace PingMonitor
             if (inOct.Count == 0) { inOct = Column(ip, s.Community, IfInOctets); outOct = Column(ip, s.Community, IfOutOctets); }
             Dictionary<int, SnmpValue> bcast = Column(ip, s.Community, IfHCInBcast);
             if (bcast.Count == 0) bcast = Column(ip, s.Community, IfInBcast);
+            Dictionary<int, SnmpValue> inU = Column(ip, s.Community, IfHCInUcast), inM = Column(ip, s.Community, IfHCInMcast),
+                outU = Column(ip, s.Community, IfHCOutUcast), outM = Column(ip, s.Community, IfHCOutMcast), outB = Column(ip, s.Community, IfHCOutBcast);
+            if (inU.Count == 0)
+            {
+                inU = Column(ip, s.Community, IfInUcast); inM = Column(ip, s.Community, IfInMcast);
+                outU = Column(ip, s.Community, IfOutUcast); outM = Column(ip, s.Community, IfOutMcast); outB = Column(ip, s.Community, IfOutBcast);
+            }
             int wanIndex = -1;
             if (s.Kind == "Firewall")
             {
@@ -6226,6 +6319,10 @@ namespace PingMonitor
 
                     Counters(s, p, Num(inErr, idx, 0), Num(outErr, idx, 0), Num(inDisc, idx, 0) + Num(outDisc, idx, 0),
                         Num(fcs, idx, 0), Num(align, idx, 0), Num(late, idx, 0));
+                    long iu = Num(inU, idx, -1), ou = Num(outU, idx, -1);
+                    Packets(p, iu < 0 ? -1 : iu + Math.Max(0, Num(inM, idx, 0)) + Math.Max(0, Num(bcast, idx, 0)), Num(inM, idx, -1),
+                        ou < 0 ? -1 : ou + Math.Max(0, Num(outM, idx, 0)) + Math.Max(0, Num(outB, idx, 0)), Num(outM, idx, -1),
+                        Num(inDisc, idx, -1), Num(outDisc, idx, -1), now);
 
                     // Link-Wechsel: ifLastChange hat sich geändert
                     long lc = Num(change, idx, -1);
@@ -6289,6 +6386,33 @@ namespace PingMonitor
             p.TxHist.RemoveAll(delegate (KeyValuePair<DateTime, long> x) { return now - x.Key > TimeSpan.FromDays(7); });
             if (p.DErr > 0)
                 Event(s, p, "Empfangsfehler (CRC) +" + p.DErr, "seit Überwachungsbeginn " + p.RxErrors + " fehlerhafte Pakete");
+        }
+
+        /// <summary>
+        /// Paketraten (alle Pakete, Multicast ein/aus) und verworfene Pakete getrennt nach Eingang/Ausgang. Verwerfen im AUSGANG = Puffer voll
+        /// (Überlast); im EINGANG meist Filter (nicht erlaubtes VLAN, STP-blockiert, unbekanntes Protokoll).
+        /// </summary>
+        static void Packets(PortState p, long inPkts, long inMcast, long outPkts, long outMcast, long inDisc, long outDisc, DateTime now)
+        {
+            bool have = p.PktsAt != DateTime.MinValue;
+            bool reset = have && (inPkts >= 0 && inPkts < p.PInPkts || outPkts >= 0 && outPkts < p.POutPkts || inDisc >= 0 && inDisc < p.PInDisc || outDisc >= 0 && outDisc < p.POutDisc);
+            if (have && !reset)
+            {
+                double secs = Math.Max(1, (now - p.PktsAt).TotalSeconds);
+                long dIn = inPkts >= 0 && p.PInPkts >= 0 ? inPkts - p.PInPkts : 0, dOut = outPkts >= 0 && p.POutPkts >= 0 ? outPkts - p.POutPkts : 0;
+                long dInD = inDisc >= 0 && p.PInDisc >= 0 ? inDisc - p.PInDisc : 0, dOutD = outDisc >= 0 && p.POutDisc >= 0 ? outDisc - p.POutDisc : 0;
+                p.InPps = dIn / secs; p.OutPps = dOut / secs;
+                p.McastInPps = inMcast >= 0 && p.PInMcast >= 0 ? (inMcast - p.PInMcast) / secs : 0;
+                p.McastOutPps = outMcast >= 0 && p.POutMcast >= 0 ? (outMcast - p.POutMcast) / secs : 0;
+                if (inPkts >= 0) { p.RecentPps.Enqueue(p.InPps); while (p.RecentPps.Count > 5) p.RecentPps.Dequeue(); }
+                if (inMcast >= 0) { p.RecentMcastIn.Enqueue(p.McastInPps); while (p.RecentMcastIn.Count > 5) p.RecentMcastIn.Dequeue(); }
+                if (outMcast >= 0) { p.RecentMcastOut.Enqueue(p.McastOutPps); while (p.RecentMcastOut.Count > 5) p.RecentMcastOut.Dequeue(); }
+                p.PktHist.Add(new long[] { now.Ticks, dInD, dOutD, dIn, dOut });
+                long cut = now.AddHours(-6).Ticks;
+                p.PktHist.RemoveAll(delegate (long[] x) { return x[0] < cut; });
+                p.DropsHour = outDisc >= 0 ? p.Sum(2, TimeSpan.FromHours(1)) : -1;
+            }
+            p.PInPkts = inPkts; p.POutPkts = outPkts; p.PInMcast = inMcast; p.POutMcast = outMcast; p.PInDisc = inDisc; p.POutDisc = outDisc; p.PktsAt = now;
         }
 
         /// <summary>Datenrate aus den Byte-Zählern.</summary>
@@ -6526,6 +6650,7 @@ namespace PingMonitor
                 long sum = 0;
                 foreach (KeyValuePair<string, SnmpValue> kv in cpu) sum += kv.Value.Number;
                 s.Cpu = (int)(sum / cpu.Count);
+                s.CpuFromUniFi = false;
             }
             Dictionary<string, SnmpValue> g = Snmp.GetValues(ip, s.Community, 1500, TcpCurrEstab, UcdLoad1, UcdLoad5, UcdLoad15,
                 UcdMemTotal, UcdMemAvail, UcdMemBuffer, UcdMemCached);
@@ -6540,6 +6665,7 @@ namespace PingMonitor
                 if (g.TryGetValue(UcdMemBuffer, out v)) free += v.Number;
                 if (g.TryGetValue(UcdMemCached, out v)) free += v.Number;
                 s.MemPct = (int)Math.Max(0, Math.Min(100, 100 - 100.0 * free / total));
+                s.MemFromUniFi = false;
             }
             else
             {
@@ -6551,18 +6677,12 @@ namespace PingMonitor
                             Dictionary<string, SnmpValue> m = Snmp.GetValues(ip, s.Community, 1500, HrStorageSize + "." + kv.Key, HrStorageUsed + "." + kv.Key);
                             SnmpValue size, used;
                             if (m.TryGetValue(HrStorageSize + "." + kv.Key, out size) && m.TryGetValue(HrStorageUsed + "." + kv.Key, out used) && size.Number > 0)
-                                s.MemPct = (int)(100.0 * used.Number / size.Number);
+                            { s.MemPct = (int)(100.0 * used.Number / size.Number); s.MemFromUniFi = false; }
                             break;
                         }
             }
 
-            List<Finding> f = new List<Finding>();
-            if (s.Cpu >= 75)
-                f.Add(new Finding(s.Cpu >= 90 ? Finding.Problem : Finding.Warning, "CPU " + s.Cpu + " %",
-                    "Das Gerät ist stark ausgelastet (CPU " + s.Cpu + " %). Bei einer Firewall: viel Verkehr, IDS/IPS (Suricata), VPN-Verschlüsselung, " +
-                    "Proxy oder Angriffe/Portscans. Folge: Verzögerungen und Paketverluste für ALLE Geräte."));
-            if (s.MemPct >= 90)
-                f.Add(new Finding(Finding.Warning, "RAM " + s.MemPct + " %", "Der Arbeitsspeicher ist fast voll (" + s.MemPct + " %). Dienste können abstürzen oder neu starten."));
+            List<Finding> f = SystemFindings(s);
             if (s.Kind != "Firewall") ReadStp(ip, s, f);
             s.SysRating = Assessment.From(f, s.SystemText, "Systemzustand unauffällig.");
             if (s.SystemText.Length == 0 && f.Count == 0) s.SysRating.Level = Finding.Unknown;
@@ -7004,6 +7124,34 @@ namespace PingMonitor
                     "ein Profil ohne dieses VLAN.\r\nVorgehen: Port-Profil des Ports " + p.DisplayName + " auf \"Alle\" bzw. um das VLAN erweitern."));
         }
 
+        /// <summary>CPU/RAM (nur wenn per SNMP nicht vorhanden), Temperatur und PoE-Budget vom UniFi-Controller übernehmen.</summary>
+        static void SystemFromUniFi(SwitchState s, UniFiDeviceInfo d)
+        {
+            if (d.Cpu >= 0 && (s.Cpu < 0 || s.CpuFromUniFi)) { s.Cpu = (int)Math.Round(d.Cpu); s.CpuFromUniFi = true; }
+            if (d.Mem >= 0 && (s.MemPct < 0 || s.MemFromUniFi)) { s.MemPct = (int)Math.Round(d.Mem); s.MemFromUniFi = true; }
+            s.Temp = d.Temp; s.Overheating = d.Overheating;
+            s.PoeBudget = d.PoeBudget;
+        }
+
+        /// <summary>Bewertung von CPU, RAM und Temperatur (SNMP oder UniFi).</summary>
+        static List<Finding> SystemFindings(SwitchState s)
+        {
+            List<Finding> f = new List<Finding>();
+            if (s.Cpu >= 75)
+                f.Add(new Finding(s.Cpu >= 90 ? Finding.Problem : Finding.Warning, "CPU " + s.Cpu + " %",
+                    s.Kind == "Firewall" ? "Die Firewall ist stark ausgelastet (CPU " + s.Cpu + " %): viel Verkehr, IDS/IPS (Suricata), VPN-Verschlüsselung, Proxy oder " +
+                        "Angriffe/Portscans. Folge: Verzögerungen und Paketverluste für ALLE Geräte."
+                    : "Die CPU des " + (s.Kind == "Access Point" ? "Access Points" : "Switches") + " ist stark ausgelastet (" + s.Cpu + " %). Weitergeleitet wird in Hardware - " +
+                        "die CPU belasten Pakete, die der Switch selbst verarbeiten muss: Broadcasts/Multicast-Flut, Schleife, Spanning-Tree-Änderungen, ARP-Stürme, " +
+                        "zu häufige Abfragen (SNMP/Controller). Folge: Verwaltung, STP und LLDP reagieren verzögert, im schlimmsten Fall Aussetzer."));
+            if (s.MemPct >= 90)
+                f.Add(new Finding(Finding.Warning, "RAM " + s.MemPct + " %", "Der Arbeitsspeicher ist fast voll (" + s.MemPct + " %). Dienste können abstürzen oder neu starten."));
+            if (s.Overheating)
+                f.Add(new Finding(Finding.Problem, "ÜBERHITZT" + (s.Temp > 0 ? " (" + s.Temp + " °C)" : ""), "Das Gerät meldet Überhitzung. Folge: Drosselung, Abstürze, " +
+                    "Neustarts, Ports fallen aus. Ursachen: Lüftung blockiert, Schrank/Raum zu warm, Lüfter defekt, zu hohe PoE-Last."));
+            return f;
+        }
+
         /// <summary>Switch-Port, an dem ein Access Point hängt (Port-Rolle, LLDP oder UniFi-Uplink), z. B. "Bro / 0/3".</summary>
         static string ApPeer(SwitchState ap)
         {
@@ -7069,6 +7217,7 @@ namespace PingMonitor
                     if (snmp != null)
                     {
                         switches.RemoveAll(delegate (SwitchState x) { return x.FromUniFi && Matches(x, dd); });
+                        SystemFromUniFi(snmp, d);
                         foreach (UniFiPort up in d.Ports)
                         {
                             PortState p = PortByNumber(snmp, up.Idx);
@@ -7111,6 +7260,9 @@ namespace PingMonitor
                         s.UpTime = d.Uptime * 100;
                     }
                     if (!d.Online) continue;
+                    SystemFromUniFi(s, d);
+                    s.SysRating = Assessment.From(SystemFindings(s), s.SystemText, "Systemzustand unauffällig.");
+                    if (s.SystemText.Length == 0) s.SysRating.Level = Finding.Unknown;
                     foreach (UniFiPort up in d.Ports)
                     {
                         PortState p;
@@ -7130,6 +7282,7 @@ namespace PingMonitor
                         Counters(s, p, up.RxErr, up.TxErr, up.RxDrop + up.TxDrop, 0, 0, 0);
                         Rates(p, up.RxBytes, up.TxBytes, now);
                         Broadcasts(p, up.RxBcast, now);
+                        Packets(p, up.RxPackets, up.RxMcast, up.TxPackets, up.TxMcast, up.RxDrop, up.TxDrop, now);
                         p.PoeOn = up.PoeOn; p.PoeWatts = up.PoeWatts; p.Stp = up.Stp;
                         if (up.VlanKnown) { p.Pvid = up.NativeVlan; p.Tagged.Clear(); p.Tagged.AddRange(up.Tagged); }
                         // "MAC-Tabelle" aus den Controller-Daten: Geräte an diesem Port, angeschlossene UniFi-Geräte, Gateway am Uplink
@@ -7533,7 +7686,10 @@ namespace PingMonitor
                 (p.Up && p.Stp.Length > 0 ? "\r\nSpanning Tree: " + p.Stp : "") +
                 (p.HasVlan ? "\r\nVLAN: " + (p.Pvid > 0 ? VlanLabel(p.Pvid, s, unifi) + " ungetaggt" : "kein natives") +
                     (p.Tagged.Count > 0 ? ", getaggt: " + string.Join(", ", p.Tagged.ConvertAll<string>(delegate (int v) { return v.ToString(); }).ToArray()) : "") : "") +
-                (p.Up && p.RecentBcast.Count > 0 ? "\r\nBroadcasts: " + p.BcastPps.ToString("0") + "/s" : "") + "\r\n" +
+                (p.Up && p.RecentBcast.Count > 0 ? "\r\nBroadcasts: " + p.BcastPps.ToString("0") + "/s" : "") +
+                (p.Up && p.RecentPps.Count > 0 ? "\r\nPakete/s empfangen / gesendet: " + p.InPps.ToString("0") + " / " + p.OutPps.ToString("0") +
+                    (p.RecentMcastIn.Count > 0 || p.RecentMcastOut.Count > 0 ? ",  Multicast/s ein / aus: " + p.McastInPps.ToString("0") + " / " + p.McastOutPps.ToString("0") : "") : "") +
+                (p.DropsHour > 0 ? "\r\nIm Ausgang verworfen (letzte Stunde): " + p.DropsHour : "") + "\r\n" +
                 "\r\nSeit Überwachungsbeginn: Empfangsfehler " + p.RxErrors + ", Sendefehler " + p.TxErrors + ", verworfen " + p.Discards +
                 ", Link-Wechsel (24 h) " + flapsDay +
                 (p.ConnectedText.Length > 0 ? "\r\nAngeschlossen: " + p.ConnectedText : "");
@@ -7572,7 +7728,8 @@ namespace PingMonitor
                         s.Polled ? "1" : "0", s.Reachable ? "1" : "0", Fmt.Csv(s.Error), Fmt.Csv(s.SysName), Fmt.Csv(s.SysDescr),
                         s.LastPoll == DateTime.MinValue ? "" : s.LastPoll.ToString(Fmt.Time), s.HasFdb ? "1" : "0",
                         Fmt.Csv(s.OwnMacs), Fmt.Csv(s.Kind), s.Cpu.ToString(), s.MemPct.ToString(), s.Connections.ToString(), Fmt.Csv(s.Load),
-                        Fmt.Csv(s.SysRating.Encode()), Fmt.Csv(ArpText(s.Arp)), s.FromUniFi ? "1" : "0", string.Join(",", s.IfAddrs.ToArray()) })).Append("\r\n");
+                        Fmt.Csv(s.SysRating.Encode()), Fmt.Csv(ArpText(s.Arp)), s.FromUniFi ? "1" : "0", string.Join(",", s.IfAddrs.ToArray()),
+                        s.Temp.ToString(), s.Overheating ? "1" : "0", s.PoeBudget.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) })).Append("\r\n");
                     foreach (PortState p in s.Ports.Values)
                         sb.Append(string.Join(";", new string[] { "P", Fmt.Csv(s.Address), p.IfIndex.ToString(), Fmt.Csv(p.Name), Fmt.Csv(p.Alias),
                             p.Oper.ToString(), p.SpeedMbps.ToString(), p.Duplex.ToString(), p.RxErrors.ToString(), p.TxErrors.ToString(),
@@ -7586,7 +7743,10 @@ namespace PingMonitor
                             p.OctetsAt == DateTime.MinValue ? "" : p.OctetsAt.ToString(Fmt.Time), p.LldpCaps.ToString(), p.Role, Fmt.Csv(p.RoleInfo), Fmt.Csv(p.RoleTarget),
                             p.PoeOn ? "1" : "0", p.PoeWatts.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture), p.Stp,
                             p.BcastPps.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture), p.Pvid.ToString(),
-                            string.Join(",", p.Tagged.ConvertAll<string>(delegate (int v) { return v.ToString(); }).ToArray()) })).Append("\r\n");
+                            string.Join(",", p.Tagged.ConvertAll<string>(delegate (int v) { return v.ToString(); }).ToArray()),
+                            p.InPps.ToString("0", System.Globalization.CultureInfo.InvariantCulture), p.OutPps.ToString("0", System.Globalization.CultureInfo.InvariantCulture),
+                            p.McastInPps.ToString("0", System.Globalization.CultureInfo.InvariantCulture), p.McastOutPps.ToString("0", System.Globalization.CultureInfo.InvariantCulture),
+                            p.DropsHour.ToString() })).Append("\r\n");
                 }
             }
             return sb.ToString();
@@ -7627,6 +7787,11 @@ namespace PingMonitor
                         }
                     if (f.Count >= 20) s.FromUniFi = f[19] == "1";
                     if (f.Count >= 21) s.IfAddrs = new List<string>(f[20].Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries));
+                    if (f.Count >= 24)
+                    {
+                        int.TryParse(f[21], out s.Temp); s.Overheating = f[22] == "1";
+                        double.TryParse(f[23], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out s.PoeBudget);
+                    }
                     list.Add(s);
                 }
                 else if (f.Count >= 18 && f[0] == "P" && list.Count > 0)
@@ -7669,6 +7834,15 @@ namespace PingMonitor
                             {
                                 int.TryParse(f[35], out p.Pvid);
                                 foreach (string v in f[36].Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) { int x; if (int.TryParse(v, out x)) p.Tagged.Add(x); }
+                            }
+                            if (f.Count >= 42)
+                            {
+                                System.Globalization.CultureInfo ci = System.Globalization.CultureInfo.InvariantCulture;
+                                double.TryParse(f[37], System.Globalization.NumberStyles.Float, ci, out p.InPps);
+                                double.TryParse(f[38], System.Globalization.NumberStyles.Float, ci, out p.OutPps);
+                                double.TryParse(f[39], System.Globalization.NumberStyles.Float, ci, out p.McastInPps);
+                                double.TryParse(f[40], System.Globalization.NumberStyles.Float, ci, out p.McastOutPps);
+                                long.TryParse(f[41], out p.DropsHour);
                             }
                         }
                         foreach (string m in f[22].Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries)) p.Macs.Add(m);
@@ -11823,6 +11997,14 @@ namespace PingMonitor
         // ---- Zähler
         long arp, ipv4, ipv6, tcp, udp, icmp, other, stp, lldp, broadcast, multicast, fragments;
         readonly Dictionary<long, int> bcastPerSecond = new Dictionary<long, int>();
+        // Last: Pakete/Multicast je Sekunde, Absender und Multicast-Gruppen, identische Frames (Schleife)
+        readonly Dictionary<long, int> pktPerSecond = new Dictionary<long, int>(), mcastPerSecond = new Dictionary<long, int>();
+        readonly Dictionary<string, long[]> macTalkers = new Dictionary<string, long[]>();      // Quell-MAC -> Pakete, Bytes
+        readonly Dictionary<string, long[]> mcGroups = new Dictionary<string, long[]>();     // Ziel-MAC -> Pakete, Bytes
+        readonly Dictionary<long, long> bytesPerSecond = new Dictionary<long, long>();
+        readonly Dictionary<long, long[]> frameSeen = new Dictionary<long, long[]>();         // Hash -> letzte Zeit (Ticks), Anzahl
+        readonly Dictionary<string, int> loopSenders = new Dictionary<string, int>();
+        long loopFrames;
         readonly Dictionary<string, long> talkers = new Dictionary<string, long>();
 
         // ARP
@@ -11963,10 +12145,11 @@ namespace PingMonitor
                     if (len < 14) return;
                     dstMac = Mac(d, 0); srcMac = Mac(d, 6);
                     ethertype = U16(d, 12); p = 14;
+                    Load(t, d, len, srcMac, dstMac);
                     if ((d[0] & 1) != 0)
                     {
                         if (dstMac == "FF-FF-FF-FF-FF-FF") { broadcast++; Count(bcastPerSecond, t); }
-                        else multicast++;
+                        else { multicast++; Count(mcastPerSecond, t); }
                     }
                     curVlan = 0;
                     int tags = 0;
@@ -12011,6 +12194,109 @@ namespace PingMonitor
             else if (ethertype == 0x86DD) { ipv6++; DecodeIp6(t, d, p, len, srcMac); }
             else if (ethertype == 0x88CC) { lldp++; DecodeLldp(d, p, len, srcMac); }
             else other++;
+        }
+
+        /// <summary>Lastdaten je Frame: Rate, Absender, Multicast-Gruppen und mehrfach identische Frames (mind. 3× in 100 ms = Schleife).</summary>
+        void Load(DateTime t, byte[] d, int len, string src, string dst)
+        {
+            Count(pktPerSecond, t);
+            long sec = t.Ticks / TimeSpan.TicksPerSecond, by;
+            bytesPerSecond.TryGetValue(sec, out by); bytesPerSecond[sec] = by + len;
+            long[] a;
+            if (!macTalkers.TryGetValue(src, out a)) { a = new long[2]; macTalkers[src] = a; }
+            a[0]++; a[1] += len;
+            if ((d[0] & 1) != 0 && dst != "FF-FF-FF-FF-FF-FF")
+            {
+                if (!mcGroups.TryGetValue(dst, out a)) { a = new long[2]; mcGroups[dst] = a; }
+                a[0]++; a[1] += len;
+            }
+            if (t == DateTime.MinValue) return;
+            long h = len;
+            int n = Math.Min(len, 96);
+            for (int i = 0; i < n; i++) h = h * 1099511628211L ^ d[i];
+            long[] f;
+            if (frameSeen.TryGetValue(h, out f) && t.Ticks - f[0] <= TimeSpan.TicksPerMillisecond * 100)
+            {
+                f[1]++;
+                if (f[1] == 3) { loopFrames++; int c; loopSenders.TryGetValue(src, out c); loopSenders[src] = c + 1; }
+            }
+            else { f = new long[] { t.Ticks, 1 }; frameSeen[h] = f; }
+            f[0] = t.Ticks;
+            if (frameSeen.Count > 200000) frameSeen.Clear();
+        }
+
+        /// <summary>Last im Mitschnitt: Schleife (identische Frames), Paket-/Multicast-Spitzen, größte Absender und Multicast-Gruppen.</summary>
+        void EvaluateLoad(TimeSpan dur)
+        {
+            if (where == null) where = Locator.Load();
+            if (loopFrames >= 20)
+            {
+                List<KeyValuePair<string, int>> ls = new List<KeyValuePair<string, int>>(loopSenders);
+                ls.Sort(delegate (KeyValuePair<string, int> x, KeyValuePair<string, int> y) { return y.Value.CompareTo(x.Value); });
+                List<string> top = new List<string>();
+                foreach (KeyValuePair<string, int> kv in ls) if (top.Count < 5 && kv.Value * 10 >= ls[0].Value) top.Add(kv.Key + where.Text(kv.Key) + " (" + kv.Value + ")");
+                Add(loopFrames >= 200 ? Finding.Problem : Finding.Warning, "Identische Pakete mehrfach - Schleife?",
+                    loopFrames + " Pakete kamen innerhalb von 100 ms mindestens dreimal byte-gleich vorbei. Das passiert, wenn ein Paket im Kreis läuft " +
+                    "(Netzwerkschleife). Hinweis: Ein Spiegel-Port mit \"Ein- und Ausgang\" zeigt jedes Paket doppelt - das ist hier schon berücksichtigt (erst ab 3 Kopien).\r\n" +
+                    "Häufigste Absender: " + string.Join(", ", top.ToArray()) + "\r\nVorgehen: Weg dieser Geräte verfolgen - irgendwo gibt es zwei Verbindungen in dasselbe Netz.",
+                    "", "");
+            }
+            int maxP = 0, maxM = 0; long secP = 0, secM = 0;
+            foreach (KeyValuePair<long, int> kv in pktPerSecond) if (kv.Value > maxP) { maxP = kv.Value; secP = kv.Key; }
+            foreach (KeyValuePair<long, int> kv in mcastPerSecond) if (kv.Value > maxM) { maxM = kv.Value; secM = kv.Key; }
+            long peakBytes;
+            bytesPerSecond.TryGetValue(secP, out peakBytes);
+            double avgSize = maxP > 0 ? (double)peakBytes / maxP : 0;   // Paketgröße in der Spitzen-Sekunde
+            if (maxP >= 20000)
+            {
+                DateTime when = new DateTime(secP * TimeSpan.TicksPerSecond);
+                AddEvent(when, "Paket-Spitze", maxP + " Pakete in einer Sekunde", Finding.Warning);
+                Add(avgSize < 300 ? Finding.Warning : Finding.Info, "Paket-Spitze " + maxP + "/s",
+                    "Um " + when.ToString("HH:mm:ss") + " " + maxP + " Pakete in einer Sekunde, Ø Paketgröße in dieser Sekunde " + avgSize.ToString("0") + " Byte. " +
+                    (avgSize < 300 ? "Viele kleine Pakete belasten Firewall, APs und Switch-CPUs - typisch für Scans, Fluten oder fehlerhafte Geräte. Absender siehe \"Wer sendet am meisten\"."
+                                   : "Große Pakete - eher eine große Übertragung (Backup, Download) als eine Flut."), "", "");
+            }
+            if (maxM >= 500)
+            {
+                DateTime when = new DateTime(secM * TimeSpan.TicksPerSecond);
+                List<KeyValuePair<string, long[]>> gs = new List<KeyValuePair<string, long[]>>(mcGroups);
+                gs.Sort(delegate (KeyValuePair<string, long[]> x, KeyValuePair<string, long[]> y) { return y.Value[0].CompareTo(x.Value[0]); });
+                List<string> top = new List<string>();
+                foreach (KeyValuePair<string, long[]> kv in gs) if (top.Count < 5) top.Add(McName(kv.Key) + " " + kv.Value[0] + " Pakete");
+                AddEvent(when, "Multicast-Spitze", maxM + " Multicast-Pakete in einer Sekunde", Finding.Warning);
+                Add(maxM >= 3000 ? Finding.Problem : Finding.Warning, "Viel Multicast (" + maxM + "/s)",
+                    "Bis zu " + maxM + " Multicast-Pakete pro Sekunde (normal: unter 50). Kommen sie an einem Port an, an dem niemand den Strom angefordert hat, " +
+                    "flutet der Switch Multicast wie Broadcast - IGMP-Snooping bzw. ein IGMP-Querier fehlt.\r\nGrößte Gruppen: " + string.Join(", ", top.ToArray()) +
+                    "\r\nVorgehen: IGMP-Snooping für das Netz aktivieren, Querier festlegen, Multicast-Quellen (IPTV, Kameras) ggf. in ein eigenes VLAN.",
+                    "eth.dst[0] & 1 && !(eth.dst == ff:ff:ff:ff:ff:ff)", "");
+            }
+            if (Packets >= 1000 && macTalkers.Count > 1)
+            {
+                List<KeyValuePair<string, long[]>> tl = new List<KeyValuePair<string, long[]>>(macTalkers);
+                tl.Sort(delegate (KeyValuePair<string, long[]> x, KeyValuePair<string, long[]> y) { return y.Value[0].CompareTo(x.Value[0]); });
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < Math.Min(5, tl.Count); i++)
+                {
+                    long[] v = tl[i].Value;
+                    sb.Append("\r\n" + (i + 1) + ". " + tl[i].Key + where.Text(tl[i].Key) + ": " + v[0] + " Pakete (" + (100.0 * v[0] / Packets).ToString("0") + " %), " +
+                        (v[1] / 1024.0 / 1024.0).ToString("0.0") + " MB, Ø " + (v[0] > 0 ? v[1] / v[0] : 0) + " Byte" +
+                        (dur.TotalSeconds >= 1 ? ", " + (v[0] / dur.TotalSeconds).ToString("0") + " Pakete/s" : ""));
+                }
+                long first = tl[0].Value[0];
+                Add(first * 2 > Packets && Packets >= 20000 ? Finding.Warning : Finding.Info, "Wer sendet am meisten",
+                    "Absender nach Paketen (alle " + Packets + " Pakete des Mitschnitts):" + sb +
+                    (first * 2 > Packets && Packets >= 20000 ? "\r\nEin Absender verursacht mehr als die Hälfte aller Pakete - bei Überlast/Paketflut der erste Verdächtige." : ""),
+                    "", "");
+            }
+        }
+
+        static string McName(string mac)
+        {
+            string h = NetTools.MacHex(mac);
+            if (h.StartsWith("01005E")) return "IPv4-Gruppe " + mac + (h == "01005E0000FB" ? " (mDNS)" : h == "01005E7FFFFA" ? " (SSDP/UPnP)" : h == "01005E000001" ? " (alle Hosts/IGMP)" : "");
+            if (h.StartsWith("3333")) return "IPv6-Gruppe " + mac + (h == "3333000000FB" ? " (mDNS)" : h == "333300000001" ? " (alle Knoten)" : "");
+            if (h.StartsWith("0180C2")) return "Switch-Protokoll " + mac + " (STP/LLDP)";
+            return mac;
         }
 
         static void Count(Dictionary<long, int> perSecond, DateTime t)
@@ -12760,6 +13046,7 @@ namespace PingMonitor
                         : "Erhöhter Broadcast-Verkehr (z. B. viele ARP-Anfragen, Netzwerkscans, Discovery-Protokolle). Beobachten."),
                     "eth.dst == ff:ff:ff:ff:ff:ff", "https://en.wikipedia.org/wiki/Broadcast_radiation");
             }
+            EvaluateLoad(dur);
 
             if (stpChanges.Count > 0)
                 Add(stpChanges.Count >= 3 ? Finding.Problem : Finding.Warning, stpChanges.Count + "× Netzwerk-Umbau (STP)",
@@ -13373,7 +13660,7 @@ namespace PingMonitor
         public bool Up, FullDuplex, PoeOn, IsUplink;
         public int Speed;
         public double PoeWatts;
-        public long RxErr, TxErr, RxDrop, TxDrop, RxBytes = -1, TxBytes = -1, RxBcast = -1;
+        public long RxErr, TxErr, RxDrop, TxDrop, RxBytes = -1, TxBytes = -1, RxBcast = -1, RxPackets = -1, TxPackets = -1, RxMcast = -1, TxMcast = -1;
     }
 
     class UniFiDeviceInfo
@@ -13384,6 +13671,10 @@ namespace PingMonitor
         public string Version = "";
         public long Uptime = -1;            // Sekunden seit dem Start
         public int UplinkSpeed;             // Mbit/s der eigenen Uplink-Verbindung
+        public double Cpu = -1, Mem = -1;   // Auslastung in % (system-stats)
+        public int Temp = -1;               // Temperatur °C
+        public bool Overheating;
+        public double PoeBudget = -1;       // PoE-Budget in Watt (total_max_power)
         public readonly List<UniFiPort> Ports = new List<UniFiPort>();
 
         public bool IsAp { get { return Type == "uap"; } }
@@ -13793,6 +14084,16 @@ namespace PingMonitor
                 x.Online = Json.N(d, "state", 1) == 1;
                 x.Version = Json.S(d, "version");
                 x.Uptime = (long)Json.N(d, "uptime", -1);
+                Dictionary<string, object> ss = Json.Obj(d, "system-stats");
+                if (ss != null) { x.Cpu = Json.N(ss, "cpu", -1); x.Mem = Json.N(ss, "mem", -1); }
+                if (Json.B(d, "has_temperature") || Json.N(d, "general_temperature", -1) > 0) x.Temp = (int)Json.N(d, "general_temperature", -1);
+                foreach (object to in Json.Arr(d, "temperatures"))
+                {
+                    double tv = Json.N(to as Dictionary<string, object>, "value", -1);
+                    if (tv > x.Temp) x.Temp = (int)tv;
+                }
+                x.Overheating = Json.B(d, "overheating");
+                x.PoeBudget = Json.N(d, "total_max_power", -1);
                 Dictionary<string, object> up = Json.Obj(d, "uplink") ?? Json.Obj(d, "last_uplink");
                 if (up != null)
                 {
@@ -13820,6 +14121,10 @@ namespace PingMonitor
                     u.RxBytes = (long)Json.N(pt, "rx_bytes", -1);
                     u.TxBytes = (long)Json.N(pt, "tx_bytes", -1);
                     u.RxBcast = (long)Json.N(pt, "rx_broadcast", -1);
+                    u.RxPackets = (long)Json.N(pt, "rx_packets", -1);
+                    u.TxPackets = (long)Json.N(pt, "tx_packets", -1);
+                    u.RxMcast = (long)Json.N(pt, "rx_multicast", -1);
+                    u.TxMcast = (long)Json.N(pt, "tx_multicast", -1);
                     u.Stp = Json.S(pt, "stp_state");
                     u.IsUplink = Json.B(pt, "is_uplink");
                     u.Media = Json.S(pt, "media");
@@ -13928,6 +14233,7 @@ namespace PingMonitor
                 sb.Append("=== " + s.Name + " (" + s.Address + ")  Typ " + s.Kind + "  " + (s.Reachable ? "erreichbar" : "NICHT erreichbar " + s.Error) + "\r\n");
                 sb.Append("    sysName " + s.SysName + " | " + s.SysDescr + "\r\n");
                 sb.Append("    eigene MACs: " + (s.OwnMacs.Length > 0 ? s.OwnMacs : "-") + " | MAC-Tabelle per SNMP: " + (s.HasFdb ? "ja" : "NEIN") + "\r\n");
+                if (s.SystemText.Length > 0) sb.Append("    System: " + s.SystemText + "\r\n");
                 List<PortState> ports = new List<PortState>(s.Ports.Values);
                 ports.Sort(delegate (PortState a, PortState b) { return a.IfIndex.CompareTo(b.IfIndex); });
                 foreach (PortState p in ports)
@@ -13937,6 +14243,9 @@ namespace PingMonitor
                         "  Rolle=" + (p.Role.Length > 0 ? p.Role : "Endgerät") + (p.RoleTarget.Length > 0 ? " -> " + p.RoleTarget : "") +
                         (p.LldpName.Length > 0 || p.LldpChassis.Length > 0 ? "  LLDP=" + p.LldpName + "/" + p.LldpChassis + " caps " + p.LldpCaps : "") +
                         (p.HasVlan ? "  VLAN=" + p.VlanText : "") +
+                        (p.Up ? "  " + p.SpeedText + " " + p.RateText + " pps=" + p.InPps.ToString("0") + "/" + p.OutPps.ToString("0") + " mc=" + p.McastInPps.ToString("0") + "/" +
+                            p.McastOutPps.ToString("0") + " bc=" + p.BcastPps.ToString("0") + (p.DropsHour >= 0 ? " drops/h=" + p.DropsHour : "") +
+                            " err=" + p.RxErrors + "/" + p.TxErrors + (p.PoeOn ? " PoE=" + p.PoeWatts.ToString("0.0") + "W" : "") : "") +
                         "  MACs(" + p.Macs.Count + ")=" + string.Join(",", p.Macs.ToArray()) + "\r\n");
                 }
                 sb.Append("\r\n");
@@ -14415,7 +14724,8 @@ namespace PingMonitor
             switch (kind)
             {
                 case "duplex": case "slowlink": case "vlan": case "wan": case "snmp": case "conflict": case "nicpower": case "cgnat": return TimeSpan.FromMinutes(15);
-                case "bcast": case "stpblock": case "outage": return TimeSpan.FromMinutes(30);
+                case "bcast": case "stpblock": case "outage": case "pps": case "mcast": case "mcflood": case "indrops": return TimeSpan.FromMinutes(30);
+                case "drops": case "temp": return TimeSpan.FromHours(2);
                 case "quality": case "fwload": return TimeSpan.FromHours(1);
                 case "crc": case "txerr": case "util": case "stp": case "wlan": case "gateway": return TimeSpan.FromHours(2);
                 default: return TimeSpan.FromHours(24);   // flap, unstable, roam, dhcp, nicreset, ipconflict
@@ -14557,6 +14867,19 @@ namespace PingMonitor
                 if (!s.FromUniFi && s.Polled && !s.Reachable) { found.Add(SnmpIssue(s)); continue; }
                 if (!s.Reachable) continue;
                 if (s.Cpu >= 75 || s.MemPct >= 90) found.Add(LoadIssue(s));   // nur CPU/RAM - STP-Änderungen sind ein eigener Befund
+                if (s.Overheating || s.Temp >= 85) found.Add(TempIssue(s));
+                if (s.PoeBudget > 0 && s.PoeUsed >= 0.85 * s.PoeBudget) found.Add(PoeIssue(s));
+                int flood = 0; List<string> floodPorts = new List<string>(); double floodMax = 0;
+                foreach (PortState p in s.Ports.Values)
+                {
+                    if (!p.Up || p.Wireless || p.RecentMcastOut.Count < 3) continue;
+                    double mn = double.MaxValue;
+                    foreach (double x in p.RecentMcastOut) mn = Math.Min(mn, x);
+                    if (mn >= 500 && !p.IsInfrastructure) { flood++; floodPorts.Add(p.DisplayName); floodMax = Math.Max(floodMax, mn); }
+                }
+                if (flood >= 2) found.Add(McastFloodIssue(s, flood, floodPorts, floodMax));
+                Issue mf = MacFlapIssue(s);
+                if (mf != null) found.Add(mf);
                 int tc = 0;
                 foreach (DateTime d in s.StpTimes) if (now - d < TimeSpan.FromHours(1)) tc++;
                 if (tc >= 5) found.Add(StpIssue(s, tc));
@@ -14593,6 +14916,9 @@ namespace PingMonitor
                     if (p.Up && uN >= 3 && uSum / uN >= 80) found.Add(UtilIssue(s, p, pk, uSum / uN, uHigh, uN));
                     if (p.Up && p.StpBlocked) found.Add(StpBlockIssue(s, p, pk, tc));
                     foreach (Finding vf in p.VlanIssues) found.Add(VlanIssue(s, p, pk, vf));
+                    if (p.Up) { Issue d = DropIssue(s, p, pk); if (d != null) found.Add(d); }
+                    if (p.Up && p.RecentPps.Count >= 3) { Issue pp = PpsIssue(s, p, pk); if (pp != null) found.Add(pp); }
+                    if (p.Up && p.RecentMcastIn.Count >= 3) { Issue mc = McastSourceIssue(s, p, pk); if (mc != null) found.Add(mc); }
                     if (p.IsWan && !p.Up) found.Add(WanIssue(s, p, pk));
                 }
             }
@@ -14814,6 +15140,215 @@ namespace PingMonitor
             return i;
         }
 
+        /// <summary>Im Ausgang verworfene Pakete = Puffer voll (Überlast). Im Eingang verworfene = Filter (VLAN/STP) - nur Hinweis.</summary>
+        static Issue DropIssue(SwitchState s, PortState p, string pk)
+        {
+            TimeSpan h = TimeSpan.FromHours(1);
+            long outD = p.Sum(2, h), outP = p.Sum(4, h), inD = p.Sum(1, h), inP = p.Sum(3, h);
+            int polls = p.Polls(2, h);
+            double ratio = outP > 0 ? (double)outD / (outD + outP) : -1;
+            if (outD > 0 && polls >= 2 && (ratio < 0 ? outD >= 1000 : ratio >= 0.001 || outD >= 5000))
+            {
+                double maxUtil = 0;
+                foreach (double u in p.RecentUtil) maxUtil = Math.Max(maxUtil, u);
+                bool busy = maxUtil >= 70;
+                int conf = polls >= 3 && ratio >= 0.001 && (busy || ratio >= 0.01) ? Issue.Certain : polls >= 3 ? Issue.Likely : Issue.Hint;
+                Issue i = New("drops", pk, "Port", "Überlast: " + outD + " Pakete verworfen (1 h)" + (ratio >= 0 ? ", " + (ratio * 100).ToString("0.##") + " %" : ""), PortObj(s, p),
+                    ratio >= 0.01 ? Finding.Problem : Finding.Warning, conf);
+                i.Ref = pk; i.HistKey = "port;" + pk + "|6"; i.Occurred = DateTime.Now;
+                i.Evidence.Add("Ausgangs-Verwerfzähler (" + (s.FromUniFi ? "UniFi" : "SNMP ifOutDiscards") + "): " + outD + " Pakete in der letzten Stunde, in " + polls + " Abfragen" +
+                    (ratio >= 0 ? " - " + (ratio * 100).ToString("0.###") + " % der gesendeten Pakete" : ""));
+                i.Evidence.Add(busy ? "Gleichzeitig bis " + maxUtil.ToString("0") + " % ausgelastet → die Leitung ist zeitweise voll" :
+                    "Durchschnittliche Auslastung gering - typisch für kurze Spitzen (Microbursts): viele Ports senden gleichzeitig an diesen Port");
+                if (p.SpeedMbps > 0 && p.SpeedMbps < 1000) i.Evidence.Add("Port läuft nur mit " + p.SpeedText + " → schneller voll");
+                i.Causes.Add("Mehrere Geräte senden gleichzeitig über diesen Port (z. B. Uplink, NAS, Server) - der Puffer des Switches läuft über (Microbursts)");
+                i.Causes.Add("Gigabit-Geräte senden an ein langsameres Ziel (100-Mbit-Gerät, WLAN-AP, Uplink mit kleinerer Geschwindigkeit)");
+                i.Causes.Add("Große Übertragungen (Backup, Updates, Kamera-Aufzeichnung) zur selben Zeit");
+                i.Causes.Add("Viel Broadcast/Multicast, das auf jeden Port kopiert wird");
+                i.Fix.Add("Verursacher und Zeitpunkt feststellen (Eingrenzen, Langzeitdaten: zu welchen Uhrzeiten?).");
+                i.Fix.Add(p.IsInfrastructure ? "Uplink vergrößern: 10G/SFP+ oder Link-Aggregation (zwei Kabel als LACP) zwischen den Switches." :
+                    "Gerät mit höherer Geschwindigkeit anbinden bzw. das langsamere Ziel (100 Mbit) beheben.");
+                i.Fix.Add("Große Übertragungen zeitlich verschieben oder begrenzen; QoS für Telefonie/Video.");
+                i.Fix.Add("Flusskontrolle (802.3x) am Port testen - kann bei Microbursts helfen, bei Uplinks eher nicht.");
+                i.Narrow.AddRange(Mirror(s, p));
+                i.Narrow.Add(Wireshark("dem Laptop am Spiegel-Port", "", "", "Statistik → E/A-Diagramm (Intervall 10 ms) zeigt Spitzen; Statistik → Konversationen → IPv4 nach Bytes zeigt den Verursacher"));
+                i.Read.Add("Kurze Spitzen im E/A-Diagramm bei geringer Durchschnittslast → Microbursts: mehr Bandbreite am Engpass oder Verkehr verteilen.");
+                i.Read.Add("Eine Konversation dominiert → diese gezielt verschieben/begrenzen.");
+                return i;
+            }
+            double inRatio = inP > 0 ? (double)inD / (inD + inP) : -1;
+            if (inD > 0 && p.Polls(1, h) >= 3 && inRatio >= 0.01)
+            {
+                Issue i = New("indrops", pk, "Port", "Eingang verwirft " + (inRatio * 100).ToString("0.#") + " % der Pakete", PortObj(s, p), Finding.Info, Issue.Hint);
+                i.Ref = pk; i.Occurred = DateTime.Now;
+                i.Evidence.Add("Eingangs-Verwerfzähler: " + inD + " Pakete in der letzten Stunde (" + (inRatio * 100).ToString("0.##") + " % der empfangenen)");
+                i.Evidence.Add("Im Eingang verworfene Pakete sind meist KEINE Überlast, sondern Filter des Switches");
+                i.Causes.Add("Das angeschlossene Gerät sendet in einem VLAN, das an diesem Port nicht erlaubt ist (z. B. getaggte Pakete eines APs/Hypervisors)");
+                i.Causes.Add("Spanning Tree blockiert den Port; unbekannte Protokolle; Pakete an die eigene MAC");
+                i.Fix.Add("VLANs am Port mit denen des Geräts vergleichen (Hypervisor/AP sendet getaggt?) und ggf. freigeben.");
+                i.Narrow.AddRange(Mirror(s, p));
+                i.Narrow.Add(Wireshark("dem Laptop am Spiegel-Port", "", "vlan", "welche VLAN-IDs sendet das Gerät?"));
+                i.Read.Add("Getaggte Pakete eines nicht erlaubten VLANs → am Port freigeben oder am Gerät abschalten.");
+                return i;
+            }
+            return null;
+        }
+
+        /// <summary>Paketflut: sehr viele (kleine) Pakete - belastet Firewall, APs und CPU der Geräte, auch wenn Mbit/s gering sind.</summary>
+        static Issue PpsIssue(SwitchState s, PortState p, string pk)
+        {
+            double mn = double.MaxValue, sum = 0;
+            foreach (double x in p.RecentPps) { mn = Math.Min(mn, x); sum += x; }
+            double avg = sum / p.RecentPps.Count;
+            double size = avg > 0 ? p.InMbps * 1000000 / 8 / avg : 0;
+            if (mn < 20000 || size >= 400) return null;
+            int conf = mn >= 100000 || s.Cpu >= 75 || p.Sum(2, TimeSpan.FromHours(1)) > 0 ? Issue.Certain : Issue.Likely;
+            Issue i = New("pps", pk, "Port", "Paketflut: " + avg.ToString("0") + " Pakete/s (Ø " + size.ToString("0") + " Byte)", PortObj(s, p),
+                mn >= 100000 ? Finding.Problem : Finding.Warning, conf);
+            i.Ref = pk; i.Occurred = DateTime.Now;
+            i.Evidence.Add("Paketzähler: in den letzten " + p.RecentPps.Count + " Abfragen mindestens " + mn.ToString("0") + " Pakete/s empfangen, Ø Paketgröße nur " + size.ToString("0") + " Byte");
+            i.Evidence.Add("Bei normaler Nutzung sind Pakete im Mittel mehrere hundert Byte groß - viele kleine Pakete deuten auf Flut, Scan oder Fehlfunktion");
+            if (s.Cpu >= 75) i.Evidence.Add("Gleichzeitig CPU des Switches bei " + s.Cpu + " %");
+            i.Causes.Add("Defektes oder fehlkonfiguriertes Gerät (Endlosschleife einer Software, Netzwerkkarte \"spinnt\")");
+            i.Causes.Add("Portscan/Angriff oder Schadsoftware auf einem Gerät dahinter");
+            i.Causes.Add("Viele kleine Pakete durch VoIP/Spiele/IoT-Polling (eher harmlos, aber belastet Firewall/AP)");
+            i.Causes.Add("Schleife (dann meist auch Broadcast-Sturm)");
+            i.Fix.Add("Verursacher feststellen (Eingrenzen) und das Gerät vom Netz nehmen bzw. neu starten.");
+            i.Fix.Add("Gerät prüfen: Firmware/Software aktualisieren, auf Schadsoftware untersuchen.");
+            i.Fix.Add("Storm Control/Rate Limit am Port setzen, falls das Verhalten gewollt aber zu viel ist.");
+            i.Narrow.AddRange(Mirror(s, p));
+            i.Narrow.Add(Wireshark("dem Laptop am Spiegel-Port", "", "", "Statistik → Endpunkte → nach Paketen sortieren: wer sendet? Statistik → Protokollhierarchie: was?"));
+            i.Narrow.AddRange(FwCapture("", "", ""));
+            i.Read.Add("Eine Quell-MAC/IP sendet den Großteil → dieses Gerät. Viele SYN an viele Ports → Scan. Gleiche Pakete immer wieder → Schleife.");
+            return i;
+        }
+
+        /// <summary>Multicast-Quelle: ein Gerät sendet sehr viel Multicast (IPTV, Kameras, Discovery).</summary>
+        static Issue McastSourceIssue(SwitchState s, PortState p, string pk)
+        {
+            double mn = double.MaxValue;
+            foreach (double x in p.RecentMcastIn) mn = Math.Min(mn, x);
+            if (mn < 500 || p.IsInfrastructure) return null;
+            Issue i = New("mcast", pk, "Netz", "Viel Multicast: " + p.McastInPps.ToString("0") + " Pakete/s von diesem Port", PortObj(s, p),
+                mn >= 3000 ? Finding.Problem : Finding.Warning, Issue.Likely);
+            i.Ref = pk; i.HistKey = "port;" + pk + "|7"; i.Occurred = DateTime.Now;
+            i.Evidence.Add("Multicast-Zähler (Eingang): in den letzten " + p.RecentMcastIn.Count + " Abfragen mindestens " + mn.ToString("0") + " Pakete/s (normal: unter 50)");
+            i.Evidence.Add("Ob es geflutet wird, zeigt der Befund \"Multicast wird geflutet\" (Ausgang mehrerer Ports)");
+            i.Causes.Add("IPTV-/Multicast-Videostream (Receiver, Kamera, Sat>IP), Audio-Streaming (Dante, Sonos)");
+            i.Causes.Add("Discovery-Protokolle in großer Menge (mDNS/SSDP) durch ein fehlerhaftes Gerät");
+            i.Fix.Add("Gerät identifizieren (" + (p.ConnectedText.Length > 0 ? p.ConnectedText : "Gerät an " + p.DisplayName) + ") und prüfen, ob der Stream gewollt ist.");
+            i.Fix.Add("IGMP-Snooping aktivieren, damit Multicast nur an Empfänger geht (UniFi: Einstellungen → Netzwerke → Netz → Multicast-Verwaltung/IGMP Snooping).");
+            i.Narrow.AddRange(Mirror(s, p));
+            i.Narrow.Add(Wireshark("dem Laptop am Spiegel-Port", "multicast", "eth.dst[0] & 1 && !(eth.dst == ff:ff:ff:ff:ff:ff)", "Statistik → Konversationen → IPv4: Multicast-Gruppen (224.x/239.x) und Quelle"));
+            i.Read.Add("Gleichmäßiger Strom an 239.x.x.x mit großen Paketen → Video/IPTV. Viele kleine an 224.0.0.251/239.255.255.250 → mDNS/SSDP.");
+            return i;
+        }
+
+        static Issue McastFloodIssue(SwitchState s, int ports, List<string> names, double max)
+        {
+            string key = "mcflood|" + s.Address;
+            Issue i = New("mcflood", s.Address, "Netz", "Multicast wird an " + ports + " Ports geflutet (bis " + max.ToString("0") + "/s)", s.Name + " (" + s.Address + ")",
+                max >= 3000 ? Finding.Problem : Finding.Warning, RoundsOf(key) >= 3 ? Issue.Certain : Issue.Likely);
+            i.Ref = s.Address; i.Occurred = DateTime.Now;
+            i.Evidence.Add("Multicast-Zähler (Ausgang) an " + ports + " Endgeräte-Ports gleichzeitig über 500 Pakete/s: " + string.Join(", ", names.ToArray()));
+            i.Evidence.Add("Derselbe Strom geht an viele Ports → der Switch verteilt Multicast wie Broadcast (kein IGMP-Snooping oder kein Querier)");
+            i.Causes.Add("IGMP-Snooping aus - Multicast wird an alle Ports kopiert");
+            i.Causes.Add("IGMP-Snooping an, aber kein IGMP-Querier im Netz - Switches fluten nach Ablauf wieder");
+            i.Causes.Add("Quelle: IPTV, Kameras, Audio-Streaming (siehe Befund \"Viel Multicast\")");
+            i.Fix.Add("IGMP-Snooping für das Netz aktivieren (UniFi: Einstellungen → Netzwerke → " + "<Netz> → Multicast-Verwaltung: IGMP Snooping).");
+            i.Fix.Add("Einen IGMP-Querier festlegen (UniFi: \"Querier\" am Switch/Gateway bzw. Multicast-Querier auf der Firewall).");
+            i.Fix.Add("Multicast-Quellen in ein eigenes VLAN legen.");
+            i.Narrow.Add(Wireshark("einem Laptop an einem beliebigen freien Port (ohne Spiegelung)", "multicast", "igmp || (ip.dst >= 224.0.0.0 && ip.dst <= 239.255.255.255)", "kommt der Strom hier an, wird geflutet"));
+            i.Read.Add("Strom kommt an einem Port ohne Empfänger an → geflutet. Keine IGMP-Queries im Mitschnitt → Querier fehlt.");
+            return i;
+        }
+
+        /// <summary>MAC-Adressen springen zwischen zwei Ports desselben Switches hin und her - typisches Zeichen einer Schleife.</summary>
+        static Issue MacFlapIssue(SwitchState s)
+        {
+            DateTime from = DateTime.Now.AddHours(-1);
+            Dictionary<string, Dictionary<string, int>> pairs = new Dictionary<string, Dictionary<string, int>>();   // Portpaar -> MAC -> Wechsel
+            foreach (SwitchMonitor.MacMove m in SwitchMonitor.MacMoves())
+            {
+                if (m.Switch != s.Address || m.Time < from) continue;
+                string pair = Math.Min(m.From, m.To) + "-" + Math.Max(m.From, m.To);
+                if (!pairs.ContainsKey(pair)) pairs[pair] = new Dictionary<string, int>();
+                int n; pairs[pair].TryGetValue(m.Mac, out n); pairs[pair][m.Mac] = n + 1;
+            }
+            string best = ""; int macs = 0, moves = 0;
+            foreach (KeyValuePair<string, Dictionary<string, int>> kv in pairs)
+            {
+                int bm = 0, mv = 0;
+                foreach (int n in kv.Value.Values) { if (n >= 2) bm++; mv += n; }
+                if (bm > macs || bm == macs && mv > moves) { best = kv.Key; macs = bm; moves = mv; }
+            }
+            if (best.Length == 0 || macs == 0 && moves < 3) return null;
+            string[] pp = best.Split('-');
+            PortState a, b;
+            s.Ports.TryGetValue(int.Parse(pp[0]), out a); s.Ports.TryGetValue(int.Parse(pp[1]), out b);
+            string an = a != null ? a.DisplayName : pp[0], bn = b != null ? b.DisplayName : pp[1];
+            Issue i = New("macflap", s.Address, "Netz", "MAC-Adressen springen zwischen " + an + " und " + bn, s.Name + " (" + s.Address + ")",
+                macs >= 3 ? Finding.Problem : Finding.Warning, macs >= 3 ? Issue.Certain : macs >= 1 ? Issue.Likely : Issue.Hint);
+            i.Ref = s.Address; i.Occurred = DateTime.Now;
+            List<string> list = new List<string>();
+            foreach (KeyValuePair<string, int> kv in pairs[best]) if (list.Count < 6) list.Add(NetTools.FormatMac(kv.Key) + " (" + kv.Value + "×)");
+            i.Evidence.Add("MAC-Tabelle des Switches (letzte Stunde): " + moves + " Wechsel zwischen " + an + " und " + bn + ", " + macs + " MAC(s) hin und zurück: " + string.Join(", ", list.ToArray()));
+            i.Evidence.Add("WLAN-Clients (Roaming), zufällige MACs und die Geräte selbst sind herausgerechnet");
+            int tc = 0;
+            foreach (DateTime d in s.StpTimes) if (DateTime.Now - d < TimeSpan.FromHours(1)) tc++;
+            if (tc >= 3) { i.Evidence.Add(tc + " Spanning-Tree-Änderungen in derselben Stunde"); if (i.Confidence < Issue.Certain) i.Confidence++; }
+            i.Causes.Add("Schleife: Dieselben Geräte sind über zwei Wege erreichbar (Kabel doppelt, Mini-Switch, Dose-zu-Dose, WLAN-Bridge plus Kabel)");
+            i.Causes.Add("Gerät mit zwei Netzwerkanschlüssen und Bridge (Hypervisor, NAS mit Bonding falsch konfiguriert, PC mit Bridge)");
+            i.Causes.Add("Einzelne MAC: Gerät wird zwischen zwei Anschlüssen umgesteckt (Dockingstation) - dann harmlos");
+            i.Fix.Add("Was hängt an " + an + " und " + bn + "? (" + (a != null && a.ConnectedText.Length > 0 ? a.ConnectedText : "?") + " / " + (b != null && b.ConnectedText.Length > 0 ? b.ConnectedText : "?") +
+                ") - gibt es dahinter eine zweite Verbindung zwischen denselben Netzen?");
+            i.Fix.Add("Ungewollte zweite Verbindung entfernen; gewollte Redundanz als LACP einrichten.");
+            i.Fix.Add("Bei Hypervisor/NAS: Bonding/Bridge-Einstellungen prüfen (active-backup oder LACP, nicht zwei unabhängige Bridges).");
+            i.Fix.Add("Loop Protection/Spanning Tree auf allen Switches aktivieren.");
+            i.Narrow.Add("Kabel an " + bn + " kurz ziehen: hören die Wechsel auf, liegt die zweite Verbindung dahinter.");
+            i.Read.Add("Keine neuen Wechsel nach der Änderung → behoben (Nachprüfung 24 h).");
+            return i;
+        }
+
+        static Issue PoeIssue(SwitchState s)
+        {
+            double used = s.PoeUsed, pct = 100 * used / s.PoeBudget;
+            string key = "poe|" + s.Address;
+            Issue i = New("poe", s.Address, "Netz", "PoE-Budget zu " + pct.ToString("0") + " % ausgeschöpft (" + used.ToString("0") + " von " + s.PoeBudget.ToString("0") + " W)",
+                s.Name + " (" + s.Address + ")", pct >= 97 ? Finding.Problem : Finding.Warning, pct >= 90 && RoundsOf(key) >= 3 ? Issue.Certain : Issue.Likely);
+            i.Ref = s.Address; i.Occurred = DateTime.Now;
+            List<string> users = new List<string>(), flapping = new List<string>();
+            foreach (PortState p in s.Ports.Values)
+                if (p.PoeOn && p.PoeWatts > 0)
+                {
+                    users.Add(p.DisplayName + " " + p.PoeWatts.ToString("0.0") + " W" + (p.ConnectedText.Length > 0 ? " (" + (p.ConnectedText.Length > 25 ? p.ConnectedText.Substring(0, 25) : p.ConnectedText) + ")" : ""));
+                    if (p.FlapsSince(TimeSpan.FromDays(1)) > 0) flapping.Add(p.DisplayName);
+                }
+            i.Evidence.Add("UniFi-Controller: Budget " + s.PoeBudget.ToString("0") + " W, Verbrauch " + used.ToString("0.0") + " W - " + string.Join(", ", users.ToArray()));
+            if (flapping.Count > 0) { i.Evidence.Add("PoE-Ports mit Link-Wechseln in 24 h: " + string.Join(", ", flapping.ToArray()) + " → passt zu Abschaltungen wegen Budget"); i.Confidence = Issue.Certain; }
+            i.Causes.Add("Zu viele bzw. zu stromhungrige PoE-Geräte am Switch (APs, Kameras mit IR/Heizung, Telefone)");
+            i.Causes.Add("Verbrauch steigt zeitweise (Kamera-Heizung im Winter, IR nachts, AP unter Last) - dann schaltet der Switch Ports ab");
+            i.Fix.Add("Einzelne PoE-Geräte über Injektor oder anderen Switch versorgen.");
+            i.Fix.Add("Switch mit größerem PoE-Budget einsetzen.");
+            i.Fix.Add("Nicht benötigtes PoE an Ports ohne PoE-Gerät abschalten; Priorität für wichtige Geräte setzen.");
+            i.Read.Add("Verbrauch dauerhaft unter 85 % und keine Link-Wechsel an PoE-Ports → behoben.");
+            return i;
+        }
+
+        static Issue TempIssue(SwitchState s)
+        {
+            string key = "temp|" + s.Address;
+            Issue i = New("temp", s.Address, "Netz", s.Kind + (s.Overheating ? " überhitzt" : " sehr warm") + (s.Temp > 0 ? " (" + s.Temp + " °C)" : ""), s.Name + " (" + s.Address + ")",
+                Finding.Problem, RoundsOf(key) >= 2 ? Issue.Certain : Issue.Likely);
+            i.Ref = s.Address; i.Occurred = DateTime.Now;
+            i.Evidence.Add("UniFi-Controller: " + (s.Overheating ? "Überhitzung gemeldet" : "Temperatur hoch") + (s.Temp > 0 ? ", " + s.Temp + " °C" : "") + (RoundsOf(key) >= 2 ? " (in " + RoundsOf(key) + " Abfragen)" : ""));
+            i.Causes.Add("Lüftungsschlitze verdeckt, Gerät im geschlossenen Schrank/Verteiler ohne Lüftung"); i.Causes.Add("Raum zu warm (Sommer, Heizung, Sonne)");
+            i.Causes.Add("Lüfter defekt bzw. verschmutzt"); i.Causes.Add("Hohe PoE-Last erzeugt Wärme im Switch");
+            i.Fix.Add("Lüftung herstellen: Abstand zu anderen Geräten, Schrank belüften."); i.Fix.Add("Lüfter prüfen/reinigen."); i.Fix.Add("PoE-Last reduzieren bzw. Gerät an kühleren Ort.");
+            i.Read.Add("Keine Überhitzung mehr in 2 h → behoben.");
+            return i;
+        }
+
         static Issue StpBlockIssue(SwitchState s, PortState p, string pk, int tc)
         {
             Issue i = New("stpblock", pk, "Netz", "Spanning Tree blockiert diesen Port", PortObj(s, p), Finding.Warning, tc >= 3 ? Issue.Likely : Issue.Hint);
@@ -14925,11 +15460,32 @@ namespace PingMonitor
                 (s.Cpu >= 75 && s.MemPct >= 90 ? ", " : "") + (s.MemPct >= 90 ? "RAM " + s.MemPct + " %" : ""),
                 s.Name + " (" + s.Address + ")", lvl, lvl >= Finding.Problem && RoundsOf(key) >= 3 ? Issue.Certain : RoundsOf(key) >= 3 ? Issue.Likely : Issue.Hint);
             i.Ref = s.Address; i.Occurred = DateTime.Now;
-            i.Evidence.Add("Systemwerte laut SNMP: " + s.SystemText + (RoundsOf(key) >= 3 ? " (in " + RoundsOf(key) + " Abfragen)" : ""));
+            i.Evidence.Add("Systemwerte laut " + (s.CpuFromUniFi || s.MemFromUniFi ? "UniFi-Controller" : "SNMP") + ": " + s.SystemText + (RoundsOf(key) >= 3 ? " (in " + RoundsOf(key) + " Abfragen)" : ""));
+            if (s.Kind != "Firewall")
+            {
+                double bc = 0, mc = 0; int tc = 0;
+                foreach (PortState p in s.Ports.Values) { bc = Math.Max(bc, p.BcastPps); mc = Math.Max(mc, p.McastInPps); }
+                foreach (DateTime d in s.StpTimes) if (DateTime.Now - d < TimeSpan.FromHours(1)) tc++;
+                if (bc >= 300 || mc >= 500 || tc >= 3)
+                {
+                    i.Evidence.Add("Passend dazu: " + (bc >= 300 ? "Broadcasts bis " + bc.ToString("0") + "/s " : "") + (mc >= 500 ? "Multicast bis " + mc.ToString("0") + "/s " : "") +
+                        (tc >= 3 ? tc + " STP-Änderungen/h" : "") + " - diese Pakete muss die CPU verarbeiten");
+                    if (i.Confidence < Issue.Certain && i.Severity >= Finding.Problem) i.Confidence = Issue.Certain;
+                }
+                i.Causes.Add("Viele Pakete an die CPU: Broadcast-/Multicast-Flut, Schleife, häufige Spanning-Tree-Änderungen, ARP-Stürme");
+                i.Causes.Add("Controller-Probleme: Gerät wird ständig neu provisioniert/adoptiert, Firmware-Fehler");
+                i.Causes.Add("Zu häufige Abfragen (SNMP-Intervall sehr kurz, mehrere Überwachungssysteme)");
+                i.Fix.Add("Broadcast-/Multicast-/STP-Befunde dieses Switches zuerst beheben (siehe Befunde).");
+                i.Fix.Add("Im UniFi-Controller Ereignisse des Geräts prüfen (ständige Provisionierung?), Firmware aktualisieren, Gerät neu starten.");
+                i.Fix.Add("IGMP-Snooping und Storm Control aktivieren; Abfrageintervall von PingMonitor nicht unter 60 s.");
+                i.Narrow.Add("Zeiten hoher CPU mit Broadcast/Multicast/STP in den Langzeitdaten vergleichen.");
+                i.Read.Add("CPU normalisiert sich nach Beseitigung der Flut → das war die Ursache.");
+                return i;
+            }
             i.Causes.Add("Hohe Last durch IDS/IPS (Suricata), VPN, Proxy oder viele Verbindungen");
             i.Causes.Add("Speicher voll (Logs, Plugins, RAM-Disk)");
             i.Causes.Add("Hardware zu klein für die Leitung/Nutzung");
-            i.Fix.Add(s.Kind == "Firewall" ? "OPNsense: System → Diagnose → Aktivität (top) - welcher Prozess verursacht die Last?" : "Weboberfläche des Geräts: CPU/Speicher und Prozesse ansehen.");
+            i.Fix.Add("OPNsense: System → Diagnose → Aktivität (top) - welcher Prozess verursacht die Last?");
             i.Fix.Add("IDS/IPS-Regelsätze reduzieren bzw. Hardware-Offloading prüfen; nicht benötigte Plugins entfernen.");
             i.Fix.Add("Bei dauerhafter Last: leistungsfähigere Hardware.");
             i.Narrow.Add("Zeiten hoher Last mit Ausfällen/Latenz im Protokoll vergleichen (Langzeitdaten).");
@@ -15444,6 +16000,7 @@ namespace PingMonitor
                     string k = "port;" + PortKey(s, p);
                     Acc(k, 0, p.Util, true);
                     Acc(k, 1, p.BcastPps, true);
+                    Acc(k, 2, p.McastInPps, true);
                 }
             }
             if (op.Valid)
@@ -15495,9 +16052,12 @@ namespace PingMonitor
                     string k = "port;" + PortKey(s, p);
                     double[] a;
                     hourAcc.TryGetValue(k, out a);
+                    long drops = 0;
+                    foreach (long[] x in p.PktHist) if (x[0] >= from.Ticks && x[0] < to.Ticks) drops += x[2];
                     if (!p.Up && rx == 0 && tx == 0 && fl == 0 && a == null) continue;
                     sb.Append(h + ";port;" + PortKey(s, p) + ";" + Fmt.Csv(s.Name + " " + p.DisplayName) + ";" + rx + ";" + tx + ";" + fl + ";" +
-                        (a != null ? a[0].ToString("0.#", ci) : "0") + ";" + (a != null ? a[1].ToString("0", ci) : "0") + "\r\n");
+                        (a != null ? a[0].ToString("0.#", ci) : "0") + ";" + (a != null ? a[1].ToString("0", ci) : "0") + ";" + drops + ";" +
+                        (a != null ? a[2].ToString("0", ci) : "0") + "\r\n");
                 }
             }
             foreach (PingTarget t in hosts)
@@ -15537,7 +16097,7 @@ namespace PingMonitor
                 Directory.CreateDirectory(Config.LogDir);
                 string f = HistoryFile(from);
                 bool fresh = !File.Exists(f);
-                File.AppendAllText(f, (fresh ? "\uFEFFStunde;Art;Objekt;Name;Wert1;Wert2;Wert3;Wert4;Wert5\r\n" : "") + sb.ToString(), new UTF8Encoding(false));
+                File.AppendAllText(f, (fresh ? "\uFEFFStunde;Art;Objekt;Name;Wert1;Wert2;Wert3;Wert4;Wert5;Wert6;Wert7\r\n" : "") + sb.ToString(), new UTF8Encoding(false));
             }
             catch { }
         }
@@ -15559,7 +16119,7 @@ namespace PingMonitor
                         if (p.Count < 9) continue;
                         DateTime t;
                         if (!DateTime.TryParseExact(p[0], "yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out t)) continue;
-                        for (int k = 1; k <= 5; k++)
+                        for (int k = 1; k <= Math.Min(7, p.Count - 4); k++)
                         {
                             double v;
                             if (!double.TryParse(p[3 + k], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v)) continue;
@@ -15621,6 +16181,7 @@ namespace PingMonitor
             if (histKey.StartsWith("wlan;") && histKey.EndsWith("|1")) return v != 0 && v <= -75;
             if (histKey.StartsWith("port;") && histKey.EndsWith("|4")) return v >= 80;
             if (histKey.StartsWith("port;") && histKey.EndsWith("|5")) return v >= 300;
+            if (histKey.StartsWith("port;") && histKey.EndsWith("|7")) return v >= 500;
             if (histKey.StartsWith("dev;") && histKey.EndsWith("|1")) return v >= 1;
             if (histKey.StartsWith("gw;") && histKey.EndsWith("|1")) return v >= 2;
             return v > 0;
