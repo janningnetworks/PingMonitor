@@ -483,6 +483,12 @@ Wo mitschneiden?
         ... Problem abwarten ...
         pktmon stop
         pktmon etl2pcap PktMon.etl          (erzeugt PktMon.pcapng)
+Einfacher auf DIESEM PC: im Fenster "Mitschnitt analysieren" -> "Mitschnitt dieses PCs starten ...". PingMonitor startet das
+eingebaute pktmon (Windows fragt nach Administratorrechten), wahlweise alles / nur Verkehr mit einer IP / nur DHCP / nur DNS /
+nur ARP und Ping, mit Größenbegrenzung (Ringpuffer, Standard 200 MB). Mitgeschnitten wird nur an der Netzwerkkarte (keine
+Doppelungen). "Stoppen und auswerten" wandelt in pcapng um und wertet sofort aus. Der Mitschnitt läuft weiter, auch wenn das
+Fenster geschlossen wird; die Dateien liegen unter Logs\Mitschnitte. Hinweis: Ein PC sieht nur seinen eigenen Verkehr sowie
+Broadcasts/Multicast - für andere Geräte Port-Spiegelung oder den Mitschnitt an der Firewall nutzen.
 Erkannt und in Klartext erklärt werden u. a.:
   - mehrere DHCP-Server (z. B. mitgebrachter Router/FRITZ!Box) inkl. Hersteller und verteiltem Gateway
   - langsame DHCP-Vergabe je Gerät mit Ablauf und Zeiten (Discover/Offer/Request/ACK, "secs"-Feld) und

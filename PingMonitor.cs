@@ -13386,10 +13386,137 @@ namespace PingMonitor
     }
 
     /// <summary>Mitschnitt öffnen, auswerten und Befunde/Zeitleiste anzeigen.</summary>
+    /// <summary>
+    /// Mitschnitt auf DIESEM PC mit dem in Windows 10/11 eingebauten pktmon (keine Installation nötig, Administratorrechte nötig):
+    /// starten, stoppen, in pcapng umwandeln. Die pktmon-Befehle laufen in einer Skriptdatei mit Administratorrechten (UAC-Abfrage).
+    /// </summary>
+    static class LocalCapture
+    {
+        public static string Dir { get { return Path.Combine(Config.LogDir, "Mitschnitte"); } }
+
+        public static string Pktmon
+        {
+            get
+            {
+                string sys = Environment.GetFolderPath(Environment.SpecialFolder.System);
+                string p = Path.Combine(sys, "pktmon.exe");
+                if (File.Exists(p)) return p;
+                string native = Path.Combine(Environment.GetEnvironmentVariable("WINDIR") ?? "C:\\Windows", "Sysnative\\pktmon.exe");   // 32-Bit-Prozess auf 64-Bit-Windows
+                return File.Exists(native) ? native : "";
+            }
+        }
+
+        /// <summary>Laufender Mitschnitt: ETL-Datei (überlebt einen Neustart der App), sonst leer.</summary>
+        public static string RunningEtl
+        {
+            get { string v = Config.Get(Config.LoadSettings(), "Mitschnitt.Laeuft", ""); return v.Split('|')[0]; }
+        }
+
+        public static DateTime RunningSince
+        {
+            get
+            {
+                string[] v = Config.Get(Config.LoadSettings(), "Mitschnitt.Laeuft", "").Split('|');
+                DateTime t;
+                return v.Length > 1 && DateTime.TryParseExact(v[1], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out t) ? t : DateTime.MinValue;
+            }
+        }
+
+        static void SetRunning(string value)
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            d["Mitschnitt.Laeuft"] = value;
+            Config.SaveSettings(d);
+        }
+
+        /// <summary>pktmon-Filter: Art 0 = alles, 1 = mit IP, 2 = DHCP, 3 = DNS, 4 = ARP + Ping.</summary>
+        static List<string> Filters(int kind, string ip)
+        {
+            List<string> f = new List<string>();
+            if (kind == 1 && ip.Length > 0) f.Add("filter add PM -i " + ip);
+            if (kind == 2) { f.Add("filter add DHCP67 -t UDP -p 67"); f.Add("filter add DHCP68 -t UDP -p 68"); }
+            if (kind == 3) { f.Add("filter add DNS -p 53"); }
+            if (kind == 4) { f.Add("filter add ARP -d ARP"); f.Add("filter add ICMP -t ICMP"); }
+            return f;
+        }
+
+        /// <summary>Führt pktmon-Befehle mit Administratorrechten aus; liefert die Ausgabe (oder eine Fehlermeldung).</summary>
+        static bool RunElevated(List<string> commands, out string output)
+        {
+            output = "";
+            string pk = Pktmon;
+            if (pk.Length == 0) { output = "pktmon.exe nicht gefunden - pktmon gibt es ab Windows 10 (Version 1809) bzw. Windows Server 2019."; return false; }
+            Directory.CreateDirectory(Dir);
+            string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss_fff");
+            string script = Path.Combine(Dir, "pktmon_" + stamp + ".cmd"), log = Path.Combine(Dir, "pktmon_" + stamp + ".log");
+            StringBuilder sb = new StringBuilder("@echo off\r\nchcp 65001 >nul\r\n");
+            foreach (string c in commands)
+                sb.Append("echo ^> pktmon " + c.Replace("\"", "").Replace(">", "^>") + " >> \"" + log + "\"\r\n\"" + pk + "\" " + c + " >> \"" + log + "\" 2>&1\r\n");
+            File.WriteAllText(script, sb.ToString(), new UTF8Encoding(false));
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("cmd.exe", "/c \"\"" + script + "\"\"");
+                psi.UseShellExecute = true;
+                psi.Verb = "runas";
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                using (Process p = Process.Start(psi))
+                    if (p == null || !p.WaitForExit(120000)) { output = "pktmon reagiert nicht."; return false; }
+            }
+            catch (Win32Exception) { output = "Abgebrochen - für pktmon werden Administratorrechte benötigt."; return false; }
+            finally { try { File.Delete(script); } catch { } }
+            try { output = File.Exists(log) ? File.ReadAllText(log, Encoding.UTF8) : ""; File.Delete(log); } catch { }
+            return true;
+        }
+
+        public static bool Start(int kind, string ip, int maxMb, out string message)
+        {
+            string etl = Path.Combine(Dir, "Mitschnitt_" + Environment.MachineName + "_" + DateTime.Now.ToString("yyyy-MM-dd_HHmmss") + ".etl");
+            List<string> c = new List<string>();
+            c.Add("stop");
+            c.Add("filter remove");
+            c.AddRange(Filters(kind, ip));
+            // nur an der Netzwerkkarte mitschneiden - sonst steht jedes Paket mehrfach drin (je Treiberschicht)
+            c.Add("start --capture --comp nics --pkt-size 0 --file-name \"" + etl + "\" --file-size " + maxMb + " --log-mode circular");
+            string output;
+            if (!RunElevated(c, out output)) { message = output; return false; }
+            string last = output.Substring(Math.Max(0, output.LastIndexOf("> pktmon start")));
+            if (last.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0 || last.IndexOf("fehler", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                last.IndexOf("unknown", StringComparison.OrdinalIgnoreCase) >= 0 || last.IndexOf("unbekannt", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                last.IndexOf("invalid", StringComparison.OrdinalIgnoreCase) >= 0 || last.IndexOf("ungültig", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                message = "pktmon konnte nicht starten (ältere Windows-Version ohne \"--capture\"?):\r\n\r\n" + output;
+                return false;
+            }
+            SetRunning(etl + "|" + DateTime.Now.ToString(Fmt.Time));
+            message = output;
+            return true;
+        }
+
+        /// <summary>Stoppt den Mitschnitt und wandelt ihn in pcapng um; liefert den Pfad der pcapng-Datei (oder leer).</summary>
+        public static string Stop(out string message)
+        {
+            string etl = RunningEtl;
+            string pcap = etl.Length > 0 ? Path.ChangeExtension(etl, ".pcapng") : "";
+            List<string> c = new List<string>();
+            c.Add("stop");
+            if (etl.Length > 0) c.Add("etl2pcap \"" + etl + "\" --out \"" + pcap + "\"");
+            c.Add("filter remove");
+            string output;
+            bool ok = RunElevated(c, out output);
+            message = output;
+            if (!ok) return "";
+            SetRunning("");
+            if (pcap.Length > 0 && File.Exists(pcap)) { try { File.Delete(etl); } catch { } return pcap; }
+            if (etl.Length > 0) message = "Keine Mitschnitt-Datei entstanden.\r\n\r\n" + output;
+            return "";
+        }
+    }
+
     class AnalysisForm : Form
     {
-        Label lblFile;
-        Button btnOpen;
+        Label lblFile, lblCapture;
+        Button btnOpen, btnCapture;
+        System.Windows.Forms.Timer captureTimer;
         TabControl tabs;
         DataGridView gridFindings, gridTimeline, gridPings;
         RichTextBox txtDetail, txtOverview;
@@ -13412,19 +13539,43 @@ namespace PingMonitor
             btnOpen.Font = new Font(Font, FontStyle.Bold);
             btnOpen.Click += delegate { Open(); };
             top.Controls.Add(btnOpen);
+            btnCapture = new Button();
+            btnCapture.AutoSize = true;
+            btnCapture.Click += delegate { ToggleCapture(); };
+            top.Controls.Add(btnCapture);
+            lblCapture = new Label();
+            lblCapture.AutoSize = true;
+            lblCapture.Margin = new Padding(6, 8, 3, 3);
+            lblCapture.ForeColor = Color.DarkRed;
+            top.Controls.Add(lblCapture);
             lblFile = new Label();
             lblFile.AutoSize = true;
             lblFile.Margin = new Padding(10, 8, 3, 3);
             lblFile.Text = "Noch keine Datei geladen.";
             top.Controls.Add(lblFile);
+            captureTimer = new System.Windows.Forms.Timer();
+            captureTimer.Interval = 1000;
+            captureTimer.Tick += delegate { UpdateCapture(); };
+            Shown += delegate { UpdateCapture(); captureTimer.Start(); };
+            FormClosing += delegate (object sender, FormClosingEventArgs e)
+            {
+                captureTimer.Stop();
+                if (LocalCapture.RunningEtl.Length > 0 &&
+                    MessageBox.Show(this, "Der Mitschnitt dieses PCs läuft noch. Jetzt stoppen?\n\n(\"Nein\": er läuft weiter, bis er hier gestoppt wird - Speicher begrenzt, ältere Pakete werden überschrieben.)",
+                        Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                {
+                    string msg;
+                    LocalCapture.Stop(out msg);
+                }
+            };
             Label hint = new Label();
             hint.AutoSize = true;
             hint.MaximumSize = new Size(1200, 0);
             hint.ForeColor = SystemColors.GrayText;
             hint.Margin = new Padding(3, 4, 3, 3);
             hint.Text = "Datei hierher ziehen oder öffnen. Unterstützt: .pcap / .pcapng (Wireshark, tcpdump, Windows pktmon). Mitschneiden z. B. an der OPNsense: Schnittstellen -> Diagnose -> " +
-                "Paketmitschnitt (LAN-Schnittstelle, danach herunterladen) - dort sieht man den Verkehr aller Geräte zum Gateway. Windows (als Administrator): " +
-                "\"pktmon start --capture --pkt-size 0\", später \"pktmon stop\" und \"pktmon etl2pcap PktMon.etl\". Ereignisse aus dem Ausfallprotokoll " +
+                "Paketmitschnitt (LAN-Schnittstelle, danach herunterladen) - dort sieht man den Verkehr aller Geräte zum Gateway. \"Mitschnitt dieses PCs\" nutzt das in Windows " +
+                "eingebaute pktmon (Administratorrechte) und sieht nur den Verkehr DIESES PCs (plus Broadcasts/Multicast). Ereignisse aus dem Ausfallprotokoll " +
                 "im selben Zeitraum werden automatisch daneben gestellt.";
             top.SetFlowBreak(lblFile, true);
             top.Controls.Add(hint);
@@ -13541,6 +13692,66 @@ namespace PingMonitor
                 dlg.Filter = "Mitschnitte (*.pcap;*.pcapng;*.cap;*.dmp)|*.pcap;*.pcapng;*.cap;*.dmp|Alle Dateien (*.*)|*.*";
                 if (dlg.ShowDialog(this) != DialogResult.OK) return;
                 Analyze(dlg.FileName);
+            }
+        }
+
+        void UpdateCapture()
+        {
+            string etl = LocalCapture.RunningEtl;
+            if (etl.Length == 0) { btnCapture.Text = "● Mitschnitt dieses PCs starten ..."; lblCapture.Text = ""; return; }
+            btnCapture.Text = "■ Stoppen und auswerten";
+            DateTime since = LocalCapture.RunningSince;
+            long size = 0;
+            try { if (File.Exists(etl)) size = new FileInfo(etl).Length; } catch { }
+            lblCapture.Text = "Mitschnitt läuft" + (since != DateTime.MinValue ? " seit " + Milestones.Fmt(DateTime.Now - since) : "") + ", " + (size / 1048576.0).ToString("0.0") + " MB";
+        }
+
+        void ToggleCapture()
+        {
+            string msg;
+            if (LocalCapture.RunningEtl.Length > 0)
+            {
+                Cursor = Cursors.WaitCursor;
+                string pcap;
+                try { pcap = LocalCapture.Stop(out msg); }
+                finally { Cursor = Cursors.Default; }
+                UpdateCapture();
+                if (pcap.Length > 0) Analyze(pcap);
+                else if (msg.Length > 0) MessageBox.Show(this, msg, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            using (Form f = new Form())
+            {
+                f.Text = "Mitschnitt dieses PCs (pktmon)";
+                f.Font = Font;
+                f.FormBorderStyle = FormBorderStyle.FixedDialog; f.MaximizeBox = false; f.MinimizeBox = false;
+                f.StartPosition = FormStartPosition.CenterParent;
+                f.ClientSize = new Size(560, 250);
+                Label l1 = new Label(); l1.Text = "Was mitschneiden?"; l1.SetBounds(12, 12, 530, 20);
+                ComboBox kind = new ComboBox(); kind.DropDownStyle = ComboBoxStyle.DropDownList; kind.SetBounds(12, 34, 300, 24);
+                kind.Items.AddRange(new object[] { "Alles (Verkehr dieses PCs)", "Nur Verkehr mit IP-Adresse:", "Nur DHCP (Adressvergabe)", "Nur DNS (Namensauflösung)", "Nur ARP und Ping" });
+                kind.SelectedIndex = 0;
+                TextBox ip = new TextBox(); ip.SetBounds(320, 34, 220, 24); ip.Enabled = false;
+                kind.SelectedIndexChanged += delegate { ip.Enabled = kind.SelectedIndex == 1; };
+                Label l2 = new Label(); l2.Text = "Höchstens (MB, danach werden die ältesten Pakete überschrieben):"; l2.SetBounds(12, 70, 420, 20);
+                NumericUpDown mb = new NumericUpDown(); mb.Minimum = 10; mb.Maximum = 4000; mb.Value = 200; mb.SetBounds(440, 68, 100, 24);
+                Label l3 = new Label(); l3.ForeColor = SystemColors.GrayText; l3.SetBounds(12, 100, 530, 96);
+                l3.Text = "Windows fragt nach Administratorrechten (pktmon ist eingebaut, keine Installation). Mitgeschnitten wird nur an der Netzwerkkarte - " +
+                    "also der Verkehr dieses PCs sowie Broadcasts/Multicast des Netzes. Für den Verkehr ANDERER Geräte: Port-Spiegelung oder Mitschnitt an der Firewall.\r\n" +
+                    "Tipp: Starten, das Problem abwarten (z. B. PC neu verbinden, Ausfall), dann \"Stoppen und auswerten\". Der Mitschnitt läuft auch weiter, wenn dieses Fenster geschlossen wird.";
+                Button ok = new Button(); ok.Text = "Starten"; ok.DialogResult = DialogResult.OK; ok.SetBounds(330, 206, 100, 30);
+                Button cancel = new Button(); cancel.Text = "Abbrechen"; cancel.DialogResult = DialogResult.Cancel; cancel.SetBounds(440, 206, 100, 30);
+                f.Controls.AddRange(new Control[] { l1, kind, ip, l2, mb, l3, ok, cancel });
+                f.AcceptButton = ok; f.CancelButton = cancel;
+                if (f.ShowDialog(this) != DialogResult.OK) return;
+                IPAddress a;
+                if (kind.SelectedIndex == 1 && !IPAddress.TryParse(ip.Text.Trim(), out a)) { MessageBox.Show(this, "Bitte eine gültige IP-Adresse eingeben.", Text); return; }
+                Cursor = Cursors.WaitCursor;
+                bool started;
+                try { started = LocalCapture.Start(kind.SelectedIndex, ip.Text.Trim(), (int)mb.Value, out msg); }
+                finally { Cursor = Cursors.Default; }
+                UpdateCapture();
+                if (!started) MessageBox.Show(this, msg, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
@@ -15973,7 +16184,8 @@ namespace PingMonitor
         {
             return "Auf " + name + " selbst (Windows 10/11, ohne Installation, Eingabeaufforderung als Administrator): pktmon filter remove  →  pktmon filter add PM " +
                 (filter.Length > 0 ? filter : "-i " + ip) + "  →  pktmon start --capture --pkt-size 0 -f C:\\pm.etl  →  (Problem abwarten)  →  pktmon stop  →  " +
-                "pktmon etl2pcap C:\\pm.etl -o C:\\pm.pcapng  → Datei in PingMonitor \"Mitschnitt analysieren\" oder Wireshark öffnen.";
+                "pktmon etl2pcap C:\\pm.etl -o C:\\pm.pcapng  → Datei in PingMonitor \"Mitschnitt analysieren\" oder Wireshark öffnen." +
+                (name.Equals(Environment.MachineName, StringComparison.OrdinalIgnoreCase) ? " Auf diesem PC einfacher: Analyse → Mitschnitt analysieren → \"Mitschnitt dieses PCs starten\"." : "");
         }
 
         // ------------------------------------------------------------ Langzeitdaten (stündlich)
