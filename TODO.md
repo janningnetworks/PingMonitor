@@ -35,6 +35,32 @@
   im Ausfallprotokoll als eigene Zeile „ausgeschaltet 16:31 – 07:45 (Link down, 10 Mbit)“ führen.
   Gleichzeitig bleibt der Mehrwert: „PC war nachts an / ging um 3 Uhr aus“ ist sichtbar.
 
+  **WLAN-Geräte (Smartphones, Tablets, Laptops)** – gleiche Idee, andere Belege (UniFi-Client-Daten):
+  - *Standby* – noch am AP angemeldet, antwortet aber nicht auf Ping (Energiesparen, ICMP im Schlaf).
+  - *Schlechter Empfang* – Signal vor dem Abmelden schwach (z. B. < −75 dBm), viele Wiederholungen,
+    häufiges Roaming/Abmelden; ggf. letzter AP = AP am Ausgang (Gerät hat das Gebäude verlassen).
+  - *Abgemeldet / ausgeschaltet* – UniFi-Ereignis „disconnected“ ohne vorherige Signalprobleme.
+  - Private/zufällige MAC beachten (Zuordnung über Hostname/DHCP-Name statt nur MAC).
+  - Standard für WLAN-Endgeräte: „darf aus sein“; Ausfall nur, wenn angemeldet + gutes Signal + keine Antwort
+    über längere Zeit, oder viele Clients am selben AP gleichzeitig (→ AP-Befund).
+
+  **Manuell änderbar:** Geräteklasse und Grund im Kontextmenü/Details übersteuern
+  („immer an“, „darf aus sein“, „ignorieren außerhalb Arbeitszeit“); Einordnung einzelner Ereignisse korrigierbar.
+
+  **Filter erweitern:**
+  - Hauptliste: Ansicht „Offline ausblenden“, Filter nach Geräteklasse (immer an / Arbeitsplatz / WLAN).
+  - Benachrichtigungen: Offline/ausgeschaltet/Standby nie melden; „immer an“-Geräte weiter nach Mindestdauer;
+    vorhandene Optionen (Mindestdauer, nur/außer Geräte, WLAN überspringen) auf die neuen Klassen abstimmen.
+  - Befunde/Instabilität/Tagesbericht: Offline-Zeiten nicht mitzählen.
+
+## Befundliste (Bedienung)
+
+- Spalte **IP** (und Gerätename) in der Befundliste; dazu ein **Suchfeld** (IP, Name, Switch/Port, Text).
+- **Liste springt** beim automatischen Aktualisieren: Auswahl und Scrollposition beibehalten,
+  nur geänderte Zeilen aktualisieren; Auto-Aktualisierung pausieren, solange der Benutzer markiert/scrollt,
+  oder per Schalter „Automatisch aktualisieren“ abschaltbar + Knopf „Aktualisieren“ (F5) mit Hinweis
+  „n neue/geänderte Befunde“. Gleiches für die Hauptliste prüfen.
+
 - **Proxmox-/Cluster-Hinweise** (optional)
   Corosync mit nur einem Link, gleiche Bridge-Namen mit unterschiedlicher Bedeutung auf den Knoten,
   Quorum-Verlust bei Switch-Neustart. Ggf. über Proxmox-API (nur lesend).
