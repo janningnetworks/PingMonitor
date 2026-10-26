@@ -1,4 +1,4 @@
-# PingMonitor 4.3
+# PingMonitor 4.4
 
 Windows-App (optional als Windows-Dienst), die mehrere Geräte parallel per Ping überwacht
 und jeden Ausfall mit Zeitstempel in eine tägliche CSV-Datei protokolliert.
@@ -10,6 +10,8 @@ UniFi-Controller-Anbindung (nur lesend): genaue Zuordnung Switch-Port bzw. Acces
 UniFi-Port-Daten (PoE, Fehler, STP) auch ohne SNMP, UniFi-Ereignisse im Ausfallprotokoll, WLAN-Verlauf je Gerät (Signal, Datenrate, Roaming), Erkennung von Broadcast-Sturm/Schleifen und langsamen Uplinks, übersichtlicher Netzwerkplan mit Symbolen/Farben/Filtern und Export einer Netzwerkdokumentation (HTML/PDF) für Kunden.
 Befunde mit Sicherheitsstufe (sicher / wahrscheinlich / Hinweis) und Belegen aus allen Quellen, Maßnahmenplan mit den echten Werten des Netzes (Port-Spiegelung, Firewall-Mitschnitt/tcpdump, Wireshark-Filter, pktmon), "Maßnahme durchgeführt" mit automatischer Nachprüfung (behoben / nicht behoben + nächster Schritt) und stündliche Langzeitdaten mit Mustern und Vorher/Nachher.
 Netzwerk-Werkzeuge: DNS (wie dig/nslookup, Serververgleich), Ping/Traceroute/MTU, TCP/UDP-Ports mit Banner, TLS-Zertifikat, SMTP/IMAP/POP3 mit STARTTLS, MX-/SPF-/DMARC-Test, NTP, SNMP, öffentliche IP und CG-NAT-Erkennung.
+Geräteklassen ("immer an" / "darf aus sein" / WLAN-Gerät / Arbeitszeit): ausgeschaltete Arbeitsplatz-PCs (Link aus, Wake-on-LAN mit 10/100 Mbit, sauberes Ende, gelerntes Muster) und WLAN-Geräte im Standby oder bei schlechtem Empfang werden als "offline" dokumentiert statt als Ausfall gezählt; Switch-Neustarts (Firmware-Update) werden mit den Ausfällen verknüpft.
+Proxmox-API (nur lesend): Quorum, Knoten, Corosync-Links, zwei IPs im selben Subnetz (ARP-Flux), uneinheitliche Bridges; OPNsense-State-Tabelle; Befundliste mit IP-Spalte und Suche.
 Benachrichtigung per Webhook (JSON) und/oder E-Mail (SMTP) bei Ausfall/Wiederherstellung und bei sicheren Befunden - mit Filtern (Mindestdauer, Geräte, WLAN-Geräte, Sicherheit, Bereiche), Ruhezeit und Tagesbericht.
 
 - Kompilieren: `build.bat` ausführen (nutzt den in Windows enthaltenen .NET-Framework-4.x-Compiler, keine Installation nötig)

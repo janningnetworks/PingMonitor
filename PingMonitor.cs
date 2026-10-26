@@ -34,8 +34,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCompany("janning networks")]
 [assembly: System.Reflection.AssemblyProduct("PingMonitor")]
 [assembly: System.Reflection.AssemblyCopyright("janning networks")]
-[assembly: System.Reflection.AssemblyVersion("4.3.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("4.3.0.0")]
+[assembly: System.Reflection.AssemblyVersion("4.4.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("4.4.0.0")]
 
 namespace PingMonitor
 {
@@ -103,6 +103,13 @@ namespace PingMonitor
         public DeviceLink Link;             // LAN/WLAN-Zuordnung (nur in der Oberfläche)
         public int QualityLevel = Finding.Unknown;
         public bool OfflineMode;            // Gerät vermutlich ausgeschaltet - zählt nicht als Störung
+        public string OffReason = "";       // Grund für "offline" (ausgeschaltet, Standby, Switch-Neustart ...)
+        public string Class = "";           // Geräteklasse: "" automatisch, "immer", "aus" (darf aus sein), "zeit" (nur in der Arbeitszeit immer an)
+        public int DiagRound;               // Diagnose-Durchgang des laufenden Ausfalls
+        public bool OutageConfirmed;        // laufender Ausfall endgültig als Störung eingeordnet
+        public int LossBefore = -1;         // Fehlschläge in den Pings vor dem Ausfall (sauberes Ende = ausgeschaltet)
+        public string InferredClass;        // automatisch geschätzte Klasse (zwischengespeichert)
+        public DateTime InferredAt;
         public Assessment ServiceQuality;   // vom Dienst gemeldete Bewertung (nur in der Oberfläche)
 
         public bool Running;
@@ -237,19 +244,88 @@ namespace PingMonitor
         public const string EvOffline = "Offline";
         public const string EvOnline = "Wieder online";
 
+        public const string EvRestart = "Neustart Netzwerkgerät";
+
+        /// <summary>Übergabe der manuellen Einordnung von der Oberfläche an den Dienst ("host;offline" bzw. "host;ausfall").</summary>
+        public static string OverrideFile { get { return Path.Combine(Config.BaseDir, "einordnung.txt"); } }
+
         public static bool IsOfflineVerdict(string verdict)
         {
-            return verdict.StartsWith("vermutlich aus") || verdict.StartsWith("nicht im Netz");
+            return verdict.StartsWith("vermutlich aus") || verdict.StartsWith("nicht im Netz") || verdict.StartsWith("WLAN") ||
+                   verdict.StartsWith("Switch-Neustart");
+        }
+
+        /// <summary>
+        /// Ordnet den laufenden Ausfall nach Geräteklasse und Diagnose ein. Liefert den Grund, wenn das Gerät als offline
+        /// (ausgeschaltet, Standby ...) gilt, sonst null. final = Einordnung steht fest (keine weitere Wartezeit für Meldungen).
+        /// </summary>
+        public static string OfflineReason(PingTarget t, out bool final)
+        {
+            final = false;
+            string v = t.Diagnosis;
+            if (v.StartsWith("Switch-Neustart")) { final = true; return v; }
+            if (v.StartsWith("mehrere Geräte") || v.StartsWith("eigene Verbindung")) { final = true; return null; }
+            bool auto;
+            string cls = DeviceClass.Effective(t, out auto);
+            if (cls == DeviceClass.Always) { final = true; return null; }
+            if (!DeviceClass.MayBeOff(cls))
+            {
+                // Klasse unbekannt: nur eindeutige Diagnosen (kein Link, keine ARP-Antwort, WLAN abgemeldet) gelten als ausgeschaltet.
+                final = t.DiagRound >= 3;
+                return IsOfflineVerdict(v) ? Reason(v) : null;
+            }
+            if (IsOfflineVerdict(v)) { final = true; return Reason(v); }
+            if (v.StartsWith("eingeschaltet") || v.StartsWith("IP-Konflikt"))
+            {
+                // MAC noch aktiv am Port: abwarten, bis die MAC-Tabelle abgelaufen ist (ca. 5 min) - dann echte Störung.
+                final = t.DiagRound >= 3;
+                return null;
+            }
+            if (v.StartsWith("im Netz"))
+            {
+                if (t.DiagRound < 3) return null;
+                final = true;
+                return "Standby? (antwortet nur noch auf ARP)";
+            }
+            if (t.DiagRound >= 2) { final = true; return "offline, Grund nicht ersichtlich"; }
+            return null;
+        }
+
+        static string Reason(string verdict)
+        {
+            if (verdict.StartsWith("vermutlich aus")) return "ausgeschaltet" + verdict.Substring("vermutlich aus".Length).Replace(" / Kabel ab", "").TrimEnd();
+            if (verdict.StartsWith("nicht im Netz")) return "ausgeschaltet/getrennt (keine ARP-Antwort)";
+            return verdict;
+        }
+
+        /// <summary>Meldungen für Geräte, die aus sein dürfen, erst nach der Einordnung (spätestens nach ca. 6 Minuten).</summary>
+        public static bool Pending(PingTarget t)
+        {
+            if (t.OutageConfirmed || t.OfflineMode) return false;
+            bool auto;
+            return DeviceClass.MayBeOff(DeviceClass.Effective(t, out auto)) && t.DiagRound < 3;
+        }
+
+        /// <summary>Wendet die Einordnung an: liefert den Offline-Protokolleintrag oder null.</summary>
+        public static LogEntry Apply(PingTarget t)
+        {
+            if (t.OfflineMode || !t.OutageStart.HasValue || t.OutageConfirmed) return null;
+            bool final;
+            string reason = OfflineReason(t, out final);
+            if (reason != null) return MarkOffline(t, reason);
+            if (final) t.OutageConfirmed = true;
+            return null;
         }
 
         /// <summary>
         /// Gerät gilt als ausgeschaltet: Die Fehlschläge seit Ausfallbeginn werden aus Statistik und Leitungsqualität
         /// herausgerechnet, der Ausfall zählt nicht als Störung. Liefert den Protokolleintrag (oder null).
         /// </summary>
-        public static LogEntry MarkOffline(PingTarget t)
+        public static LogEntry MarkOffline(PingTarget t, string reason)
         {
             if (t.OfflineMode || !t.OutageStart.HasValue) return null;
             t.OfflineMode = true;
+            t.OffReason = reason;
             int n = t.FailStreak;
             t.Lost = Math.Max(0, t.Lost - n);
             t.Sent = Math.Max(0, t.Sent - n);
@@ -257,8 +333,56 @@ namespace PingMonitor
             lock (t.OutageTimes) t.OutageTimes.Remove(t.OutageStart.Value);
             t.Quality.DropTrailingFailures(n);
             t.Status = "OFFLINE";
-            return Entry(DateTime.Now, t, EvOffline, "Gerät vermutlich ausgeschaltet bzw. vom Netz getrennt (seit " +
-                t.OutageStart.Value.ToString(Fmt.Time) + ") - wird nicht als Störung gewertet. " + t.Diagnosis);
+            if (t.Diagnosis.Length == 0 || !IsOfflineVerdict(t.Diagnosis)) t.Diagnosis = reason;
+            string clean = t.LossBefore == 0 ? " Vorher keine Aussetzer (sauberes Ende)." : "";
+            string habit = OfflineHistory.HabitText(t.Host, t.OutageStart.Value);
+            return Entry(DateTime.Now, t, EvOffline, "Gerät offline: " + reason + " (seit " + t.OutageStart.Value.ToString(Fmt.Time) +
+                ") - wird nicht als Störung gewertet." + clean + (habit.Length > 0 ? " " + habit : ""));
+        }
+
+        /// <summary>Manuelle Einordnung des laufenden Ausfalls: "offline" (ausgeschaltet) oder "ausfall" (echte Störung).</summary>
+        public static LogEntry Override(PingTarget t, bool offline)
+        {
+            if (!t.OutageStart.HasValue) return null;
+            if (offline) return MarkOffline(t, "manuell als ausgeschaltet gewertet");
+            t.OutageConfirmed = true;
+            if (!t.OfflineMode) return null;
+            t.OfflineMode = false;
+            t.OffReason = "";
+            t.Outages++;
+            lock (t.OutageTimes) t.OutageTimes.Add(t.OutageStart.Value);
+            t.Status = "AUSFALL";
+            t.Diagnosis = "manuell als Ausfall gewertet";
+            return Entry(DateTime.Now, t, EvOutage, "Manuell als Ausfall (Störung) gewertet - seit " + t.OutageStart.Value.ToString(Fmt.Time));
+        }
+
+        /// <summary>
+        /// Ein Switch/AP ist neu gestartet (boot = Startzeitpunkt): Ausfälle der betroffenen Geräte in diesem Zeitfenster
+        /// zählen nicht als Instabilität. Laufende Ausfälle werden als offline (Neustart) eingeordnet.
+        /// </summary>
+        public static List<LogEntry> ExplainRestart(PingTarget t, string device, DateTime boot, string why)
+        {
+            List<LogEntry> result = new List<LogEntry>();
+            DateTime from = boot.AddMinutes(-10), to = boot.AddMinutes(3);
+            string reason = "Switch-Neustart: " + device + (why.Length > 0 ? " (" + why + ")" : "");
+            if (t.OutageStart.HasValue && t.OutageStart.Value >= from && t.OutageStart.Value <= to)
+            {
+                if (!t.OfflineMode) { t.Diagnosis = reason; LogEntry e = MarkOffline(t, reason); if (e != null) result.Add(e); }
+                return result;
+            }
+            List<DateTime> hit = new List<DateTime>();
+            lock (t.OutageTimes)
+            {
+                hit = t.OutageTimes.FindAll(delegate (DateTime x) { return x >= from && x <= to; });
+                foreach (DateTime x in hit) t.OutageTimes.Remove(x);
+            }
+            if (hit.Count == 0) return result;
+            t.Outages = Math.Max(0, t.Outages - hit.Count);
+            List<string> times = new List<string>();
+            foreach (DateTime x in hit) times.Add(x.ToString("HH:mm:ss"));
+            result.Add(Entry(DateTime.Now, t, EvRestart, (hit.Count == 1 ? "Ausfall um " : hit.Count + " Ausfälle um ") + string.Join(", ", times.ToArray()) +
+                " durch " + reason + " - wird nicht als Störung/Instabilität gewertet."));
+            return result;
         }
 
         /// <summary>Wird ausgelöst, sobald ein Ausfall beginnt (für die automatische Diagnose).</summary>
@@ -268,24 +392,38 @@ namespace PingMonitor
         /// Diagnose nach 20 Sekunden Ausfall (kurze Aussetzer werden übersprungen, und Windows hat bis dahin
         /// veraltete ARP-Einträge verworfen). done erhält den fertigen Protokolleintrag.
         /// </summary>
+        /// <summary>
+        /// Wiederholt die Diagnose während des Ausfalls (nach 20 s, 2 min, 6 min, dann alle 10 min): Erst nach Ablauf der
+        /// MAC-Tabelle der Switches (ca. 5 min) lässt sich "ausgeschaltet" sicher von "hängt" unterscheiden.
+        /// done erhält den Protokolleintrag (null, wenn sich die Diagnose nicht geändert hat).
+        /// </summary>
         public static void Diagnose(PingTarget t, Func<List<SwitchState>> switches, Action<PingTarget, LogEntry> done)
         {
             DateTime? since = t.OutageStart;
             Thread th = new Thread(delegate ()
             {
-                Thread.Sleep(20000);
-                if (!t.Running || t.OutageStart != since) return;
-                try
+                int[] waits = { 20, 100, 240, 600 };
+                string last = "";
+                for (int round = 1; round <= 16; round++)
                 {
-                    string verdict, details;
-                    OutageDiagnosis.Run(t, switches(), out verdict, out details);
-                    if (t.OutageStart != since) return;
-                    t.Diagnosis = verdict;
-                    t.DiagnosisDetails = details;
-                    LogEntry e = Entry(DateTime.Now, t, EvDiagnosis, verdict + ": " + details.Replace("\r\n", " | "));
-                    done(t, e);
+                    Thread.Sleep(waits[Math.Min(round - 1, waits.Length - 1)] * 1000);
+                    if (!t.Running || t.OutageStart != since || t.OfflineMode) return;
+                    try
+                    {
+                        string verdict, details;
+                        OutageDiagnosis.Run(t, switches(), out verdict, out details);
+                        if (t.OutageStart != since || t.OfflineMode) return;
+                        if (!t.Diagnosis.StartsWith("manuell")) t.Diagnosis = verdict;
+                        t.DiagnosisDetails = details;
+                        t.DiagRound = round;
+                        LogEntry e = verdict == last ? null : Entry(DateTime.Now, t, EvDiagnosis, (round > 1 ? "Nachprüfung nach " +
+                            Duration(since.Value, DateTime.Now) + ": " : "") + verdict + ": " + details.Replace("\r\n", " | "));
+                        last = verdict;
+                        done(t, e);
+                        if (t.OutageConfirmed && round >= 3) return;
+                    }
+                    catch { }
                 }
-                catch { }
             });
             th.IsBackground = true;
             th.Start();
@@ -331,6 +469,10 @@ namespace PingMonitor
                     t.OutageStart = now;
                     t.LastOutage = now;
                     t.Outages++;
+                    t.DiagRound = 0;
+                    t.OutageConfirmed = false;
+                    t.OffReason = "";
+                    t.LossBefore = t.Quality.FailuresBefore(300);
                     lock (t.OutageTimes)
                     {
                         t.OutageTimes.Add(now);
@@ -350,7 +492,7 @@ namespace PingMonitor
                 // Nur einmal melden: solange die Online-Meldung aussteht, gilt das Gerät weiter als offline.
                 // Filter: Mindestdauer (ausgeschaltete Geräte sind bis dahin erkannt), Gerätefilter, WLAN-Geräte.
                 if (!t.NotifiedDown && t.FailStreak >= cfg.Threshold && cfg.OnOutage &&
-                    (now - t.OutageStart.Value).TotalMinutes >= cfg.OutageMinMinutes && cfg.WantsOutage(t))
+                    (now - t.OutageStart.Value).TotalMinutes >= cfg.OutageMinMinutes && !Pending(t) && cfg.WantsOutage(t))
                 {
                     t.NotifiedDown = true;
                     t.NotifiedSince = t.OutageStart.Value;
@@ -363,10 +505,20 @@ namespace PingMonitor
         /// <summary>Beendet einen laufenden Ausfall und liefert den Eintrag mit der Dauer.</summary>
         public static LogEntry Close(PingTarget t, DateTime now, string evt)
         {
-            string info = "Ausfalldauer " + Duration(t.OutageStart.Value, now) +
-                " (seit " + t.OutageStart.Value.ToString(Fmt.Time) + ")";
+            DateTime start = t.OutageStart.Value;
+            string info = "Ausfalldauer " + Duration(start, now) + " (seit " + start.ToString(Fmt.Time) + ")";
+            if (t.OfflineMode)
+            {
+                // Eigene Zeile im Ausfallprotokoll: von - bis und Grund (zählt nicht als Ausfall)
+                info = "offline " + start.ToString(start.Date == now.Date ? "HH:mm" : "dd.MM. HH:mm") + " – " + now.ToString("HH:mm") +
+                    " (Dauer " + Duration(start, now) + ")" + (t.OffReason.Length > 0 ? " – " + t.OffReason : "") + " – kein Ausfall";
+                OfflineHistory.Add(t.Host, start, now, t.OffReason);
+            }
             t.OutageStart = null;
             t.OfflineMode = false;
+            t.OffReason = "";
+            t.DiagRound = 0;
+            t.OutageConfirmed = false;
             t.Diagnosis = "";
             t.DiagnosisDetails = "";
             return Entry(now, t, evt, info);
@@ -383,6 +535,187 @@ namespace PingMonitor
             LogEntry e = new LogEntry();
             e.Time = time; e.Name = t.Name; e.Host = t.Host; e.Event = evt; e.Info = info;
             return e;
+        }
+    }
+
+    /// <summary>
+    /// Geräteklasse: Muss das Gerät immer erreichbar sein (Server, Switch, Drucker) oder darf es aus sein
+    /// (Arbeitsplatz-PC nach Feierabend, Smartphone im Standby)? Automatisch geschätzt, im Kontextmenü änderbar.
+    /// </summary>
+    static class DeviceClass
+    {
+        public const string Auto = "", Always = "immer", MayOff = "aus", WorkHours = "zeit", Wlan = "wlan";
+
+        public static bool MayBeOff(string cls) { return cls == MayOff || cls == Wlan; }
+
+        /// <summary>Wirksame Klasse jetzt: "immer", "aus", "wlan" oder "" (unbekannt).</summary>
+        public static string Effective(PingTarget t, out bool auto)
+        {
+            auto = false;
+            if (t.Class == WorkHours) return InWorkHours(DateTime.Now) ? Always : MayOff;
+            if (t.Class == Always || t.Class == MayOff) return t.Class;
+            auto = true;
+            if (t.InferredClass == null || DateTime.UtcNow - t.InferredAt > TimeSpan.FromSeconds(60))
+            {
+                t.InferredClass = Infer(t);
+                t.InferredAt = DateTime.UtcNow;
+            }
+            return t.InferredClass;
+        }
+
+        public static string Text(string cls)
+        {
+            switch (cls)
+            {
+                case Always: return "immer an";
+                case MayOff: return "darf aus sein";
+                case WorkHours: return "Arbeitszeit";
+                case Wlan: return "WLAN-Gerät";
+                default: return "unbekannt";
+            }
+        }
+
+        /// <summary>Anzeige für die Geräteliste, z. B. "darf aus sein (auto)".</summary>
+        public static string Display(PingTarget t, bool wlanHint)
+        {
+            if (t.Class == WorkHours) return "Arbeitszeit" + (InWorkHours(DateTime.Now) ? " (jetzt: immer an)" : " (jetzt: darf aus)");
+            if (t.Class.Length > 0) return Text(t.Class);
+            bool auto;
+            string c = Effective(t, out auto);
+            if (c.Length == 0 && wlanHint) c = Wlan;
+            return Text(c) + " (auto)";
+        }
+
+        public static bool InWorkHours(DateTime when)
+        {
+            string days = Config.Cached("Arbeitszeit.Tage", "12345");
+            int dow = when.DayOfWeek == DayOfWeek.Sunday ? 7 : (int)when.DayOfWeek;
+            if (days.IndexOf((char)('0' + dow)) < 0) return false;
+            TimeSpan from, to;
+            if (!TimeSpan.TryParse(Config.Cached("Arbeitszeit.Von", "07:00"), out from)) from = TimeSpan.FromHours(7);
+            if (!TimeSpan.TryParse(Config.Cached("Arbeitszeit.Bis", "18:00"), out to)) to = TimeSpan.FromHours(18);
+            TimeSpan now = when.TimeOfDay;
+            return from <= to ? now >= from && now < to : now >= from || now < to;
+        }
+
+        static readonly System.Text.RegularExpressions.Regex AlwaysWords = new System.Text.RegularExpressions.Regex(
+            @"server|esxi?\b|vmware|proxmox|hyper-v|\bnas\b|synology|qnap|drucker|printer|jetdirect|laserjet|officejet|kyocera|ricoh|brother|canon|lexmark|" +
+            @"switch|firewall|router|opnsense|pfsense|fritz|access point|unifi|ubiquiti|hp ethernet|multi-environment|\busv\b|\bups\b|idrac|\bilo\b|ipmi|kamera|camera|telefonanlage|\bpbx\b|voip|yealink|snom",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        static readonly System.Text.RegularExpressions.Regex ClientNames = new System.Text.RegularExpressions.Regex(
+            @"^(pc|nb|laptop|notebook|desktop|ws|client|arbeitsplatz)[-_0-9]", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        /// <summary>Schätzung aus Geräteinfo, Name, Hersteller, WLAN-Zuordnung und bisherigem Verhalten.</summary>
+        public static string Infer(PingTarget t)
+        {
+            if (SwitchMonitor.IsInfrastructure(t.Host)) return Always;
+            string all = t.Info + " " + t.Vendor + " " + t.Name + " " + t.DnsName + " " + t.NetBiosName + " " + t.Comment;
+            if (AlwaysWords.IsMatch(all)) return Always;
+            if (SwitchMonitor.IsWlanClient(t) || Topology.RandomMac(t.Mac) || Topology.MobileVendor(t.Vendor)) return Wlan;
+            if (OfflineHistory.Count(t.Host, 14) >= 3) return MayOff;   // war schon mehrfach ausgeschaltet
+            if (all.IndexOf("windows", StringComparison.OrdinalIgnoreCase) >= 0) return MayOff;
+            foreach (string n in new string[] { t.Name, t.DnsName, t.NetBiosName })
+                if (n != null && ClientNames.IsMatch(n.Trim())) return MayOff;
+            return Auto;
+        }
+    }
+
+    /// <summary>Offline-Zeiten je Gerät (14 Tage) für Muster wie "abends ab 17 Uhr aus" - Logs\Offline_Verlauf.csv.</summary>
+    static class OfflineHistory
+    {
+        class Period { public string Host; public DateTime From, To; }
+        static readonly object sync = new object();
+        static List<Period> cache = new List<Period>();
+        static DateTime stamp = DateTime.MinValue, loadedAt = DateTime.MinValue;
+
+        static string File { get { return Path.Combine(Config.LogDir, "Offline_Verlauf.csv"); } }
+
+        public static void Add(string host, DateTime from, DateTime to, string reason)
+        {
+            if (to - from < TimeSpan.FromMinutes(2)) return;
+            lock (sync)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Config.LogDir);
+                    using (FileStream fs = new FileStream(File, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+                    using (StreamWriter w = new StreamWriter(fs, new UTF8Encoding(false)))
+                        w.WriteLine(host + ";" + from.ToString("yyyy-MM-dd HH:mm:ss") + ";" + to.ToString("yyyy-MM-dd HH:mm:ss") + ";" + (reason ?? "").Replace(";", ","));
+                }
+                catch { }
+                stamp = DateTime.MinValue;
+            }
+        }
+
+        static List<Period> All()
+        {
+            lock (sync)
+            {
+                if (DateTime.UtcNow - loadedAt < TimeSpan.FromSeconds(30)) return cache;
+                loadedAt = DateTime.UtcNow;
+                DateTime st = Config.Stamp(File);
+                if (st == stamp) return cache;
+                stamp = st;
+                List<Period> list = new List<Period>();
+                DateTime min = DateTime.Now.AddDays(-14);
+                try
+                {
+                    if (System.IO.File.Exists(File))
+                        foreach (string line in Config.ReadAllLinesShared(File))
+                        {
+                            string[] f = line.Split(';');
+                            DateTime a, b;
+                            if (f.Length < 3 || !DateTime.TryParse(f[1], out a) || !DateTime.TryParse(f[2], out b) || b < min) continue;
+                            Period p = new Period(); p.Host = f[0]; p.From = a; p.To = b;
+                            list.Add(p);
+                        }
+                    // Datei klein halten
+                    if (list.Count > 0 && new FileInfo(File).Length > 2000000)
+                    {
+                        List<string> keep = new List<string>();
+                        foreach (Period p in list) keep.Add(p.Host + ";" + p.From.ToString("yyyy-MM-dd HH:mm:ss") + ";" + p.To.ToString("yyyy-MM-dd HH:mm:ss") + ";");
+                        System.IO.File.WriteAllLines(File, keep.ToArray(), new UTF8Encoding(false));
+                    }
+                }
+                catch { }
+                cache = list;
+                return cache;
+            }
+        }
+
+        public static int Count(string host, int days)
+        {
+            DateTime min = DateTime.Now.AddDays(-days);
+            int n = 0;
+            foreach (Period p in All()) if (p.Host == host && p.To >= min && p.To - p.From >= TimeSpan.FromMinutes(30)) n++;
+            return n;
+        }
+
+        /// <summary>An wie vielen der letzten 14 Tage war das Gerät zu dieser Uhrzeit (±1 h) ebenfalls aus?</summary>
+        public static string HabitText(string host, DateTime when)
+        {
+            List<DateTime> days = new List<DateTime>();
+            foreach (Period p in All())
+            {
+                if (p.Host != host || p.From.Date == when.Date) continue;
+                double diff = Math.Abs((p.From.TimeOfDay - when.TimeOfDay).TotalMinutes);
+                if (Math.Min(diff, 1440 - diff) <= 60 && !days.Contains(p.From.Date)) days.Add(p.From.Date);
+            }
+            if (days.Count < 2) return "";
+            return "Üblich: an " + days.Count + " der letzten 14 Tage um diese Uhrzeit ebenfalls ausgeschaltet.";
+        }
+
+        /// <summary>Kurzfassung für die Gerätedetails.</summary>
+        public static string Summary(string host)
+        {
+            List<Period> list = All().FindAll(delegate (Period p) { return p.Host == host; });
+            if (list.Count == 0) return "";
+            StringBuilder sb = new StringBuilder();
+            int from = Math.Max(0, list.Count - 10);
+            for (int i = list.Count - 1; i >= from; i--)
+                sb.Append("  ").Append(list[i].From.ToString("ddd dd.MM. HH:mm")).Append(" – ").Append(list[i].To.ToString(list[i].To.Date == list[i].From.Date ? "HH:mm" : "ddd HH:mm"))
+                  .Append("\r\n");
+            return list.Count + " Offline-Zeiten in 14 Tagen (neueste zuerst):\r\n" + sb.ToString();
         }
     }
 
@@ -459,6 +792,7 @@ namespace PingMonitor
                 if (p.Length > 7) t.DnsName = p[7].Trim();
                 if (p.Length > 8) t.NetBiosName = p[8].Trim();
                 if (p.Length > 9) t.Info = p[9].Trim();
+                if (p.Length > 10) t.Class = p[10].Trim();
                 list.Add(t);
             }
             return list;
@@ -467,11 +801,11 @@ namespace PingMonitor
         public static void SaveHosts(IEnumerable<PingTarget> targets)
         {
             List<string> lines = new List<string>();
-            lines.Add("# Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller;Kommentar;DNS-Name;NetBIOS;Geräteinfo");
+            lines.Add("# Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller;Kommentar;DNS-Name;NetBIOS;Geräteinfo;Klasse (leer=automatisch, immer, aus, zeit)");
             foreach (PingTarget t in targets)
                 lines.Add(Clean(t.Name) + ";" + t.Host + ";" + t.IntervalMs + ";" + t.TimeoutMs + ";" +
                     t.Mac + ";" + Clean(t.Vendor) + ";" + Clean(t.Comment) + ";" + Clean(t.DnsName) + ";" +
-                    Clean(t.NetBiosName) + ";" + Clean(t.Info));
+                    Clean(t.NetBiosName) + ";" + Clean(t.Info) + ";" + Clean(t.Class));
             File.WriteAllLines(HostsFile, lines.ToArray(), Encoding.UTF8);
         }
 
@@ -507,6 +841,15 @@ namespace PingMonitor
             List<string> lines = new List<string>();
             foreach (KeyValuePair<string, string> kv in d) lines.Add(kv.Key + "=" + kv.Value);
             File.WriteAllLines(SettingsFile, lines.ToArray(), Encoding.UTF8);
+        }
+
+        /// <summary>Einen einzelnen Wert speichern.</summary>
+        public static void Set(string key, string value)
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            d[key] = value;
+            try { SaveSettings(d); } catch { }
+            lock (cacheLock) cachedSettings = null;
         }
 
         public static string Get(Dictionary<string, string> d, string key, string def)
@@ -640,6 +983,7 @@ namespace PingMonitor
         public string OnlyDevices = "";      // nur Geräte, deren Name/IP einen dieser Begriffe enthält (kommagetrennt, leer = alle)
         public string ExceptDevices = "";    // diese Geräte nie melden
         public bool SkipWlan;                // WLAN-/Mobilgeräte (zufällige MAC, Handy-Hersteller) nicht melden
+        public bool OnlyAlways;              // Ausfälle nur für Geräte der Klasse "immer an" melden
         public bool OnIssue = true;          // Befunde melden
         public int IssueMinConfidence = Issue.Certain;
         public int IssueMinSeverity = Finding.Warning;
@@ -687,7 +1031,13 @@ namespace PingMonitor
         public bool WantsOutage(PingTarget t)
         {
             if (!DeviceAllowed(t.Name + " " + t.Host + " " + t.Comment)) return false;
-            if (SkipWlan && (t.Link != null ? t.Link.Wlan : Topology.RandomMac(t.Mac) || Topology.MobileVendor(t.Vendor))) return false;
+            bool wlan = t.Link != null ? t.Link.Wlan : Topology.RandomMac(t.Mac) || Topology.MobileVendor(t.Vendor) || SwitchMonitor.IsWlanClient(t);
+            if (SkipWlan && wlan) return false;
+            if (OnlyAlways)
+            {
+                bool auto;
+                if (DeviceClass.Effective(t, out auto) != DeviceClass.Always) return false;
+            }
             return true;
         }
 
@@ -748,6 +1098,7 @@ namespace PingMonitor
             c.OnlyDevices = Config.Get(d, "Benachrichtigen.NurGeraete", "");
             c.ExceptDevices = Config.Get(d, "Benachrichtigen.OhneGeraete", "");
             c.SkipWlan = Config.Get(d, "Benachrichtigen.OhneWlan", "0") == "1";
+            c.OnlyAlways = Config.Get(d, "Benachrichtigen.NurImmerAn", "0") == "1";
             c.OnIssue = Config.Get(d, "Benachrichtigen.Befunde", Config.Get(d, "Benachrichtigen.SwitchPort", "1")) != "0";
             c.IssueMinConfidence = Math.Min(3, Int(d, "Benachrichtigen.BefundeAbSicherheit", Issue.Certain, 1));
             c.IssueMinSeverity = Math.Min(3, Int(d, "Benachrichtigen.BefundeAbSchwere", Finding.Warning, 1));
@@ -794,6 +1145,7 @@ namespace PingMonitor
             d["Benachrichtigen.NurGeraete"] = OnlyDevices.Trim();
             d["Benachrichtigen.OhneGeraete"] = ExceptDevices.Trim();
             d["Benachrichtigen.OhneWlan"] = SkipWlan ? "1" : "0";
+            d["Benachrichtigen.NurImmerAn"] = OnlyAlways ? "1" : "0";
             d["Benachrichtigen.Befunde"] = OnIssue ? "1" : "0";
             d["Benachrichtigen.BefundeAbSicherheit"] = IssueMinConfidence.ToString();
             d["Benachrichtigen.BefundeAbSchwere"] = IssueMinSeverity.ToString();
@@ -1446,6 +1798,43 @@ namespace PingMonitor
             SwitchMonitor.Targets = delegate { lock (sync) return new List<PingTarget>(targets.Values); };
             SwitchMonitor.Start(Source, true);
             Outages.OutageStarted += OnOutageStarted;
+            SwitchMonitor.Restarted += OnRestarted;
+        }
+
+        /// <summary>Switch/AP neu gestartet: Ausfälle in diesem Zeitfenster nicht als Störung werten.</summary>
+        void OnRestarted(SwitchMonitor.Restart r)
+        {
+            lock (sync)
+            {
+                foreach (PingTarget t in targets.Values)
+                    if (SwitchMonitor.Affects(r, t))
+                        foreach (LogEntry e in Outages.ExplainRestart(t, r.Device, r.Boot, r.Why)) Write(e);
+                dirty = true;
+            }
+        }
+
+        /// <summary>Manuelle Einordnung aus der Oberfläche (Kontextmenü "Als ausgeschaltet/als Ausfall werten").</summary>
+        void ApplyOverrides()
+        {
+            string file = Outages.OverrideFile;
+            if (!File.Exists(file)) return;
+            string[] lines;
+            try { lines = Config.ReadAllLinesShared(file); File.Delete(file); } catch { return; }
+            lock (sync)
+            {
+                foreach (string line in lines)
+                {
+                    string[] f = line.Split(';');
+                    if (f.Length < 2) continue;
+                    foreach (PingTarget t in targets.Values)
+                        if (t.Host == f[0])
+                        {
+                            LogEntry e = Outages.Override(t, f[1] == "offline");
+                            if (e != null) Write(e);
+                        }
+                }
+                dirty = true;
+            }
         }
 
         protected override void OnStop() { Shutdown("Dienst gestoppt"); }
@@ -1457,12 +1846,9 @@ namespace PingMonitor
             {
                 lock (sync)
                 {
-                    Write(e);
-                    if (Outages.IsOfflineVerdict(x.Diagnosis))
-                    {
-                        LogEntry off = Outages.MarkOffline(x);
-                        if (off != null) Write(off);
-                    }
+                    if (e != null) Write(e);
+                    LogEntry off = Outages.Apply(x);
+                    if (off != null) Write(off);
                     dirty = true;
                 }
             });
@@ -1490,6 +1876,7 @@ namespace PingMonitor
             {
                 if (Config.Stamp(Config.HostsFile) != hostsStamp || Config.Stamp(Config.SettingsFile) != settingsStamp)
                     Reload();
+                ApplyOverrides();
                 WriteStatus();
             }
             catch (Exception ex)
@@ -1526,7 +1913,14 @@ namespace PingMonitor
                 }
                 foreach (PingTarget t in wanted.Values)
                 {
-                    if (targets.ContainsKey(t.Key)) continue;
+                    PingTarget had;
+                    if (targets.TryGetValue(t.Key, out had))
+                    {
+                        // Laufendes Gerät: Stammdaten (Klasse, MAC, Infos) übernehmen, ohne die Messung zu unterbrechen
+                        had.Class = t.Class; had.Mac = t.Mac; had.Vendor = t.Vendor; had.Info = t.Info; had.Comment = t.Comment;
+                        had.DnsName = t.DnsName; had.NetBiosName = t.NetBiosName;
+                        continue;
+                    }
                     t.PingResult += OnPingResult;
                     targets.Add(t.Key, t);
                     t.Status = "Läuft ...";
@@ -1575,7 +1969,7 @@ namespace PingMonitor
                         Fmt.Csv(t.Name), Fmt.Csv(t.Host), Fmt.Csv(t.Status), Fmt.Csv(t.LastReply),
                         t.Sent.ToString(), t.Lost.ToString(), t.Outages.ToString(),
                         t.LastOutage.HasValue ? t.LastOutage.Value.ToString(Fmt.Time) : "",
-                        t.OutageStart.HasValue ? "1" : "0", t.IntervalMs.ToString(), Fmt.Csv(t.Quality.Evaluate().Encode()), Fmt.Csv(t.Diagnosis), Fmt.Csv(t.DiagnosisDetails.Replace("\r\n", "\\n")), t.OfflineMode ? "1" : "0" }));
+                        t.OutageStart.HasValue ? "1" : "0", t.IntervalMs.ToString(), Fmt.Csv(t.Quality.Evaluate().Encode()), Fmt.Csv(t.Diagnosis), Fmt.Csv(t.DiagnosisDetails.Replace("\r\n", "\\n")), t.OfflineMode ? "1" : "0", Fmt.Csv(t.OffReason) }));
                     sb.Append("\r\n");
                 }
             }
@@ -1808,7 +2202,7 @@ namespace PingMonitor
         ToolStripMenuItem miSvcInstall, miSvcStart, miSvcStop, miSvcUninstall;
         ComboBox cboFilter;
         TextBox txtSearch;
-        CheckBox chkHideWlan;
+        CheckBox chkHideWlan, chkHideOffline;
         Label lblCount;
         Dictionary<string, KeyValuePair<SwitchState, PortState>> portByMac = new Dictionary<string, KeyValuePair<SwitchState, PortState>>();
         System.Windows.Forms.Timer svcTimer;
@@ -1820,7 +2214,7 @@ namespace PingMonitor
 
         public MainForm()
         {
-            Text = "PingMonitor 4.3";
+            Text = "PingMonitor 4.4";
             Size = new Size(1360, 800);
             MinimumSize = new Size(850, 520);
             StartPosition = FormStartPosition.CenterScreen;
@@ -1829,6 +2223,22 @@ namespace PingMonitor
             BuildUi();
             LoadHosts();
             logEachFailure = Config.LoadLogEachFailure();
+            SwitchMonitor.Restarted += delegate (SwitchMonitor.Restart rs)
+            {
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        foreach (PingTarget t in targets)
+                            if (t.Running && SwitchMonitor.Affects(rs, t))
+                            {
+                                foreach (LogEntry e in Outages.ExplainRestart(t, rs.Device, rs.Boot, rs.Why)) AddLog(e);
+                                RefreshRow(t);
+                            }
+                    }));
+                }
+                catch (InvalidOperationException) { }
+            };
             SwitchMonitor.Targets = delegate
             {
                 List<PingTarget> r = null;
@@ -1903,6 +2313,7 @@ namespace PingMonitor
             AddTargetColumn("Comment", "Kommentar", 100);
             AddTargetColumn("Host", "IP / Hostname", 90);
             AddTargetColumn("Status", "Status", 80);
+            AddTargetColumn("Class", "Klasse", 70);
             AddTargetColumn("Quality", "Leitungsqualität", 120);
             AddTargetColumn("Reply", "Antwort", 50);
             AddTargetColumn("Sent", "Gesendet", 55);
@@ -1945,6 +2356,23 @@ namespace PingMonitor
             ctx.Items.Add("Aktualisieren", null, delegate { RefreshAll(); });
             ctx.Items.Add("Statistik zurücksetzen", null, delegate { ResetStats(Selected()); });
             ctx.Items.Add(new ToolStripSeparator());
+            ToolStripMenuItem cls = new ToolStripMenuItem("Geräteklasse");
+            cls.DropDownItems.Add("Automatisch (aus Geräteinfo, Name, WLAN und Verhalten)", null, delegate { SetClass(Selected(), DeviceClass.Auto); });
+            cls.DropDownItems.Add("Immer an - jeder Ausfall ist eine Störung (Server, Drucker, Netzwerk)", null, delegate { SetClass(Selected(), DeviceClass.Always); });
+            cls.DropDownItems.Add("Darf aus sein - ausgeschaltet/Standby ist kein Ausfall (Arbeitsplatz, Mobilgerät)", null, delegate { SetClass(Selected(), DeviceClass.MayOff); });
+            cls.DropDownItems.Add("Nur in der Arbeitszeit immer an (außerhalb darf es aus sein)", null, delegate { SetClass(Selected(), DeviceClass.WorkHours); });
+            ctx.Items.Add(cls);
+            ToolStripMenuItem ovr = new ToolStripMenuItem("Laufenden Ausfall einordnen");
+            ovr.DropDownItems.Add("Als ausgeschaltet werten (kein Ausfall)", null, delegate { OverrideOutage(Selected(), true); });
+            ovr.DropDownItems.Add("Als Ausfall werten (Störung)", null, delegate { OverrideOutage(Selected(), false); });
+            ctx.Items.Add(ovr);
+            ctx.Opening += delegate
+            {
+                bool any = false;
+                foreach (PingTarget t in Selected()) { PingTarget v = !t.Running && t.ServiceView != null ? t.ServiceView : t; if (v.OutageStart.HasValue) any = true; }
+                ovr.Enabled = any;
+            };
+            ctx.Items.Add(new ToolStripSeparator());
             ctx.Items.Add("Entfernen", null, delegate { RemoveSelected(); });
             gridTargets.ContextMenuStrip = ctx;
             gridTargets.CellMouseDown += delegate (object sender, DataGridViewCellMouseEventArgs e)
@@ -1979,7 +2407,7 @@ namespace PingMonitor
             cboFilter.Width = 230;
             cboFilter.Items.AddRange(new object[] { "Alle Geräte", "Nur erreichbare", "Nur Ausfälle (aktuell oder heute)",
                 "Nur auffällige (Qualität / Port / Ausfall)", "Nur per LAN angeschlossen", "Nur WLAN (vermutet)", "Nur nicht zugeordnete",
-                "Nur offline (ausgeschaltet)" });
+                "Nur offline (ausgeschaltet)", "Nur Klasse \"immer an\"", "Nur Geräte, die aus sein dürfen" });
             cboFilter.SelectedIndex = 0;
             cboFilter.SelectedIndexChanged += delegate { ApplyFilterAll(); };
             filter.Controls.Add(cboFilter);
@@ -1989,6 +2417,12 @@ namespace PingMonitor
             chkHideWlan.Margin = new Padding(12, 7, 3, 3);
             chkHideWlan.CheckedChanged += delegate { ApplyFilterAll(); };
             filter.Controls.Add(chkHideWlan);
+            chkHideOffline = new CheckBox();
+            chkHideOffline.Text = "Offline ausblenden";
+            chkHideOffline.AutoSize = true;
+            chkHideOffline.Margin = new Padding(12, 7, 3, 3);
+            chkHideOffline.CheckedChanged += delegate { ApplyFilterAll(); };
+            filter.Controls.Add(chkHideOffline);
             lblCount = NewLabel("");
             lblCount.ForeColor = SystemColors.GrayText;
             filter.Controls.Add(lblCount);
@@ -2101,7 +2535,7 @@ namespace PingMonitor
             });
             help.DropDownItems.Add("Über PingMonitor", null, delegate
             {
-                MessageBox.Show(this, "PingMonitor 4.3\n\nÜberwacht Geräte, Switches, WLAN, Firewall und Internet-Leitung, erkennt Fehler im Netz mit Sicherheitsstufe " +
+                MessageBox.Show(this, "PingMonitor 4.4\n\nÜberwacht Geräte, Switches, WLAN, Firewall und Internet-Leitung, erkennt Fehler im Netz mit Sicherheitsstufe " +
                     "und Maßnahmenplan und prüft Maßnahmen nach.\n\nProgrammordner: " + Config.BaseDir, Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
             });
             m.Items.AddRange(new ToolStripItem[] { file, dev, net, ana, set, svc, help });
@@ -2197,7 +2631,9 @@ namespace PingMonitor
                 uf.Valid ? uf.Devices.Count + " Geräte, " + uf.Clients.Count + " Clients, abgefragt " + age(uf.Fetched) : "Fehler: " + uf.Error));
             OpnSnapshot o = SwitchMonitor.CurrentOpn(svc);
             sb.AppendLine((!Opn.Configured ? "– " : o.Valid ? "✓ " : "✖ ") + "OPNsense-API: " + (!Opn.Configured ? "nicht eingerichtet" :
-                o.Valid ? o.Gateways.Count + " Gateways, " + o.Leases.Count + " Leases, " + o.Arp.Count + " ARP, abgefragt " + age(o.Fetched) : "Fehler: " + o.Error));
+                o.Valid ? o.Gateways.Count + " Gateways, " + o.Leases.Count + " Leases, " + o.Arp.Count + " ARP" + (o.States >= 0 ? ", " + o.States + " States" : "") + ", abgefragt " + age(o.Fetched) : "Fehler: " + o.Error));
+            string pv = SwitchMonitor.PveSummary(svc);
+            sb.AppendLine((!Pve.Configured ? "– " : pv.Length > 0 && !pv.StartsWith("Fehler") ? "✓ " : "✖ ") + "Proxmox-API: " + (!Pve.Configured ? "nicht eingerichtet" : pv.Length > 0 ? pv : "wird abgefragt ..."));
             string[] lines = SwitchMonitor.Lines(svc);
             foreach (string l in lines)
             {
@@ -2655,12 +3091,9 @@ namespace PingMonitor
                 {
                     BeginInvoke(new Action(delegate
                     {
-                        AddLog(e);
-                        if (Outages.IsOfflineVerdict(x.Diagnosis))
-                        {
-                            LogEntry off = Outages.MarkOffline(x);
-                            if (off != null) AddLog(off);
-                        }
+                        if (e != null) AddLog(e);
+                        LogEntry off = Outages.Apply(x);
+                        if (off != null) AddLog(off);
                         if (targets.Contains(x)) RefreshRow(x);
                     }));
                 }
@@ -2715,7 +3148,15 @@ namespace PingMonitor
             if (t.Link != null) sb.Append("\r\nVerbindung: " + t.Link.Text);
             PingTarget sv = !t.Running && t.ServiceView != null ? t.ServiceView : t;
             if (sv.OutageStart.HasValue)
-                sb.Append("\r\n\r\n=== AUSFALL-DIAGNOSE ===\r\n" + (sv.Diagnosis.Length > 0 ? sv.Diagnosis + "\r\n" + sv.DiagnosisDetails : "läuft (ca. 20 Sekunden nach Ausfallbeginn) ..."));
+                sb.Append("\r\n\r\n=== " + (sv.OfflineMode ? "OFFLINE (kein Ausfall)" : "AUSFALL-DIAGNOSE") + " ===\r\n" + (sv.OfflineMode && sv.OffReason.Length > 0 ? "Grund: " + sv.OffReason + "\r\n" : "") +
+                    (sv.Diagnosis.Length > 0 ? (sv.Diagnosis != sv.OffReason ? sv.Diagnosis + "\r\n" : "") + sv.DiagnosisDetails : "läuft (ca. 20 Sekunden nach Ausfallbeginn) ...") +
+                    "\r\n(Die Diagnose wird nach 2, 6 und dann alle 10 Minuten wiederholt - erst nach Ablauf der MAC-Tabelle ist \"ausgeschaltet\" sicher erkennbar.)");
+            sb.Append("\r\n\r\n=== GERÄTEKLASSE ===\r\n" + DeviceClass.Display(t, IsWlan(t)) + "\r\n" +
+                "\"Immer an\": jeder Ausfall ist eine Störung. \"Darf aus sein\": ausgeschaltet, Standby oder WLAN abgemeldet wird nur als offline dokumentiert " +
+                "(kein Ausfall, keine Meldung); echte Störungen (Link mit voller Geschwindigkeit, MAC aktiv, viele Geräte gleichzeitig) bleiben Ausfälle. Ändern: Rechtsklick → Geräteklasse." +
+                (t.Class == DeviceClass.WorkHours ? "\r\nArbeitszeit: " + Config.Cached("Arbeitszeit.Von", "07:00") + " - " + Config.Cached("Arbeitszeit.Bis", "18:00") + " (Einstellungen → Optionen)" : ""));
+            string offHist = OfflineHistory.Summary(t.Host);
+            if (offHist.Length > 0) sb.Append("\r\n\r\n=== OFFLINE-ZEITEN ===\r\n" + offHist.TrimEnd());
             string rel = RelatedIssues(t);
             if (rel.Length > 0) sb.Append("\r\n\r\n=== BEFUNDE UND WIDERSPRÜCHE ZU DIESEM GERÄT ===\r\n" + rel);
             string wl = WlanDetails(t);
@@ -2883,7 +3324,9 @@ namespace PingMonitor
             DataGridViewRow r = t.Row;
             r.Cells["Name"].Value = t.Name;
             r.Cells["Host"].Value = t.Host;
-            r.Cells["Status"].Value = (v == t ? "" : "Dienst: ") + v.Status + (v.OutageStart.HasValue && v.Diagnosis.Length > 0 ? " - " + v.Diagnosis : "");
+            r.Cells["Status"].Value = (v == t ? "" : "Dienst: ") + v.Status + (v.OutageStart.HasValue && v.OfflineMode && v.OffReason.Length > 0 ? " - " + v.OffReason :
+                v.OutageStart.HasValue && v.Diagnosis.Length > 0 ? " - " + v.Diagnosis : "");
+            r.Cells["Class"].Value = DeviceClass.Display(t, IsWlan(t));
             r.Cells["Status"].ToolTipText = v.OutageStart.HasValue && v.DiagnosisDetails.Length > 0 ? "Ausfall-Diagnose:\r\n" + v.DiagnosisDetails : "";
             r.Cells["Reply"].Value = v.LastReply;
             r.Cells["Sent"].Value = v.Sent;
@@ -2944,9 +3387,47 @@ namespace PingMonitor
                 case 5: if (!IsWlan(t)) return false; break;
                 case 6: if (t.Link != null && (t.Link.Text.StartsWith("LAN") || t.Link.Certain)) return false; break;
                 case 7: if (!(v.OutageStart.HasValue && v.OfflineMode)) return false; break;
+                case 8: if (EffClass(t) != DeviceClass.Always) return false; break;
+                case 9: if (!DeviceClass.MayBeOff(EffClass(t))) return false; break;
             }
             if (chkHideWlan.Checked && IsWlan(t)) return false;
+            if (chkHideOffline.Checked && v.OutageStart.HasValue && v.OfflineMode) return false;
             return true;
+        }
+
+        string EffClass(PingTarget t)
+        {
+            bool auto;
+            string c = DeviceClass.Effective(t, out auto);
+            return c.Length == 0 && IsWlan(t) ? DeviceClass.Wlan : c;
+        }
+
+        void SetClass(List<PingTarget> list, string cls)
+        {
+            if (list.Count == 0) return;
+            foreach (PingTarget t in list) { t.Class = cls; t.InferredClass = null; }
+            SaveHosts();
+            foreach (PingTarget t in list) RefreshRow(t);
+        }
+
+        /// <summary>Laufenden Ausfall manuell einordnen - im Dienst über einordnung.txt.</summary>
+        void OverrideOutage(List<PingTarget> list, bool offline)
+        {
+            List<string> forService = new List<string>();
+            foreach (PingTarget t in list)
+            {
+                if (t.Running && t.OutageStart.HasValue)
+                {
+                    LogEntry e = Outages.Override(t, offline);
+                    if (e != null) AddLog(e);
+                    RefreshRow(t);
+                }
+                else if (t.ServiceView != null && t.ServiceView.OutageStart.HasValue)
+                    forService.Add(t.Host + ";" + (offline ? "offline" : "ausfall"));
+            }
+            if (forService.Count > 0)
+                try { File.AppendAllText(Outages.OverrideFile, string.Join("\r\n", forService.ToArray()) + "\r\n", Encoding.UTF8); }
+                catch (Exception ex) { MessageBox.Show(this, "Konnte nicht an den Dienst übergeben werden: " + ex.Message, Text); }
         }
 
         void ApplyFilter(PingTarget t)
@@ -3197,6 +3678,7 @@ namespace PingMonitor
                             if (f.Count > 10) v.ServiceQuality = Assessment.Decode(f[10]);
                             if (f.Count > 12) { v.Diagnosis = f[11]; v.DiagnosisDetails = f[12].Replace("\\n", "\r\n"); }
                             if (f.Count > 13) v.OfflineMode = f[13] == "1";
+                            if (f.Count > 14) v.OffReason = f[14];
                             views[v.Name + "|" + v.Host + "|" + v.IntervalMs] = v;
                         }
                     }
@@ -3218,7 +3700,7 @@ namespace PingMonitor
     /// <summary>Einstellungen für Webhook- und E-Mail-Benachrichtigungen.</summary>
     class NotifyForm : Form
     {
-        CheckBox chkOutage, chkRecovery, chkWebhook, chkMail, chkSsl, chkSkipWlan, chkIssue, chkFixed, chkQuiet, chkQuietUrgent, chkDigest;
+        CheckBox chkOutage, chkRecovery, chkWebhook, chkMail, chkSsl, chkSkipWlan, chkOnlyAlways, chkIssue, chkFixed, chkQuiet, chkQuietUrgent, chkDigest;
         NumericUpDown numThreshold, numRecovery, numBundle, numMax, numWindow, numPort, numMinMinutes, numQuietFrom, numQuietTo, numDigest;
         TextBox txtUrl, txtHost, txtUser, txtPassword, txtFrom, txtTo, txtOnly, txtExcept;
         ComboBox cboConf, cboSev;
@@ -3266,6 +3748,8 @@ namespace PingMonitor
             Row(tl, "", Hint("Name, IP oder Kommentar enthält einen dieser Begriffe (mit Komma trennen, leer = alle Geräte),\nz. B. \"Server, Switch, NAS, 10.0.0.\"."));
             txtExcept = TextRow(tl, "Nie melden", 300);
             chkSkipWlan = Check(tl, "WLAN- und Mobilgeräte (Handys, Tablets, zufällige MAC) nicht melden");
+            chkOnlyAlways = Check(tl, "Nur Geräte der Klasse \"immer an\" (Server, Drucker, Netzwerk) - Arbeitsplätze nie melden");
+            Row(tl, "", Hint("Ausgeschaltete Geräte, Standby und abgemeldete WLAN-Geräte werden nie als Ausfall gemeldet. Bei Geräten, die aus sein\ndürfen, wartet PingMonitor mit der Meldung, bis die Einordnung feststeht (bis ca. 6 Minuten). Klasse: Rechtsklick auf das Gerät."));
 
             Header(tl, "Befunde (Fehler im Netz)");
             chkIssue = Check(tl, "Befunde melden (CRC-Fehler, Link-Wechsel, Schleifen, VLAN, WLAN, Internet-Leitung ...)");
@@ -3441,6 +3925,7 @@ namespace PingMonitor
             txtOnly.Text = c.OnlyDevices;
             txtExcept.Text = c.ExceptDevices;
             chkSkipWlan.Checked = c.SkipWlan;
+            chkOnlyAlways.Checked = c.OnlyAlways;
             chkIssue.Checked = c.OnIssue;
             cboConf.SelectedIndex = 3 - Math.Max(1, Math.Min(3, c.IssueMinConfidence));
             cboSev.SelectedIndex = c.IssueMinSeverity >= Finding.Problem ? 1 : 0;
@@ -3478,6 +3963,7 @@ namespace PingMonitor
             c.OnlyDevices = txtOnly.Text.Trim();
             c.ExceptDevices = txtExcept.Text.Trim();
             c.SkipWlan = chkSkipWlan.Checked;
+            c.OnlyAlways = chkOnlyAlways.Checked;
             c.OnIssue = chkIssue.Checked;
             c.IssueMinConfidence = 3 - cboConf.SelectedIndex;
             c.IssueMinSeverity = cboSev.SelectedIndex == 1 ? Finding.Problem : Finding.Warning;
@@ -5357,6 +5843,8 @@ namespace PingMonitor
 
     static class Links
     {
+        public static string Speed(long mbps) { return mbps >= 1000 ? (mbps / 1000.0).ToString("0.#") + " Gbit/s" : mbps + " Mbit/s"; }
+
         public const string Crc = "https://en.wikipedia.org/wiki/Cyclic_redundancy_check";
         public const string Duplex = "https://de.wikipedia.org/wiki/Duplex_(Nachrichtentechnik)";
         public const string Mtu = "https://de.wikipedia.org/wiki/Maximum_Transmission_Unit";
@@ -5392,6 +5880,21 @@ namespace PingMonitor
 
         public void Reset() { lock (sync) samples.Clear(); }
         public int Count { get { lock (sync) return samples.Count; } }
+
+        /// <summary>Fehlschläge unter den letzten n Pings vor der aktuellen Fehlschlag-Serie (-1 = zu wenige Werte).</summary>
+        public int FailuresBefore(int n)
+        {
+            lock (sync)
+            {
+                Sample[] a = samples.ToArray();
+                int end = a.Length;
+                while (end > 0 && !a[end - 1].Ok) end--;
+                if (end < 30) return -1;
+                int fails = 0;
+                for (int i = Math.Max(0, end - n); i < end; i++) if (!a[i].Ok) fails++;
+                return fails;
+            }
+        }
 
         /// <summary>Entfernt die letzten n Fehlschläge (Gerät war ausgeschaltet, keine Leitungsstörung).</summary>
         public void DropTrailingFailures(int n)
@@ -5708,6 +6211,7 @@ namespace PingMonitor
         public readonly List<DateTime> StpTimes = new List<DateTime>();
         public int Cpu = -1, MemPct = -1;   // Auslastung in % (HOST-RESOURCES / UCD-SNMP), -1 = unbekannt
         public long Connections = -1;    // offene TCP-Verbindungen
+        public long FwStates = -1, FwStatesLimit = -1;   // Firewall: Einträge der State-Tabelle (Verbindungen DURCH die Firewall, OPNsense-API)
         public string Load = "";         // Systemlast (1/5/15 min)
         public Assessment SysRating = new Assessment();
 
@@ -5723,6 +6227,7 @@ namespace PingMonitor
                 if (Load.Length > 0) p.Add("Last " + Load);
                 // tcpCurrEstab zählt nur Verbindungen ZUM Gerät (Weboberfläche, SSH, API) - nicht den Verkehr durch die Firewall
                 if (Connections > 0 || Connections == 0 && Kind == "Firewall") p.Add(Connections + " TCP-Verbindungen zum Gerät selbst");
+                if (FwStates >= 0) p.Add(FwStates + " Verbindungen durch die Firewall (States" + (FwStatesLimit > 0 ? ", " + (100.0 * FwStates / FwStatesLimit).ToString("0.#") + " % von " + FwStatesLimit : "") + ")");
                 return string.Join("  ·  ", p.ToArray());
             }
         }
@@ -5797,6 +6302,16 @@ namespace PingMonitor
         static string snapshot = "";
         static UniFiSnapshot unifi = new UniFiSnapshot();
         static OpnSnapshot opn = new OpnSnapshot();
+        static PveSnapshot pve = new PveSnapshot();
+        static DateTime pveTried = DateTime.MinValue;
+
+        public static PveSnapshot CurrentPve() { lock (sync) return pve; }
+
+        /// <summary>Kurzfassung des Proxmox-Zustands (aus dem Dienst bzw. der eigenen Abfrage).</summary>
+        public static string PveSummary(bool fromService)
+        {
+            try { return PveSnapshot.SummaryFrom(SnapshotLines(fromService)); } catch { return ""; }
+        }
         static readonly Dictionary<string, int> gwLevel = new Dictionary<string, int>();
         static DateTime started;
 
@@ -6125,9 +6640,36 @@ namespace PingMonitor
                         if (o.Error.Length > 0 && o.Error != opn.Error)
                             LogUniFi("OPNsense-API nicht erreichbar", o.Error);
                         if (o.Valid) OpnEvents(o);
-                        lock (sync) opn = o;
+                        lock (sync)
+                        {
+                            opn = o;
+                            // State-Tabelle der Firewall an der Firewall-Zeile anzeigen (gleiche Adresse wie die API, sonst jede Firewall)
+                            string host = "";
+                            try { host = new Uri(Config.Cached("Opn.Url", "").Contains("://") ? Config.Cached("Opn.Url", "") : "https://" + Config.Cached("Opn.Url", "")).Host; } catch { }
+                            List<SwitchState> fws = switches.FindAll(delegate (SwitchState x) { return x.Address == host; });
+                            if (fws.Count == 0) fws = switches.FindAll(delegate (SwitchState x) { return x.Kind == "Firewall"; });
+                            foreach (SwitchState fw in fws) { fw.FwStates = o.States; fw.FwStatesLimit = o.StatesLimit; }
+                        }
                     }
                     else lock (sync) opn = new OpnSnapshot();
+                    if (Pve.Configured)
+                    {
+                        if (DateTime.Now - pve.Fetched > TimeSpan.FromMinutes(5) || !pve.Valid && DateTime.Now - pveTried > TimeSpan.FromMinutes(1))
+                        {
+                            pveTried = DateTime.Now;
+                            PveSnapshot p = Pve.Fetch();
+                            if (p.Error.Length > 0 && p.Error != pve.Error) LogUniFi("Proxmox-API nicht erreichbar", p.Error);
+                            if (p.Valid && pve.Valid)
+                                foreach (PveNode n in p.Nodes)
+                                {
+                                    PveNode o = pve.Nodes.Find(delegate (PveNode k) { return k.Name == n.Name; });
+                                    if (o != null && o.Online != n.Online) LogUniFi("Proxmox-Knoten " + n.Name + (n.Online ? " wieder online" : " OFFLINE"), n.Ip);
+                                }
+                            if (p.Valid && pve.Valid && p.Quorate != pve.Quorate) LogUniFi(p.Quorate ? "Proxmox-Cluster: Quorum wieder hergestellt" : "Proxmox-Cluster: QUORUM VERLOREN", p.Summary);
+                            lock (sync) pve = p;
+                        }
+                    }
+                    else lock (sync) pve = new PveSnapshot();
                     if (Syslog.Enabled) { if (!Syslog.Running) Syslog.Start(owner); }
                     else if (Syslog.Running) Syslog.Stop();
                     try { WinEvents.Poll(owner); } catch { }
@@ -6139,6 +6681,7 @@ namespace PingMonitor
                     try { TrackMacMoves(); } catch { }
                     try { CheckConsistency(); } catch { }
                     lock (sync) foreach (SwitchState s in switches) foreach (PortState p in s.Ports.Values) Evaluate(s, p);
+                    FireRestarts();
                     try
                     {
                         List<SwitchState> all; List<Conflict> cs;
@@ -6149,7 +6692,7 @@ namespace PingMonitor
                     }
                     catch { }
                     // Anzeige und Statusdatei sehen nur vollständig abgeschlossene Abfragerunden.
-                    string snap = Serialize() + unifi.Serialize() + opn.Serialize() + StatusLines() + Issues.Serialize();
+                    string snap = Serialize() + unifi.Serialize() + opn.Serialize() + pve.Serialize() + StatusLines() + Issues.Serialize();
                     lock (sync) snapshot = snap;
                     if (writeStatus) WriteStatus(snap);
                 }
@@ -6253,6 +6796,7 @@ namespace PingMonitor
             long up = sys[Snmp.SysUpTime].Number;
             bool rebooted = s.UpTime >= 0 && up < s.UpTime;
             s.UpTime = up;
+            if (rebooted) NoteRestart(s, DateTime.Now.AddSeconds(-up / 100.0), "");
 
             Dictionary<int, SnmpValue> types = Column(ip, s.Community, IfType);
             Dictionary<int, SnmpValue> descr = Column(ip, s.Community, IfDescr);
@@ -6928,6 +7472,19 @@ namespace PingMonitor
                                     }
                                 }
                             bool same = portA.Length > 0 && portA == portB;
+                            // Hat die MAC aus der Geräteliste zusätzlich eine ANDERE IP im selben Netz? Dann ist es ein Gerät mit zwei Karten/IPs
+                            // im selben Subnetz (z. B. Proxmox mit vmbr0 und vmbr1 in 192.168.100.0/24) - ARP-Flux.
+                            string otherIp = OtherIpOf(mac, h.Host);
+                            if (otherIp.Length > 0)
+                            {
+                                Add(found, "flux|" + h.Host, Finding.Warning, "Ein Gerät mit zwei Netzwerkkarten im selben Subnetz: " + h.Host + " und " + otherIp,
+                                    h.Name + ": " + h.Host + " antwortet laut ARP mit MAC " + Dashed(arp) + (portB.Length > 0 ? " (" + portB + ")" : "") + ", die MAC " + Dashed(mac) +
+                                    (portA.Length > 0 ? " (" + portA + ")" : "") + " gehört zu " + otherIp + " - beide " + MacVendors.Lookup(mac) +
+                                    (mac.Substring(0, 6) == arp.Substring(0, 6) ? " (gleicher Hersteller-Präfix, typisch für eine Mehrport-Karte)" : "") +
+                                    ". Ein Host hat zwei IP-Adressen im selben Netz auf verschiedenen Karten: Linux/Windows beantwortet ARP für jede eigene IP auf jeder Karte " +
+                                    "(\"ARP-Flux\"), Antworten gehen über die Standardroute raus (asymmetrisch). Folge: wechselnde MAC in ARP- und MAC-Tabellen, kurze Aussetzer.");
+                                continue;
+                            }
                             Add(found, "mac|" + h.Host, same ? Finding.Info : Finding.Warning, (same ? "Zwei Netzwerkkarten unter " : "Anderes Gerät unter ") + h.Host,
                                 h.Name + ": Geräteliste MAC " + Dashed(mac) + " (" + MacVendors.Lookup(mac) + "), ARP-Tabelle der Firewall jetzt " + Dashed(arp) + " (" +
                                 MacVendors.Lookup(arp) + ")" + (portA.Length > 0 || portB.Length > 0 ? "; Switch-Port " + (portA.Length > 0 ? portA : "?") + " bzw. " + (portB.Length > 0 ? portB : "?") : "") + ". " +
@@ -7009,6 +7566,23 @@ namespace PingMonitor
                     conflicts.Remove(k);
                 }
             }
+        }
+
+        /// <summary>Andere IP derselben MAC im selben /24-Netz (ARP von Switches/Firewall, UniFi-Client).</summary>
+        static string OtherIpOf(string mac, string ip)
+        {
+            int dot = ip.LastIndexOf('.');
+            if (dot < 0 || mac.Length != 12) return "";
+            string net = ip.Substring(0, dot + 1);
+            List<KeyValuePair<string, string>> arp = new List<KeyValuePair<string, string>>();
+            foreach (SwitchState s in switches) arp.AddRange(s.Arp);
+            arp.AddRange(opn.Arp);
+            foreach (KeyValuePair<string, string> kv in arp)
+                if (kv.Key != ip && kv.Key.StartsWith(net) && NetTools.MacHex(kv.Value) == mac) return kv.Key;
+            if (unifi.Valid)
+                foreach (UniFiClientInfo c in unifi.Clients)
+                    if (NetTools.MacHex(c.Mac) == mac && c.Ip.Length > 0 && c.Ip != ip && c.Ip.StartsWith(net)) return c.Ip;
+            return "";
         }
 
         static void Add(Dictionary<string, Conflict> d, string key, int level, string title, string detail)
@@ -7314,7 +7888,10 @@ namespace PingMonitor
                     if (d.Uptime >= 0)
                     {
                         if (s.UpTime >= 0 && d.Uptime * 100 < s.UpTime)
+                        {
                             foreach (PortState p in s.Ports.Values) p.HaveBase = false;
+                            NoteRestart(s, now.AddSeconds(-d.Uptime), "");
+                        }
                         s.UpTime = d.Uptime * 100;
                     }
                     if (!d.Online) continue;
@@ -7440,7 +8017,11 @@ namespace PingMonitor
                     LogClient(d.Name, d.Ip, "UniFi-Gerät neu gestartet", what + " läuft erst seit " + Outages.Duration(now.AddSeconds(-d.Uptime), now) +
                         " (Stromausfall, PoE-Unterbrechung, Absturz oder Firmware-Update?)");
                 if (o.Version.Length > 0 && d.Version.Length > 0 && o.Version != d.Version)
+                {
                     LogClient(d.Name, d.Ip, "Firmware geändert", what + ": " + o.Version + " → " + d.Version);
+                    lock (sync)
+                        foreach (SwitchState sw in switches) if (Matches(sw, d)) NoteFirmware(sw.Name, o.Version, d.Version);
+                }
                 if (o.UplinkMac.Length == 12 && d.UplinkMac.Length == 12 && (o.UplinkMac != d.UplinkMac || o.UplinkPort != d.UplinkPort))
                     LogClient(d.Name, d.Ip, "Uplink geändert", what + ": vorher " + ApName(u, o.UplinkMac) + " Port " + o.UplinkPort +
                         ", jetzt " + ApName(u, d.UplinkMac) + " Port " + d.UplinkPort + (d.IsAp ? " (Mesh/Kabel?)" : ""));
@@ -7482,22 +8063,128 @@ namespace PingMonitor
         /// <summary>WLAN-Hinweis für die Ausfall-Diagnose (Daten des UniFi-Controllers), sonst leer.</summary>
         public static string WlanDiagnosis(PingTarget t)
         {
+            string verdict;
+            return WlanDiagnosis(t, out verdict);
+        }
+
+        /// <summary>WLAN-Zustand laut UniFi; verdict: "WLAN-Standby ...", "WLAN: schlechter Empfang ...", "WLAN verlassen ..." oder "".</summary>
+        public static string WlanDiagnosis(PingTarget t, out string verdict)
+        {
+            verdict = "";
             UniFiSnapshot u;
             lock (sync) u = unifi;
             if (!u.Valid) return "";
             UniFiClientInfo c = u.Client(t.Mac, t.Host);
             if (c != null && c.Wired) return "";
             if (c != null)
-                return (c.Signal != 0 && c.Signal <= -80 ? "✖ WLAN laut UniFi: " + WlanText(u, c) + " - das Signal ist sehr schwach, Funkabbrüche sind die wahrscheinliche Ursache."
-                                                       : "ⓘ WLAN laut UniFi weiterhin verbunden: " + WlanText(u, c) + ".");
+            {
+                if (c.Signal != 0 && c.Signal <= -80)
+                {
+                    verdict = "WLAN: schlechter Empfang (" + c.Signal + " dBm)";
+                    return "✖ WLAN laut UniFi: " + WlanText(u, c) + " - das Signal ist sehr schwach, Funkabbrüche sind die wahrscheinliche Ursache.";
+                }
+                verdict = "WLAN-Standby (angemeldet, antwortet nicht)";
+                return "ⓘ WLAN laut UniFi weiterhin verbunden: " + WlanText(u, c) + ". Smartphones/Tablets antworten im Standby nicht auf Ping - kein Fehler.";
+            }
             WlanTrack tr;
             if (u.History.TryGetValue(NetTools.MacHex(t.Mac), out tr) && tr.Samples.Count > 0)
             {
                 WlanSample l = tr.Samples[tr.Samples.Count - 1];
+                int weak = 0;
+                for (int i = Math.Max(0, tr.Samples.Count - 3); i < tr.Samples.Count; i++) if (tr.Samples[i].Signal != 0 && tr.Samples[i].Signal <= -75) weak++;
+                verdict = weak > 0 ? "WLAN verlassen bei schlechtem Empfang (" + l.Signal + " dBm an " + l.Ap + ")" : "WLAN abgemeldet (aus / Standby / außer Reichweite)";
                 return "✖ Laut UniFi-Controller nicht mehr im WLAN angemeldet (zuletzt " + l.Time.ToString("HH:mm") + " an " + l.Ap +
-                    (l.Signal != 0 ? ", Signal " + l.Signal + " dBm" : "") + "): Gerät hat das WLAN verlassen - aus, Standby, außer Reichweite.";
+                    (l.Signal != 0 ? ", Signal " + l.Signal + " dBm" : "") + "): " + (weak > 0 ? "Das Signal war vorher schwach - außer Reichweite oder Funkabbruch."
+                    : "Gerät hat das WLAN verlassen - aus, Standby oder außer Haus.");
             }
             return "";
+        }
+
+        /// <summary>Gerät ist laut UniFi ein WLAN-Client (aktuell oder im Verlauf).</summary>
+        public static bool IsWlanClient(PingTarget t)
+        {
+            UniFiSnapshot u;
+            lock (sync) u = unifi;
+            if (!u.Valid) return false;
+            UniFiClientInfo c = u.Client(t.Mac, t.Host);
+            if (c != null) return !c.Wired;
+            WlanTrack tr;
+            return u.History.TryGetValue(NetTools.MacHex(t.Mac), out tr) && tr.Samples.Count > 0;
+        }
+
+        /// <summary>Adresse gehört zu einem überwachten Switch, AP oder zur Firewall.</summary>
+        public static bool IsInfrastructure(string host)
+        {
+            lock (sync)
+                foreach (SwitchState s in switches) if (s.Address == host) return true;
+            return false;
+        }
+
+        // ------------------------------------------------ Neustarts von Switches/APs
+
+        public class Restart { public string Device = "", Why = ""; public DateTime Boot; public string Macs; }   // Macs: betroffene Geräte (null = alle)
+        static readonly List<Restart> restarts = new List<Restart>();
+
+        /// <summary>Wird bei erkanntem Neustart ausgelöst (Gerät, Startzeit, Grund, betroffene Geräte-MACs oder null = alle).</summary>
+        public static event Action<Restart> Restarted;
+
+        public static List<Restart> Restarts(TimeSpan span)
+        {
+            lock (restarts) return restarts.FindAll(delegate (Restart r) { return r.Boot >= DateTime.Now - span; });
+        }
+
+        /// <summary>Neustart festhalten (aus SNMP-Uptime oder UniFi). Firmware-Wechsel ergänzt den Grund.</summary>
+        static void NoteRestart(SwitchState s, DateTime boot, string why)
+        {
+            Restart r;
+            lock (restarts)
+            {
+                r = restarts.Find(delegate (Restart x) { return x.Device == s.Name && Math.Abs((x.Boot - boot).TotalMinutes) < 15; });
+                if (r != null)
+                {
+                    if (why.Length > 0) r.Why = why;
+                    return;
+                }
+                r = new Restart();
+                r.Device = s.Name; r.Boot = boot; r.Why = why;
+                // Verteiler (Ports zu weiteren Switches/APs): alle Geräte können betroffen sein, sonst nur die eigenen
+                bool distribution = false;
+                List<string> macs = new List<string>();
+                foreach (PortState p in s.Ports.Values)
+                {
+                    if (p.Role == "switch" || p.Role == "ap") distribution = true;
+                    if (p.DeviceMacs.Length > 0) macs.Add(p.DeviceMacs);
+                }
+                r.Macs = distribution ? null : "," + string.Join(",", macs.ToArray()) + ",";
+                restarts.Add(r);
+                restarts.RemoveAll(delegate (Restart x) { return x.Boot < DateTime.Now.AddDays(-7); });
+                newRestarts.Add(r);
+            }
+        }
+
+        static readonly List<Restart> newRestarts = new List<Restart>();
+
+        /// <summary>Neue Neustarts melden - außerhalb aller Sperren (die Empfänger sperren ihre Geräteliste).</summary>
+        static void FireRestarts()
+        {
+            List<Restart> list;
+            lock (restarts) { list = new List<Restart>(newRestarts); newRestarts.Clear(); }
+            Action<Restart> h = Restarted;
+            if (h != null) foreach (Restart r in list) try { h(r); } catch { }
+        }
+
+        static void NoteFirmware(string device, string from, string to)
+        {
+            lock (restarts)
+            {
+                Restart r = restarts.FindLast(delegate (Restart x) { return x.Device == device && x.Boot > DateTime.Now.AddMinutes(-30); });
+                if (r != null) r.Why = "Firmware-Update " + from + " → " + to;
+            }
+        }
+
+        public static bool Affects(Restart r, PingTarget t)
+        {
+            return r.Macs == null || NetTools.MacHex(t.Mac).Length == 12 && r.Macs.Contains("," + NetTools.MacHex(t.Mac) + ",");
         }
 
         /// <summary>Rangfolge für die Zuordnung: Endgeräte-Port vor Access Point vor Switch-Verbindung vor Uplink, dann wenigste MACs.</summary>
@@ -7787,7 +8474,8 @@ namespace PingMonitor
                         s.LastPoll == DateTime.MinValue ? "" : s.LastPoll.ToString(Fmt.Time), s.HasFdb ? "1" : "0",
                         Fmt.Csv(s.OwnMacs), Fmt.Csv(s.Kind), s.Cpu.ToString(), s.MemPct.ToString(), s.Connections.ToString(), Fmt.Csv(s.Load),
                         Fmt.Csv(s.SysRating.Encode()), Fmt.Csv(ArpText(s.Arp)), s.FromUniFi ? "1" : "0", string.Join(",", s.IfAddrs.ToArray()),
-                        s.Temp.ToString(), s.Overheating ? "1" : "0", s.PoeBudget.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) })).Append("\r\n");
+                        s.Temp.ToString(), s.Overheating ? "1" : "0", s.PoeBudget.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture),
+                        s.FwStates.ToString(), s.FwStatesLimit.ToString() })).Append("\r\n");
                     foreach (PortState p in s.Ports.Values)
                         sb.Append(string.Join(";", new string[] { "P", Fmt.Csv(s.Address), p.IfIndex.ToString(), Fmt.Csv(p.Name), Fmt.Csv(p.Alias),
                             p.Oper.ToString(), p.SpeedMbps.ToString(), p.Duplex.ToString(), p.RxErrors.ToString(), p.TxErrors.ToString(),
@@ -7850,6 +8538,7 @@ namespace PingMonitor
                         int.TryParse(f[21], out s.Temp); s.Overheating = f[22] == "1";
                         double.TryParse(f[23], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out s.PoeBudget);
                     }
+                    if (f.Count >= 26) { long.TryParse(f[24], out s.FwStates); long.TryParse(f[25], out s.FwStatesLimit); }
                     list.Add(s);
                 }
                 else if (f.Count >= 18 && f[0] == "P" && list.Count > 0)
@@ -8063,6 +8752,10 @@ namespace PingMonitor
             input.Controls.Add(Btn("OPNsense-API ...", delegate
             {
                 using (OpnForm f = new OpnForm()) if (f.ShowDialog(this) == DialogResult.OK) PollNow();
+            }));
+            input.Controls.Add(Btn("Proxmox-API ...", delegate
+            {
+                using (PveForm f = new PveForm()) if (f.ShowDialog(this) == DialogResult.OK) PollNow();
             }));
             input.Controls.Add(Btn("Syslog ...", delegate { using (SyslogForm f = new SyslogForm()) f.ShowDialog(this); }));
             input.Controls.Add(Btn("Diagnosedaten speichern ...", delegate { SaveDiagnostics(); }));
@@ -8942,14 +9635,18 @@ namespace PingMonitor
                 if (kv.Key.Mac.Length == 12) infraByMac[kv.Key.Mac] = kv.Value;
             }
             foreach (SwitchState s in switches)
-                if (!s.Reachable)
-                {
-                    TopoNode n = new TopoNode();
-                    n.Kind = "switch";
-                    n.Title = s.Name + "  (" + s.Address + ")  [Switch - KEINE SNMP-ANTWORT]";
-                    n.Offline = true;
-                    gwNode.Children.Add(n);
-                }
+            {
+                if (s.Reachable || s.FromUniFi) continue;
+                // Vom Controller bekannte Geräte stehen schon (mit Status "offline") an ihrem Uplink im Plan
+                bool known = false;
+                foreach (UniFiDeviceInfo d in ufNodes.Keys) if (SwitchMonitor.Matches(s, d)) known = true;
+                if (known) continue;
+                TopoNode n = new TopoNode();
+                n.Kind = s.Kind == "Access Point" ? "ap" : "switch";
+                n.Title = s.Name + "  (" + s.Address + ")  [" + s.Kind + " - KEINE SNMP-ANTWORT]";
+                n.Offline = true;
+                gwNode.Children.Add(n);
+            }
 
             // Geräte
             List<PingTarget> aps = devices.FindAll(delegate (PingTarget t) { return LooksLikeAp(t); });
@@ -9305,6 +10002,12 @@ namespace PingMonitor
                               "die PoE-Versorgung fehlt, oder das Kabel ist abgezogen/defekt.");
                     if (verdict.Length == 0) verdict = "vermutlich aus / Kabel ab (kein Link am Switch)";
                 }
+                else if (port.MaxSpeedSeen >= 1000 && port.SpeedMbps > 0 && port.SpeedMbps <= 100)
+                {
+                    lines.Add("● Switch-Port " + sw.Name + " / " + port.DisplayName + " ist von " + Links.Speed(port.MaxSpeedSeen) + " auf " + Links.Speed(port.SpeedMbps) +
+                              " gefallen: typisch für einen heruntergefahrenen PC mit Wake-on-LAN (die Netzwerkkarte bleibt mit wenig Strom aktiv).");
+                    if (verdict.Length == 0) verdict = "vermutlich aus (Port auf " + Links.Speed(port.SpeedMbps) + " gefallen - Wake-on-LAN)";
+                }
                 else if (macSeen)
                 {
                     lines.Add("● Am Switch-Port " + sw.Name + " / " + port.DisplayName + " ist der Link da und die MAC des Geräts noch bekannt: " +
@@ -9353,12 +10056,72 @@ namespace PingMonitor
                 lines.Add("● Agent auf " + ag.Pc + " meldet um " + ag.Time.ToString("HH:mm:ss") + ": " + ag.Event);
                 if (ag.Kind == "power") verdict = "vermutlich aus: " + ag.Event + " (laut Agent)";
             }
-            string wlan = SwitchMonitor.WlanDiagnosis(t);
-            if (wlan.Length > 0) lines.Add(wlan);
+            string wlanVerdict;
+            string wlan = SwitchMonitor.WlanDiagnosis(t, out wlanVerdict);
+            if (wlan.Length > 0)
+            {
+                lines.Add(wlan);
+                if (wlanVerdict.Length > 0 && (verdict.Length == 0 || verdict.StartsWith("nicht im Netz") || verdict.StartsWith("im Netz") || verdict.StartsWith("eingeschaltet")))
+                    verdict = wlanVerdict;
+            }
             else if (Topology.RandomMac(t.Mac) || Topology.MobileVendor(t.Vendor))
                 lines.Add("ⓘ Vermutlich ein WLAN-/Mobilgerät: Smartphones und Tablets trennen im Standby das WLAN oder antworten nicht auf Ping - meist kein Fehler.");
+
+            // Vorher sauber erreichbar und dann abrupt weg = ausgeschaltet; Aussetzer vorher deuten auf eine Störung.
+            if (t.LossBefore == 0) lines.Add("ⓘ Vor dem Ausfall keine Aussetzer (sauberes Ende) - typisch für Herunterfahren/Standby.");
+            else if (t.LossBefore > 3) lines.Add("▲ Vor dem Ausfall gab es bereits " + t.LossBefore + " Aussetzer - spricht eher für eine Störung als für Ausschalten.");
+            if (t.OutageStart.HasValue)
+            {
+                string habit = OfflineHistory.HabitText(t.Host, t.OutageStart.Value);
+                if (habit.Length > 0) lines.Add("ⓘ " + habit);
+            }
+            bool autoCls;
+            string cls = DeviceClass.Effective(t, out autoCls);
+            lines.Add("ⓘ Geräteklasse: " + DeviceClass.Text(cls) + (autoCls ? " (automatisch geschätzt - im Kontextmenü änderbar)" : ""));
+
+            // Neustart eines Switches/APs in diesem Zeitraum (Firmware-Update, Stromausfall)
+            if (t.OutageStart.HasValue)
+                foreach (SwitchMonitor.Restart r in SwitchMonitor.Restarts(TimeSpan.FromHours(1)))
+                    if (SwitchMonitor.Affects(r, t) && r.Boot >= t.OutageStart.Value.AddMinutes(-10) && r.Boot <= t.OutageStart.Value.AddMinutes(3))
+                    {
+                        lines.Insert(0, "● " + r.Device + " ist um " + r.Boot.ToString("HH:mm") + " neu gestartet" + (r.Why.Length > 0 ? " (" + r.Why + ")" : "") +
+                            " - der Ausfall kommt vom Neustart, nicht vom Gerät.");
+                        verdict = "Switch-Neustart: " + r.Device + (r.Why.Length > 0 ? " (" + r.Why + ")" : "");
+                    }
+
+            // Viele Geräte am selben Switch/AP gleichzeitig weg: Switch/Uplink statt einzelner Geräte
+            string mass = Mass(t, sw, port);
+            if (mass.Length > 0 && !verdict.StartsWith("Switch-Neustart"))
+            {
+                lines.Insert(0, "✖ " + mass);
+                verdict = "mehrere Geräte an " + sw.Name + " gleichzeitig weg";
+            }
             if (verdict.Length == 0) verdict = "Ursache unklar";
             details = string.Join("\r\n", lines.ToArray());
+        }
+
+        /// <summary>Sind am selben Switch/AP zur gleichen Zeit (±90 s) mindestens zwei weitere Geräte ausgefallen?</summary>
+        static string Mass(PingTarget t, SwitchState sw, PortState port)
+        {
+            Func<List<PingTarget>> f = SwitchMonitor.Targets;
+            if (f == null || sw == null || !t.OutageStart.HasValue) return "";
+            if (port != null && !port.Up && sw.Reachable) return "";   // eigener Port ohne Link: einzelnes Gerät aus
+            List<string> names = new List<string>();
+            List<PingTarget> all;
+            try { all = f(); } catch { return ""; }
+            foreach (PingTarget o in all)
+            {
+                if (o == t || o.Host == t.Host) continue;
+                PingTarget v = o.Running ? o : o.ServiceView;
+                if (v == null || !v.OutageStart.HasValue || Math.Abs((v.OutageStart.Value - t.OutageStart.Value).TotalSeconds) > 90) continue;
+                string m = NetTools.MacHex(o.Mac);
+                if (m.Length != 12) continue;
+                foreach (PortState p in sw.Ports.Values)
+                    if (("," + p.DeviceMacs + ",").Contains("," + m + ",")) { names.Add(o.Name); break; }
+            }
+            if (names.Count < 2) return "";
+            return (names.Count + 1) + " Geräte an " + sw.Name + " sind gleichzeitig ausgefallen (" + string.Join(", ", names.ToArray()) +
+                ") - eher Switch/AP, Uplink oder Stromversorgung als die einzelnen Geräte.";
         }
     }
 
@@ -10866,6 +11629,8 @@ namespace PingMonitor
         public readonly Dictionary<string, string> ArpIntf = new Dictionary<string, string>();   // IP -> Schnittstelle ("igb1 (LAN)")
         public string Error = "";
         public string ArpError = "";     // warum keine ARP-Einträge (nur für "Verbindung testen")
+        public long States = -1, StatesLimit = -1;   // pf-State-Tabelle: aktuelle Einträge und Obergrenze
+        public string StatesError = "";
         public DateTime Fetched = DateTime.MinValue;
         public bool Valid { get { return Fetched != DateTime.MinValue && Error.Length == 0; } }
 
@@ -10876,6 +11641,7 @@ namespace PingMonitor
         {
             StringBuilder sb = new StringBuilder();
             sb.Append("OE;" + Fmt.Csv(Error) + ";" + (Fetched == DateTime.MinValue ? "" : Fetched.ToString(Fmt.Time)) + "\r\n");
+            sb.Append("OS;" + States + ";" + StatesLimit + ";" + Fmt.Csv(StatesError) + "\r\n");
             System.Globalization.CultureInfo ci = System.Globalization.CultureInfo.InvariantCulture;
             foreach (OpnGateway g in Gateways)
                 sb.Append(string.Join(";", new string[] { "OG", Fmt.Csv(g.Name), g.Address, g.Monitor, Fmt.Csv(g.Status), g.Loss.ToString(ci), g.Delay.ToString(ci), g.StdDev.ToString(ci) })).Append("\r\n");
@@ -10920,6 +11686,10 @@ namespace PingMonitor
                     OpnLease l = new OpnLease();
                     l.Ip = f[1]; l.Mac = f[2]; l.Host = f[3]; l.End = f[4]; l.Kind = f[5];
                     o.Leases.Add(l);
+                }
+                else if (f[0] == "OS" && f.Count >= 4)
+                {
+                    long.TryParse(f[1], out o.States); long.TryParse(f[2], out o.StatesLimit); o.StatesError = f[3];
                 }
                 else if (f[0] == "OA" && f.Count >= 3)
                 {
@@ -10986,8 +11756,55 @@ namespace PingMonitor
                 if (!Arp(o, url + "/api/diagnostics/interface/search_arp", "{\"current\":1,\"rowCount\":-1,\"searchPhrase\":\"\"}", auth, tried) || o.Arp.Count == 0)
                     Arp(o, url + "/api/diagnostics/interface/search_arp", null, auth, tried);
             if (o.Arp.Count == 0) o.ArpError = string.Join(", ", tried.ToArray());
+            States(o, url, auth);
             o.Fetched = DateTime.Now;
             return o;
+        }
+
+        /// <summary>
+        /// Anzahl der Verbindungen durch die Firewall (pf-State-Tabelle) und deren Obergrenze. Rechte: "Diagnostics: pfInfo"
+        /// bzw. "Diagnostics: Show States". Fehlt das Recht, bleibt der Wert leer (kein Fehler für die übrige Abfrage).
+        /// </summary>
+        static void States(OpnSnapshot o, string url, string auth)
+        {
+            int status;
+            string json;
+            List<string> tried = new List<string>();
+            if (Get(url + "/api/diagnostics/firewall/pf_statistics/info", auth, out status, out json))
+                try { o.States = FindNum(Json.Parse(json), "", new string[] { "current", "entries" }); } catch { }
+            else tried.Add("pf_statistics: " + (status == 0 ? json : "HTTP " + status));
+            if (o.States < 0 && Get(url + "/api/diagnostics/firewall/query_states", auth, out status, out json, "{\"current\":1,\"rowCount\":1,\"searchPhrase\":\"\"}"))
+                try { o.States = (long)Json.N(Json.Parse(json) as Dictionary<string, object>, "total", -1); } catch { }
+            else if (o.States < 0) tried.Add("query_states: " + (status == 0 ? json : "HTTP " + status));
+            if (Get(url + "/api/diagnostics/firewall/pf_statistics/memory", auth, out status, out json))
+                try { o.StatesLimit = FindNum(Json.Parse(json), "", new string[] { "states" }); } catch { }
+            if (o.States < 0)
+                o.StatesError = string.Join(", ", tried.ToArray()) + (tried.Exists(delegate (string x) { return x.Contains("HTTP 403") || x.Contains("HTTP 401"); })
+                    ? " - Recht \"Diagnostics: pfInfo\" bzw. \"Diagnostics: Show States\" fehlt" : "");
+        }
+
+        /// <summary>Erste Zahl im JSON, deren Pfad (Schlüssel, klein, ohne Sonderzeichen) alle Begriffe enthält.</summary>
+        static long FindNum(object node, string path, string[] tokens)
+        {
+            Dictionary<string, object> d = node as Dictionary<string, object>;
+            if (d != null)
+            {
+                foreach (KeyValuePair<string, object> kv in d)
+                {
+                    long v = FindNum(kv.Value, path + "/" + kv.Key.ToLowerInvariant(), tokens);
+                    if (v >= 0) return v;
+                }
+                return -1;
+            }
+            List<object> l = node as List<object>;
+            if (l != null)
+            {
+                foreach (object x in l) { long v = FindNum(x, path, tokens); if (v >= 0) return v; }
+                return -1;
+            }
+            foreach (string t in tokens) if (path.IndexOf(t, StringComparison.Ordinal) < 0) return -1;
+            double n = Num(Convert.ToString(node, System.Globalization.CultureInfo.InvariantCulture));
+            return n >= 0 ? (long)n : -1;
         }
 
         static bool Arp(OpnSnapshot o, string url, string post, string auth, List<string> tried)
@@ -11056,7 +11873,7 @@ namespace PingMonitor
             return Get(url, auth, out status, out body, null);
         }
 
-        static bool Get(string url, string auth, out int status, out string body, string post)
+        public static bool Get(string url, string auth, out int status, out string body, string post)
         {
             status = 0; body = "";
             try
@@ -11098,6 +11915,240 @@ namespace PingMonitor
     }
 
     /// <summary>Zugang zur OPNsense-API.</summary>
+    class PveIface { public string Node = "", Name = "", Type = "", Cidr = "", Ports = "", Comment = ""; public bool Active; }
+    class PveNode { public string Name = "", Ip = "", Ring0 = "", Ring1 = ""; public bool Online; }
+
+    /// <summary>Proxmox-Cluster laut API (nur lesend): Quorum, Knoten, Corosync-Links, Netzwerkkonfiguration.</summary>
+    class PveSnapshot
+    {
+        public string Cluster = "", Error = "";
+        public bool Quorate = true, HasCluster;
+        public DateTime Fetched = DateTime.MinValue;
+        public readonly List<PveNode> Nodes = new List<PveNode>();
+        public readonly List<PveIface> Ifaces = new List<PveIface>();
+        public string NetError = "";
+        public bool Valid { get { return Fetched != DateTime.MinValue && Error.Length == 0; } }
+
+        public string Summary
+        {
+            get
+            {
+                if (!Valid) return "Fehler: " + Error;
+                int on = Nodes.FindAll(delegate (PveNode n) { return n.Online; }).Count;
+                return (HasCluster ? "Cluster " + Cluster + ", " : "") + on + " von " + Nodes.Count + " Knoten online" + (HasCluster ? ", Quorum " + (Quorate ? "OK" : "VERLOREN") : "") +
+                    ", " + Ifaces.Count + " Schnittstellen" + (NetError.Length > 0 ? " (Netzwerk: " + NetError + ")" : "");
+            }
+        }
+
+        public string Serialize()
+        {
+            return "PV;" + Fmt.Csv(Error) + ";" + (Fetched == DateTime.MinValue ? "" : Fetched.ToString(Fmt.Time)) + ";" + Fmt.Csv(Valid ? Summary : "") + "\r\n";
+        }
+
+        public static string SummaryFrom(string[] lines)
+        {
+            foreach (string l in lines)
+                if (l.StartsWith("PV;"))
+                {
+                    List<string> f = Fmt.ParseCsv(l);
+                    if (f.Count >= 4) return f[1].Length > 0 ? "Fehler: " + f[1] : f[3];
+                }
+            return "";
+        }
+    }
+
+    static class Pve
+    {
+        public static bool Configured { get { return Config.Cached("Proxmox.Url", "").Length > 0; } }
+
+        public static PveSnapshot Fetch()
+        {
+            Dictionary<string, string> d = Config.LoadSettings();
+            return Fetch(Config.Get(d, "Proxmox.Url", ""), Config.Get(d, "Proxmox.Token", ""), NotifyConfig.Unprotect(Config.Get(d, "Proxmox.Secret", "")));
+        }
+
+        public static PveSnapshot Fetch(string url, string token, string secret)
+        {
+            PveSnapshot p = new PveSnapshot();
+            url = url.Trim().TrimEnd('/');
+            if (url.Length == 0) { p.Error = "Keine Adresse eingetragen."; return p; }
+            if (!url.Contains("://")) url = "https://" + url;
+            if (!System.Text.RegularExpressions.Regex.IsMatch(url, @"://[^/]+:\d+")) url += ":8006";
+            string auth = "PVEAPIToken=" + token.Trim() + "=" + secret.Trim();
+            int status;
+            string json;
+            if (!Opn.Get(url + "/api2/json/cluster/status", auth, out status, out json, null))
+            {
+                p.Error = status == 0 ? json : status == 401 ? "Anmeldung abgelehnt (Token-ID/Geheimnis prüfen)" : status == 403 ? "Keine Rechte (Rolle PVEAuditor auf \"/\" vergeben)" : "HTTP " + status;
+                return p;
+            }
+            try
+            {
+                foreach (object x in Json.Arr(Json.Parse(json) as Dictionary<string, object>, "data"))
+                {
+                    Dictionary<string, object> e = x as Dictionary<string, object>;
+                    if (e == null) continue;
+                    if (Json.S(e, "type") == "cluster") { p.HasCluster = true; p.Cluster = Json.S(e, "name"); p.Quorate = Json.N(e, "quorate", 1) != 0; }
+                    else if (Json.S(e, "type") == "node")
+                    {
+                        PveNode n = new PveNode(); n.Name = Json.S(e, "name"); n.Ip = Json.S(e, "ip"); n.Online = Json.N(e, "online", 0) != 0;
+                        p.Nodes.Add(n);
+                    }
+                }
+            }
+            catch (Exception ex) { p.Error = "Cluster-Status nicht lesbar: " + ex.Message; return p; }
+            // Corosync-Links je Knoten
+            if (p.HasCluster && Opn.Get(url + "/api2/json/cluster/config/nodes", auth, out status, out json, null))
+                try
+                {
+                    foreach (object x in Json.Arr(Json.Parse(json) as Dictionary<string, object>, "data"))
+                    {
+                        Dictionary<string, object> e = x as Dictionary<string, object>;
+                        PveNode n = e == null ? null : p.Nodes.Find(delegate (PveNode k) { return k.Name == Json.S(e, "node"); });
+                        if (n == null) continue;
+                        n.Ring0 = Json.S(e, "ring0_addr").Length > 0 ? Json.S(e, "ring0_addr") : Json.S(e, "link0");
+                        n.Ring1 = Json.S(e, "ring1_addr").Length > 0 ? Json.S(e, "ring1_addr") : Json.S(e, "link1");
+                    }
+                }
+                catch { }
+            // Netzwerkkonfiguration je Knoten
+            foreach (PveNode n in p.Nodes)
+            {
+                if (!n.Online) continue;
+                if (!Opn.Get(url + "/api2/json/nodes/" + Uri.EscapeDataString(n.Name) + "/network", auth, out status, out json, null))
+                {
+                    p.NetError = status == 403 ? "Recht Sys.Audit fehlt" : status == 0 ? json : "HTTP " + status;
+                    continue;
+                }
+                try
+                {
+                    foreach (object x in Json.Arr(Json.Parse(json) as Dictionary<string, object>, "data"))
+                    {
+                        Dictionary<string, object> e = x as Dictionary<string, object>;
+                        if (e == null) continue;
+                        PveIface i = new PveIface();
+                        i.Node = n.Name; i.Name = Json.S(e, "iface"); i.Type = Json.S(e, "type");
+                        i.Cidr = Json.S(e, "cidr");
+                        if (i.Cidr.Length == 0 && Json.S(e, "address").Length > 0) i.Cidr = Json.S(e, "address") + "/" + Bits(Json.S(e, "netmask"));
+                        i.Ports = Json.S(e, "bridge_ports").Length > 0 ? Json.S(e, "bridge_ports") : Json.S(e, "slaves");
+                        i.Comment = Json.S(e, "comments").Trim();
+                        i.Active = Json.N(e, "active", 0) != 0;
+                        p.Ifaces.Add(i);
+                    }
+                }
+                catch { }
+            }
+            p.Fetched = DateTime.Now;
+            return p;
+        }
+
+        static string Bits(string mask)
+        {
+            int b;
+            if (int.TryParse(mask, out b)) return mask;
+            IPAddress a;
+            if (!IPAddress.TryParse(mask, out a)) return "24";
+            int n = 0;
+            foreach (byte x in a.GetAddressBytes()) for (int k = 7; k >= 0; k--) if ((x >> k & 1) == 1) n++;
+            return n.ToString();
+        }
+
+        /// <summary>Netzadresse "a.b.c.d/bits" einer IPv4-CIDR-Angabe, sonst "".</summary>
+        public static string Network(string cidr)
+        {
+            string[] f = cidr.Split('/');
+            IPAddress a;
+            int bits;
+            if (f.Length != 2 || !IPAddress.TryParse(f[0], out a) || a.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork || !int.TryParse(f[1], out bits)) return "";
+            byte[] b = a.GetAddressBytes();
+            uint v = (uint)(b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]);
+            uint m = bits <= 0 ? 0 : bits >= 32 ? 0xFFFFFFFF : 0xFFFFFFFF << (32 - bits);
+            v &= m;
+            return (v >> 24) + "." + (v >> 16 & 255) + "." + (v >> 8 & 255) + "." + (v & 255) + "/" + bits;
+        }
+    }
+
+    class PveForm : Form
+    {
+        TextBox txtUrl, txtToken, txtSecret;
+
+        public PveForm()
+        {
+            Text = "Proxmox-API";
+            Font = new Font("Segoe UI", 9.5F);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            TableLayoutPanel t = new TableLayoutPanel();
+            t.ColumnCount = 2; t.AutoSize = true; t.Padding = new Padding(12);
+            Label intro = new Label();
+            intro.AutoSize = true;
+            intro.MaximumSize = new Size(600, 0);
+            intro.Text = "Über die API prüft PingMonitor den Proxmox-Cluster (nur lesend): Quorum und Knoten, Anzahl der Corosync-Links, " +
+                "zwei IP-Adressen im selben Subnetz auf einem Host (ARP-Flux) und Bridges, die auf den Knoten Unterschiedliches bedeuten.\r\n" +
+                "Einrichten: Rechenzentrum → Berechtigungen → API-Token → Hinzufügen (z. B. Benutzer root@pam, Token-ID \"pingmonitor\", " +
+                "\"Privilegientrennung\" an), dann Berechtigungen → Hinzufügen → API-Token-Berechtigung: Pfad \"/\", Rolle \"PVEAuditor\". " +
+                "Adresse: ein beliebiger Knoten, z. B. https://192.168.100.240:8006";
+            t.Controls.Add(intro, 0, 0); t.SetColumnSpan(intro, 2);
+            Dictionary<string, string> d = Config.LoadSettings();
+            txtUrl = Row(t, 1, "Adresse:", Config.Get(d, "Proxmox.Url", ""), 300);
+            txtToken = Row(t, 2, "Token-ID:", Config.Get(d, "Proxmox.Token", ""), 300);
+            Label hint = new Label(); hint.AutoSize = true; hint.ForeColor = SystemColors.GrayText; hint.Text = "Form: benutzer@realm!tokenname, z. B. root@pam!pingmonitor";
+            t.Controls.Add(hint, 1, 3);
+            txtSecret = Row(t, 4, "Geheimnis (UUID):", NotifyConfig.Unprotect(Config.Get(d, "Proxmox.Secret", "")), 300);
+            txtSecret.UseSystemPasswordChar = true;
+            FlowLayoutPanel b = new FlowLayoutPanel(); b.AutoSize = true; b.Margin = new Padding(0, 10, 0, 0);
+            Button test = new Button(); test.Text = "Verbindung testen"; test.AutoSize = true;
+            test.Click += delegate
+            {
+                Cursor = Cursors.WaitCursor;
+                PveSnapshot p = Pve.Fetch(txtUrl.Text, txtToken.Text, txtSecret.Text);
+                Cursor = Cursors.Default;
+                StringBuilder sb = new StringBuilder();
+                if (!p.Valid) sb.Append("Keine Verbindung:\n" + p.Error);
+                else
+                {
+                    sb.AppendLine("Verbindung OK: " + p.Summary + "\n");
+                    foreach (PveNode n in p.Nodes)
+                        sb.AppendLine(n.Name + " (" + n.Ip + "): " + (n.Online ? "online" : "OFFLINE") + (n.Ring0.Length > 0 ? ", Corosync " + n.Ring0 + (n.Ring1.Length > 0 ? " + " + n.Ring1 : " (nur ein Link)") : ""));
+                    foreach (Issue i in Issues.ProxmoxFindings(p)) sb.AppendLine("\n▲ " + i.Title);
+                }
+                MessageBox.Show(this, sb.ToString(), Text, MessageBoxButtons.OK, p.Valid ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+            };
+            Button save = new Button(); save.Text = "Speichern"; save.AutoSize = true;
+            save.Click += delegate { Save(txtUrl.Text.Trim()); };
+            Button off = new Button(); off.Text = "API nicht verwenden"; off.AutoSize = true;
+            off.Click += delegate { Save(""); };
+            Button cancel = new Button(); cancel.Text = "Abbrechen"; cancel.AutoSize = true; cancel.DialogResult = DialogResult.Cancel;
+            b.Controls.Add(test); b.Controls.Add(save); b.Controls.Add(off); b.Controls.Add(cancel);
+            t.Controls.Add(b, 0, 5); t.SetColumnSpan(b, 2);
+            Controls.Add(t);
+            CancelButton = cancel;
+        }
+
+        static TextBox Row(TableLayoutPanel t, int row, string label, string value, int width)
+        {
+            Label l = new Label(); l.Text = label; l.AutoSize = true; l.Margin = new Padding(3, 7, 3, 3);
+            TextBox x = new TextBox(); x.Text = value; x.Width = width;
+            t.Controls.Add(l, 0, row); t.Controls.Add(x, 1, row);
+            return x;
+        }
+
+        void Save(string url)
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            d["Proxmox.Url"] = url;
+            d["Proxmox.Token"] = txtToken.Text.Trim();
+            d["Proxmox.Secret"] = NotifyConfig.Protect(txtSecret.Text.Trim());
+            try { Config.SaveSettings(d); }
+            catch (Exception ex) { MessageBox.Show(this, ex.Message, Text); return; }
+            SwitchMonitor.PollNow();
+            DialogResult = DialogResult.OK;
+        }
+    }
+
     class OpnForm : Form
     {
         TextBox txtUrl, txtKey, txtSecret;
@@ -11119,7 +12170,7 @@ namespace PingMonitor
             intro.Text = "Über die API liefert die OPNsense: Gateway-Überwachung (Paketverlust und Latenz zum Provider), DHCP-Leases (Namen, " +
                 "MAC-Adressen) und die ARP-Tabelle - auch ohne SNMP. PingMonitor liest nur.\r\n" +
                 "Einrichten: System → Zugang → Benutzer → eigenen Benutzer anlegen, Gruppe/Rechte nur lesend (\"Status: Gateways\", " +
-                "\"Diagnostics: ARP Table\", \"Services: DHCP(v4): Leases\" bzw. Kea/Dnsmasq), dann beim Benutzer \"API-Schlüssel\" erzeugen. " +
+                "\"Diagnostics: ARP Table\", \"Services: DHCP(v4): Leases\" bzw. Kea/Dnsmasq, optional \"Diagnostics: pfInfo\" für die Anzahl der Verbindungen), dann beim Benutzer \"API-Schlüssel\" erzeugen. " +
                 "Die heruntergeladene Datei enthält key und secret.";
             t.Controls.Add(intro, 0, 0); t.SetColumnSpan(intro, 2);
             Dictionary<string, string> d = Config.LoadSettings();
@@ -11143,6 +12194,8 @@ namespace PingMonitor
                         sb.AppendLine("Gateway " + g.Name + ": " + g.Status + (g.Loss >= 0 ? ", Verlust " + g.Loss + " %" : "") + (g.Delay >= 0 ? ", Latenz " + g.Delay + " ms" : ""));
                     sb.AppendLine(o.Leases.Count + " DHCP-Leases, " + o.Arp.Count + " ARP-Einträge");
                     if (o.Arp.Count == 0 && o.ArpError.Length > 0) sb.AppendLine("ARP-Abfrage: " + o.ArpError);
+                    sb.AppendLine(o.States >= 0 ? o.States + " Verbindungen durch die Firewall (State-Tabelle" + (o.StatesLimit > 0 ? ", Grenze " + o.StatesLimit : "") + ")"
+                                                : "Verbindungen (States): nicht lesbar" + (o.StatesError.Length > 0 ? " - " + o.StatesError : "") + " (optional)");
                     if (o.Leases.Count == 0) sb.AppendLine("(Keine Leases lesbar - Rechte für DHCP/Kea/Dnsmasq prüfen.)");
                 }
                 MessageBox.Show(this, sb.ToString(), Text, MessageBoxButtons.OK, o.Valid ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
@@ -14226,6 +15279,8 @@ namespace PingMonitor
     /// </summary>
     static class UniFi
     {
+        static readonly Dictionary<string, KeyValuePair<string, int>> lastUplink = new Dictionary<string, KeyValuePair<string, int>>();
+
         public static bool Configured { get { return Config.Cached("UniFi.Url", "").Length > 0; } }
 
         public static UniFiSnapshot Fetch()
@@ -14474,12 +15529,23 @@ namespace PingMonitor
                 }
                 x.Overheating = Json.B(d, "overheating");
                 x.PoeBudget = Json.N(d, "total_max_power", -1);
-                Dictionary<string, object> up = Json.Obj(d, "uplink") ?? Json.Obj(d, "last_uplink");
+                Dictionary<string, object> up = Json.Obj(d, "uplink");
+                if (up == null || Json.S(up, "uplink_mac").Length == 0) up = Json.Obj(d, "last_uplink") ?? up;   // offline: letzter bekannter Uplink
                 if (up != null)
                 {
                     x.UplinkMac = NetTools.MacHex(Json.S(up, "uplink_mac"));
                     x.UplinkPort = (int)Json.N(up, "uplink_remote_port", 0);
                     x.UplinkSpeed = (int)Json.N(up, "speed", 0);
+                }
+                // Uplink merken - ein offline gemeldetes Gerät bleibt im Netzplan an seinem letzten Platz
+                lock (lastUplink)
+                {
+                    if (x.UplinkMac.Length == 12) lastUplink[x.Mac] = new KeyValuePair<string, int>(x.UplinkMac, x.UplinkPort);
+                    else
+                    {
+                        KeyValuePair<string, int> lu;
+                        if (lastUplink.TryGetValue(x.Mac, out lu)) { x.UplinkMac = lu.Key; x.UplinkPort = lu.Value; }
+                    }
                 }
                 foreach (object po in Json.Arr(d, "port_table"))
                 {
@@ -14844,7 +15910,8 @@ namespace PingMonitor
                 add(all.Contains("Agent"), "Agent");
                 add(all.Contains("Mitschnitt") || Kind == "capture", "Mitschnitt");
                 add(all.Contains("Netzwerk-Werkzeuge"), "Werkzeuge");
-                add(Kind == "conflict", "Abgleich");
+                add(all.Contains("Proxmox") || all.Contains("Corosync"), "Proxmox");
+                add(Kind == "conflict" || Kind == "arpflux", "Abgleich");
                 return r.Count > 0 ? string.Join(" + ", r.ToArray()) : "-";
             }
         }
@@ -14967,6 +16034,7 @@ namespace PingMonitor
                 List<Issue> found = new List<Issue>();
                 try { DetectPorts(found); } catch { }
                 try { DetectDevices(found); } catch { }
+                try { PveSnapshot pv = SwitchMonitor.CurrentPve(); if (pv.Valid) found.AddRange(ProxmoxFindings(pv)); } catch { }
                 try { DetectNetwork(found); } catch { }
                 try { DetectThisPc(found); } catch { }
                 foreach (SwitchMonitor.Conflict c in conflicts) try { found.Add(ConflictIssue(c)); } catch { }
@@ -15319,6 +16387,9 @@ namespace PingMonitor
                 if (!s.Reachable) continue;
                 if (s.Cpu >= 75 || s.MemPct >= 90) found.Add(LoadIssue(s));   // nur CPU/RAM - STP-Änderungen sind ein eigener Befund
                 if (s.Overheating || s.Temp >= 85) found.Add(TempIssue(s));
+                List<SwitchMonitor.Restart> rs = SwitchMonitor.Restarts(TimeSpan.FromDays(1)).FindAll(delegate (SwitchMonitor.Restart r) { return r.Device == s.Name; });
+                if (rs.Count > 0) found.Add(RestartIssue(s, rs));
+                if (s.FwStates > 0 && s.FwStatesLimit > 0 && s.FwStates >= s.FwStatesLimit * 0.8) found.Add(StatesIssue(s));
                 if (s.PoeBudget > 0 && s.PoeUsed >= 0.85 * s.PoeBudget) found.Add(PoeIssue(s));
                 int flood = 0; List<string> floodPorts = new List<string>(); double floodMax = 0;
                 foreach (PortState p in s.Ports.Values)
@@ -15357,7 +16428,7 @@ namespace PingMonitor
                     int flaps = p.FlapsSince(TimeSpan.FromDays(1));
                     if (flaps > 0) found.Add(FlapIssue(s, p, pk, flaps));
                     if (p.Up && p.SpeedMbps > 0 && p.SpeedMbps < 1000 && s.Kind != "Firewall" && !p.IsWan &&
-                        (p.IsInfrastructure || p.Role == "ap" || p.MaxSpeedSeen >= 1000))
+                        (p.IsInfrastructure || p.Role == "ap" || p.MaxSpeedSeen >= 1000) && !EndDeviceOff(p))
                         found.Add(SlowIssue(s, p, pk));
                     int bcN = 0, bcHigh = 0, bcStorm = 0; double bcSum = 0;
                     foreach (double x in p.RecentBcast) { bcN++; bcSum += x; if (x >= 300) bcHigh++; if (x >= 2000) bcStorm++; }
@@ -15524,6 +16595,19 @@ namespace PingMonitor
             i.Read.Add("Nur Sekunden weg, Gerät läuft durch → Kabel/Stecker/Dose.");
             i.Read.Add("Zeitgleich mit Standby/Aufwachen des Geräts → Energiesparen (harmlos, wenn gewollt).");
             return i;
+        }
+
+        /// <summary>Endgeräte-Port, dessen Gerät gerade aus ist (PC mit Wake-on-LAN läuft dann mit 10/100 Mbit) - kein Kabelfehler.</summary>
+        static bool EndDeviceOff(PortState p)
+        {
+            if (p.IsInfrastructure || p.Role.Length > 0 || p.DeviceMacs.Length == 0) return false;
+            string macs = "," + p.DeviceMacs + ",";
+            foreach (PingTarget t in hosts)
+            {
+                PingTarget v = t.Running ? t : t.ServiceView != null ? t.ServiceView : t;
+                if (NetTools.MacHex(t.Mac).Length == 12 && macs.Contains("," + NetTools.MacHex(t.Mac) + ",") && v.OutageStart.HasValue) return true;
+            }
+            return false;
         }
 
         static Issue SlowIssue(SwitchState s, PortState p, string pk)
@@ -15783,6 +16867,55 @@ namespace PingMonitor
             i.Fix.Add("Switch mit größerem PoE-Budget einsetzen.");
             i.Fix.Add("Nicht benötigtes PoE an Ports ohne PoE-Gerät abschalten; Priorität für wichtige Geräte setzen.");
             i.Read.Add("Verbrauch dauerhaft unter 85 % und keine Link-Wechsel an PoE-Ports → behoben.");
+            return i;
+        }
+
+        /// <summary>Neustart eines Switches/APs (Uptime zurückgesetzt): einmal mit Firmware-Update = Info, mehrfach ohne Update = Warnung.</summary>
+        static Issue RestartIssue(SwitchState s, List<SwitchMonitor.Restart> rs)
+        {
+            int unexplained = rs.FindAll(delegate (SwitchMonitor.Restart r) { return r.Why.Length == 0; }).Count;
+            SwitchMonitor.Restart last = rs[rs.Count - 1];
+            bool unstable = unexplained >= 2;
+            Issue i = New("restart", s.Address, "Netz", unstable ? s.Kind + " startet wiederholt neu (" + rs.Count + "× in 24 h)" :
+                s.Kind + " neu gestartet" + (last.Why.Length > 0 ? " (" + last.Why + ")" : ""), s.Name + " (" + s.Address + ")",
+                unstable ? Finding.Warning : Finding.Info, Issue.Certain);
+            i.Ref = s.Address; i.Occurred = last.Boot;
+            foreach (SwitchMonitor.Restart r in rs)
+                i.Evidence.Add("Neustart um " + r.Boot.ToString("dd.MM. HH:mm") + " (Laufzeit zurückgesetzt" + (r.Why.Length > 0 ? ", " + r.Why : "") + ")");
+            i.Evidence.Add("Ausfälle der angeschlossenen Geräte in diesem Zeitfenster zählen nicht als Störung/Instabilität (im Protokoll als \"" + Outages.EvRestart + "\" vermerkt)");
+            if (unstable)
+            {
+                i.Causes.Add("Stromversorgung: Netzteil, USV, Steckdosenleiste, PoE-Versorgung durch den vorgelagerten Switch");
+                i.Causes.Add("Absturz durch Firmware-Fehler oder Überhitzung");
+                i.Causes.Add("Automatische Neustarts/Updates im Controller geplant");
+                i.Fix.Add("Stromversorgung prüfen (anderes Netzteil/Steckdose, USV-Protokoll), bei PoE-Speisung den PoE-Port und das Budget des speisenden Switches prüfen.");
+                i.Fix.Add("Firmware aktualisieren bzw. Controller-Ereignisse und Geräteprotokoll (Syslog) zum Zeitpunkt des Neustarts ansehen.");
+                i.Read.Add("Keine weiteren Neustarts in 24 h → behoben.");
+            }
+            else
+            {
+                i.Causes.Add(last.Why.Length > 0 ? "Geplantes Firmware-Update" : "Firmware-Update, manueller Neustart, kurzer Stromausfall oder PoE-Unterbrechung");
+                i.Fix.Add("Nichts zu tun, wenn der Neustart gewollt war. Updates nacheinander statt gleichzeitig einspielen, damit Cluster/Server nicht alle Verbindungen gleichzeitig verlieren.");
+                i.Read.Add("Der Hinweis verschwindet nach 24 h.");
+            }
+            return i;
+        }
+
+        static Issue StatesIssue(SwitchState s)
+        {
+            string key = "states|" + s.Address;
+            double pct = 100.0 * s.FwStates / s.FwStatesLimit;
+            Issue i = New("states", s.Address, "Netz", "State-Tabelle der Firewall zu " + pct.ToString("0") + " % voll", s.Name + " (" + s.Address + ")",
+                pct >= 95 ? Finding.Problem : Finding.Warning, RoundsOf(key) >= 2 ? Issue.Certain : Issue.Likely);
+            i.Ref = s.Address; i.Occurred = DateTime.Now;
+            i.Evidence.Add("OPNsense-API: " + s.FwStates + " von maximal " + s.FwStatesLimit + " Verbindungen (States)" + (RoundsOf(key) >= 2 ? " - in " + RoundsOf(key) + " Abfragen" : ""));
+            i.Causes.Add("Ein Gerät baut sehr viele Verbindungen auf (Schadsoftware, Torrent, fehlerhafter Dienst, Scan)");
+            i.Causes.Add("Angriff von außen (viele eingehende Verbindungen) oder zu lange Zeitüberschreitungen für UDP/TCP");
+            i.Causes.Add("Obergrenze für die Netzgröße zu niedrig eingestellt");
+            i.Fix.Add("OPNsense → Firewall → Diagnose → Zustände (States): nach Quell-IP sortieren - welches Gerät hat die meisten Verbindungen?");
+            i.Fix.Add("Verursacher prüfen/abschalten; ggf. Regel mit \"Max. States pro Host\" anlegen.");
+            i.Fix.Add("Erst wenn alles legitim ist: Firewall → Einstellungen → Erweitert → \"Firewall Maximum States\" erhöhen (RAM beachten).");
+            i.Read.Add("Unter 80 % in den nächsten Abfragen → behoben. Ist die Tabelle voll, werden neue Verbindungen verworfen (\"Internet hängt\").");
             return i;
         }
 
@@ -16373,6 +17506,7 @@ namespace PingMonitor
 
         static Issue ConflictIssue(SwitchMonitor.Conflict c)
         {
+            if (c.Key.StartsWith("flux|")) return FluxIssue(c);
             Issue i = New("conflict", c.Key, "Datenquellen", "Widerspruch: " + c.Title, c.Ref.Length > 0 ? c.Ref : "Datenquellen", c.Level >= Finding.Warning ? Finding.Warning : Finding.Info, Issue.Likely);
             i.Ref = c.Ref; i.Occurred = DateTime.Now;
             i.Evidence.Add(c.Detail);
@@ -16381,6 +17515,136 @@ namespace PingMonitor
             i.Fix.Add("In den Belegen nachsehen, welche Quelle was meldet; im Zweifel gilt die eigene Messung (Ping/ARP) vor dem Live-Zustand des Switches vor dem Controller.");
             i.Fix.Add("Gerät in der Liste aktualisieren (Aktualisieren) bzw. Konfiguration anpassen.");
             i.Read.Add("Der Widerspruch verschwindet von selbst, sobald die Quellen wieder übereinstimmen.");
+            return i;
+        }
+
+        /// <summary>Befunde aus der Proxmox-API: Quorum, Knoten offline, nur ein Corosync-Link, zwei IPs im selben Subnetz, Bridges uneinheitlich.</summary>
+        public static List<Issue> ProxmoxFindings(PveSnapshot p)
+        {
+            List<Issue> r = new List<Issue>();
+            string cl = p.HasCluster ? "Proxmox-Cluster " + p.Cluster : "Proxmox";
+            if (p.HasCluster && !p.Quorate)
+            {
+                Issue i = New("pvequorum", p.Cluster, "Server", "Proxmox-Cluster ohne Quorum", cl, Finding.Problem, Issue.Certain);
+                i.Occurred = DateTime.Now;
+                i.Evidence.Add("Proxmox-API: quorate = 0 - " + p.Summary);
+                i.Causes.Add("Knoten ausgefallen bzw. Netzwerkverbindung zwischen den Knoten (Corosync) unterbrochen, z. B. durch Switch-Neustart");
+                i.Fix.Add("Auf einem Knoten: pvecm status und journalctl -u corosync - welche Links sind down?");
+                i.Fix.Add("Netzwerkverbindung der Knoten (Switch, Kabel, VLAN) prüfen; ausgefallene Knoten starten.");
+                i.Read.Add("Quorum wieder vorhanden → behoben. Ohne Quorum starten/migrieren keine VMs, HA kann Knoten neu starten (Fencing).");
+                r.Add(i);
+            }
+            foreach (PveNode n in p.Nodes)
+                if (!n.Online)
+                {
+                    Issue i = New("pvenode", n.Name, "Server", "Proxmox-Knoten " + n.Name + " offline", n.Name + (n.Ip.Length > 0 ? " (" + n.Ip + ")" : ""), Finding.Problem, Issue.Certain);
+                    i.Ref = n.Ip; i.Occurred = DateTime.Now;
+                    i.Evidence.Add("Proxmox-API (" + cl + "): Knoten " + n.Name + " ist nicht online");
+                    i.Causes.Add("Knoten ausgeschaltet/abgestürzt oder Corosync-Verbindung unterbrochen");
+                    i.Fix.Add("Knoten per Konsole/IPMI prüfen; auf einem anderen Knoten: pvecm status, journalctl -u corosync.");
+                    i.Read.Add("Knoten wieder online → behoben.");
+                    r.Add(i);
+                }
+            // Nur ein Corosync-Link: ein Switch-Neustart oder Kabelfehler trennt den Cluster
+            List<PveNode> withRing = p.Nodes.FindAll(delegate (PveNode n) { return n.Ring0.Length > 0; });
+            if (p.HasCluster && withRing.Count >= 2 && !withRing.Exists(delegate (PveNode n) { return n.Ring1.Length > 0; }))
+            {
+                Issue i = New("pvelink", p.Cluster, "Server", "Corosync nur mit einem Link (" + cl + ")", cl, Finding.Info, Issue.Likely);
+                List<string> rings = new List<string>();
+                foreach (PveNode n in withRing) rings.Add(n.Name + " " + n.Ring0);
+                i.Evidence.Add("Corosync-Adressen (link0): " + string.Join(", ", rings.ToArray()) + " - kein link1 eingetragen");
+                i.Evidence.Add("Fällt dieser Weg kurz aus (Switch-Neustart/Firmware-Update, Kabel), verlieren die Knoten das Quorum");
+                i.Causes.Add("Cluster mit nur einem Netzwerk eingerichtet (Standard)");
+                i.Fix.Add("Zweiten Corosync-Link einrichten (link1) - möglichst über einen anderen Switch bzw. eigenes VLAN/Netz: /etc/pve/corosync.conf je Knoten ring1_addr ergänzen, config_version erhöhen.");
+                i.Fix.Add("Switch-Updates nacheinander einspielen und HA-Knoten vorher in den Wartungsmodus setzen (ha-manager crm-command node-maintenance enable <knoten>).");
+                i.Read.Add("Mit zweitem Link bleibt das Quorum bei Ausfall eines Weges erhalten (journalctl -u corosync zeigt dann nur \"link down\" für einen Link).");
+                r.Add(i);
+            }
+            // Zwei IPs im selben Subnetz auf einem Knoten
+            Dictionary<string, List<PveIface>> byNet = new Dictionary<string, List<PveIface>>();
+            foreach (PveIface f in p.Ifaces)
+            {
+                string net = Pve.Network(f.Cidr);
+                if (net.Length == 0) continue;
+                string k = f.Node + "|" + net;
+                if (!byNet.ContainsKey(k)) byNet[k] = new List<PveIface>();
+                byNet[k].Add(f);
+            }
+            foreach (KeyValuePair<string, List<PveIface>> kv in byNet)
+            {
+                if (kv.Value.Count < 2) continue;
+                string node = kv.Value[0].Node, net = kv.Key.Substring(node.Length + 1);
+                List<string> ifs = new List<string>();
+                foreach (PveIface f in kv.Value) ifs.Add(f.Name + " " + f.Cidr + (f.Ports.Length > 0 ? " an " + f.Ports : "") + (f.Comment.Length > 0 ? " \"" + f.Comment + "\"" : ""));
+                Issue i = New("pvesubnet", node + "|" + net, "Server", node + ": zwei IP-Adressen im selben Subnetz (" + net + ")", node, Finding.Warning, Issue.Certain);
+                i.Ref = kv.Value[0].Cidr.Split('/')[0];
+                i.Evidence.Add("Proxmox-Netzwerkkonfiguration: " + string.Join("; ", ifs.ToArray()));
+                i.Evidence.Add("Linux beantwortet ARP für jede eigene IP auf jeder Karte und schickt Antworten über die Standardroute → wechselnde MACs (ARP-Flux), asymmetrisches Routing, kurze Aussetzer");
+                i.Causes.Add("Zweite Bridge als \"Management\" im selben Netz statt in einem eigenen VLAN");
+                i.Fix.Add("Eine der IPs entfernen (Knoten → System → Netzwerk → Bridge bearbeiten → IP leeren → \"Konfiguration anwenden\"). Vorher prüfen: corosync ring0_addr und /etc/hosts nutzen die verbleibende IP.");
+                i.Fix.Add("Eigenes Management-Netz: Bridge in ein eigenes VLAN/Subnetz legen (Switchport Native VLAN), Firewall-Regeln dafür anlegen.");
+                i.Fix.Add("Zwei Karten für Ausfallsicherheit: Bond mit einer IP statt zwei IPs.");
+                i.Read.Add("Danach nur noch eine Route für das Netz (ip route); MAC-Konflikte zur IP verschwinden.");
+                r.Add(i);
+            }
+            // Bridges: gleicher Name, unterschiedliche Bedeutung bzw. nicht auf allen Knoten
+            List<string> online = new List<string>();
+            foreach (PveNode n in p.Nodes) if (n.Online) online.Add(n.Name);
+            Dictionary<string, List<PveIface>> bridges = new Dictionary<string, List<PveIface>>();
+            foreach (PveIface f in p.Ifaces)
+                if (f.Type == "bridge" || f.Type == "OVSBridge")
+                {
+                    if (!bridges.ContainsKey(f.Name)) bridges[f.Name] = new List<PveIface>();
+                    bridges[f.Name].Add(f);
+                }
+            if (online.Count >= 2)
+                foreach (KeyValuePair<string, List<PveIface>> kv in bridges)
+                {
+                    List<string> nets = new List<string>(), notes = new List<string>(), have = new List<string>();
+                    foreach (PveIface f in kv.Value)
+                    {
+                        string net = Pve.Network(f.Cidr);
+                        if (!nets.Contains(net)) nets.Add(net);
+                        notes.Add(f.Node + ": " + (f.Cidr.Length > 0 ? f.Cidr : "ohne IP") + (f.Ports.Length > 0 ? ", Port " + f.Ports : "") + (f.Comment.Length > 0 ? ", \"" + f.Comment + "\"" : ""));
+                        have.Add(f.Node);
+                    }
+                    List<string> missing = online.FindAll(delegate (string n) { return !have.Contains(n); });
+                    bool differs = nets.Count > 1;
+                    if (!differs && missing.Count == 0) continue;
+                    Issue i = New("pvebridge", kv.Key, "Server", "Bridge " + kv.Key + (differs ? " ist auf den Knoten unterschiedlich eingerichtet" : " fehlt auf " + string.Join(", ", missing.ToArray())), cl,
+                        differs ? Finding.Warning : Finding.Info, differs ? Issue.Likely : Issue.Hint);
+                    i.Evidence.Add(string.Join("; ", notes.ToArray()) + (missing.Count > 0 ? "; fehlt auf " + string.Join(", ", missing.ToArray()) : ""));
+                    i.Evidence.Add("Bei einer Migration verbindet Proxmox die VM mit der Bridge gleichen NAMENS - bedeutet sie auf dem Zielknoten ein anderes Netz, landet die VM im falschen Netz" +
+                        (missing.Count > 0 ? "; fehlt sie, schlägt die Migration fehl" : ""));
+                    i.Causes.Add("Bridges je Knoten einzeln angelegt (z. B. vmbr1 einmal für VMs, einmal als Management)");
+                    i.Fix.Add("Bridge-Namen clusterweit einheitlich verwenden: gleicher Name = gleiches Netz/VLAN auf allen Knoten; abweichende Bridges umbenennen (z. B. vmbr10 für Management).");
+                    if (missing.Count > 0) i.Fix.Add("Ist der Knoten nur Quorum-Knoten ohne VMs, kann der Hinweis ignoriert werden.");
+                    i.Read.Add("Einheitliche Bridges → Hinweis verschwindet bei der nächsten Abfrage (alle 5 Minuten).");
+                    r.Add(i);
+                }
+            return r;
+        }
+
+        /// <summary>Ein Host mit zwei IPs im selben Subnetz auf verschiedenen Netzwerkkarten (ARP-Flux, asymmetrisches Routing).</summary>
+        static Issue FluxIssue(SwitchMonitor.Conflict c)
+        {
+            string ip = c.Key.Substring(5);
+            Issue i = New("arpflux", ip, "Gerät", c.Title.Replace("Ein Gerät mit zwei Netzwerkkarten", "Zwei Netzwerkkarten"), ip, Finding.Warning,
+                DateTime.Now - c.Since > TimeSpan.FromMinutes(30) ? Issue.Certain : Issue.Likely);
+            i.Ref = ip; i.Occurred = DateTime.Now;
+            i.Evidence.Add(c.Detail);
+            i.Evidence.Add("Seit " + c.Since.ToString("dd.MM. HH:mm") + " in mehreren Abfragen bestätigt (ARP der Firewall/Switches, MAC-Tabellen, UniFi-Clients)");
+            i.Causes.Add("Zweite Bridge/Karte mit IP im selben Netz (z. B. Proxmox vmbr0 und vmbr1 beide in 192.168.x.0/24, \"MGMT\" ohne eigenes VLAN)");
+            i.Causes.Add("Server/NAS mit zwei Karten ohne Bonding/Teaming, beide mit IP im selben Subnetz");
+            i.Causes.Add("Übrig gebliebene IP aus der Installation (DHCP-Client auf der zweiten Karte)");
+            i.Fix.Add("Nur EINE IP pro Subnetz und Host: die zweite IP entfernen (Proxmox: Netzwerk → vmbrX → IP-Feld leeren → \"Konfiguration anwenden\"). " +
+                      "Vorher prüfen, dass Cluster (corosync ring0_addr), /etc/hosts, Backups und Lesezeichen die verbleibende IP nutzen.");
+            i.Fix.Add("Wird eine eigene Management-Adresse gebraucht: eigenes VLAN/Subnetz dafür (z. B. VLAN 10, 192.168.10.0/24) - Switchport als Native VLAN, Firewall-Schnittstelle mit Regeln.");
+            i.Fix.Add("Zwei Karten für Ausfallsicherheit: als Bond (LACP/active-backup) mit EINER IP einrichten statt zwei IPs.");
+            i.Fix.Add("Notlösung, wenn beide IPs bleiben müssen (Linux): sysctl net.ipv4.conf.all.arp_ignore=1 und arp_announce=2 plus Policy-Routing (ip rule from <IP2> table mgmt).");
+            i.Narrow.Add("Auf dem Host: ip -br addr (welche Karte hat welche IP?), ip route (zwei Routen für dasselbe Netz?), cat /etc/network/interfaces.");
+            i.Narrow.Add("Firewall: ARP-Tabelle ansehen - wechselt die MAC der IP zwischen den beiden Karten?");
+            i.Read.Add("Nach dem Entfernen der zweiten IP: ARP-Eintrag der Firewall löschen; der Widerspruch und kurze Aussetzer verschwinden innerhalb von 1-2 Abfragen.");
             return i;
         }
 
@@ -16761,6 +18025,11 @@ namespace PingMonitor
         readonly TextBox details = new TextBox();
         readonly ComboBox cboView = new ComboBox();
         readonly Label lblInfo = new Label();
+        readonly TextBox txtSearch = new TextBox();
+        readonly CheckBox chkAuto = new CheckBox();
+        readonly Label lblNew = new Label();
+        DateTime lastTouch = DateTime.MinValue;   // letzte Bedienung der Liste - solange nicht automatisch umsortieren
+        string shownStamp = "";                   // Stand der angezeigten Liste (für "n neue/geänderte")
         readonly Dictionary<string, string> pendingState = new Dictionary<string, string>();   // lokal gemeldet, Überwachung hat noch nicht übernommen
         List<Issue> current = new List<Issue>();
         Button btnDone, btnIgnore, btnReopen, btnClose;
@@ -16784,6 +18053,17 @@ namespace PingMonitor
             cboView.SelectedIndex = 0;
             cboView.SelectedIndexChanged += delegate { Fill(); };
             top.Controls.Add(cboView);
+            top.Controls.Add(Lbl("Suchen:"));
+            txtSearch.Width = 180;
+            txtSearch.TextChanged += delegate { Fill(); };
+            top.Controls.Add(txtSearch);
+            chkAuto.Text = "Automatisch aktualisieren"; chkAuto.AutoSize = true; chkAuto.Margin = new Padding(12, 6, 3, 3);
+            chkAuto.Checked = Config.Cached("Befunde.AutoAktualisieren", "1") != "0";
+            chkAuto.CheckedChanged += delegate { Config.Set("Befunde.AutoAktualisieren", chkAuto.Checked ? "1" : "0"); if (chkAuto.Checked) Fill(); };
+            top.Controls.Add(chkAuto);
+            top.Controls.Add(Btn("Aktualisieren (F5)", delegate { Reload(); Fill(); }));
+            lblNew.AutoSize = true; lblNew.Margin = new Padding(6, 7, 3, 3); lblNew.ForeColor = Color.DarkBlue; lblNew.Font = new Font(Font, FontStyle.Bold);
+            top.Controls.Add(lblNew);
             lblInfo.AutoSize = true; lblInfo.Margin = new Padding(12, 7, 3, 3); lblInfo.ForeColor = SystemColors.GrayText;
             top.Controls.Add(lblInfo);
             Label legend = Lbl("Sicherheit: ●●● sicher (mehrfach gemessen/zweite Quelle bestätigt, wird gemeldet)  ●●○ wahrscheinlich  ●○○ Hinweis");
@@ -16796,8 +18076,13 @@ namespace PingMonitor
             grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
             grid.BackgroundColor = SystemColors.Window;
             AddCol("Conf", "Sicherheit", 70); AddCol("Sev", "Schwere", 55); AddCol("Cat", "Bereich", 65); AddCol("Title", "Befund", 210);
-            AddCol("Obj", "Wo / Gerät", 240); AddCol("Src", "Quellen", 90); AddCol("Since", "Seit", 70); AddCol("Last", "Zuletzt", 70); AddCol("State", "Status", 80);
+            AddCol("Obj", "Wo / Gerät", 220); AddCol("Ip", "IP", 85); AddCol("Src", "Quellen", 90); AddCol("Since", "Seit", 70); AddCol("Last", "Zuletzt", 70); AddCol("State", "Status", 80);
             grid.SelectionChanged += delegate { ShowSelected(); };
+            grid.MouseDown += delegate { lastTouch = DateTime.Now; };
+            grid.Scroll += delegate { lastTouch = DateTime.Now; };
+            grid.KeyDown += delegate { lastTouch = DateTime.Now; };
+            KeyPreview = true;
+            KeyDown += delegate (object o, KeyEventArgs e) { if (e.KeyCode == Keys.F5) { Reload(); Fill(); e.Handled = true; } };
 
             details.Dock = DockStyle.Fill; details.Multiline = true; details.ReadOnly = true; details.ScrollBars = ScrollBars.Vertical;
             details.BackColor = SystemColors.Window; details.Font = new Font("Segoe UI", 9.5F); details.WordWrap = true;
@@ -16828,8 +18113,8 @@ namespace PingMonitor
             Controls.Add(top);
 
             timer.Interval = 5000;
-            timer.Tick += delegate { Reload(); };
-            Shown += delegate { Reload(); timer.Start(); };
+            timer.Tick += delegate { Tick(); };
+            Shown += delegate { Reload(); Fill(); timer.Start(); };
             FormClosed += delegate { timer.Stop(); timer.Dispose(); };
         }
 
@@ -16846,7 +18131,35 @@ namespace PingMonitor
         static string HostOf(Issue i)
         {
             System.Text.RegularExpressions.Match m = System.Text.RegularExpressions.Regex.Match(i.Ref + " " + i.Object, @"\b(\d{1,3}\.){3}\d{1,3}\b");
-            return m.Success ? m.Value : "";
+            if (m.Success) return m.Value;
+            // Gerät nur mit Namen genannt: IP aus der Geräteliste
+            Func<List<PingTarget>> targets = SwitchMonitor.Targets;
+            if (targets == null) return "";
+            try
+            {
+                foreach (PingTarget t in targets())
+                    if (t.Name.Length > 2 && (i.Object.IndexOf(t.Name, StringComparison.OrdinalIgnoreCase) >= 0 || i.Ref == t.Host)) return t.Host;
+            }
+            catch { }
+            return "";
+        }
+
+        /// <summary>Alle 5 s neu laden; die Anzeige nur ändern, wenn gewünscht und der Benutzer gerade nicht in der Liste arbeitet.</summary>
+        void Tick()
+        {
+            Reload();
+            if (chkAuto.Checked && DateTime.Now - lastTouch > TimeSpan.FromSeconds(15) && !txtSearch.Focused) Fill();
+            else UpdateNewLabel();
+        }
+
+        static string Stamp(Issue i) { return i.Key + "=" + i.State + "/" + i.Confidence + "/" + i.Severity; }
+
+        void UpdateNewLabel()
+        {
+            int changed = 0;
+            string shown = "\n" + shownStamp + "\n";
+            foreach (Issue i in current) if (Shows(i) && !shown.Contains("\n" + Stamp(i) + "\n")) changed++;
+            lblNew.Text = changed > 0 ? changed + " neue/geänderte Befunde - F5 zum Aktualisieren" : "";
         }
 
         void Reload()
@@ -16859,7 +18172,16 @@ namespace PingMonitor
                 if (i.State == st || st == Issue.Open && i.State == Issue.Open) pendingState.Remove(i.Key);   // übernommen
                 else { i.State = st; i.Verify = "Wird von der Überwachung übernommen ..."; }
             }
-            Fill();
+        }
+
+        bool Matches(Issue i)
+        {
+            string q = txtSearch.Text.Trim();
+            if (q.Length == 0) return true;
+            string all = i.Title + " " + i.Object + " " + i.Ref + " " + i.Category + " " + i.Sources + " " + HostOf(i) + " " + string.Join(" ", i.Evidence.ToArray());
+            foreach (string w in q.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries))
+                if (all.IndexOf(w, StringComparison.OrdinalIgnoreCase) < 0) return false;
+            return true;
         }
 
         bool Shows(Issue i)
@@ -16878,7 +18200,7 @@ namespace PingMonitor
         void Fill()
         {
             string key = Sel() != null ? Sel().Key : "";
-            List<Issue> list = current.FindAll(delegate (Issue x) { return Shows(x); });
+            List<Issue> list = current.FindAll(delegate (Issue x) { return Shows(x) && Matches(x); });
             list.Sort(delegate (Issue a, Issue b)
             {
                 int c = Rank(b).CompareTo(Rank(a));
@@ -16893,23 +18215,40 @@ namespace PingMonitor
                 if (i.State == Issue.Checking) chk++;
             }
             lblInfo.Text = open + " offen (" + sure + " sicher), " + chk + " in Nachprüfung - " + list.Count + " angezeigt";
+            List<string> stamps = new List<string>();
+            foreach (Issue i in current) if (Shows(i)) stamps.Add(Stamp(i));
+            shownStamp = string.Join("\n", stamps.ToArray());
+            lblNew.Text = "";
+
+            // Gleiche Befunde in gleicher Reihenfolge: Zeilen nur aktualisieren (kein Springen); sonst neu aufbauen und Position halten.
+            bool same = grid.Rows.Count == list.Count;
+            for (int k = 0; same && k < list.Count; k++) same = grid.Rows[k].Tag is Issue && ((Issue)grid.Rows[k].Tag).Key == list[k].Key;
+            int first = grid.Rows.Count > 0 ? Math.Max(0, grid.FirstDisplayedScrollingRowIndex) : 0;
             grid.SuspendLayout();
-            grid.Rows.Clear();
-            foreach (Issue i in list)
+            if (!same) grid.Rows.Clear();
+            for (int k = 0; k < list.Count; k++)
             {
-                int r = grid.Rows.Add(Issue.ConfSymbol(i.Confidence) + " " + Issue.ConfText(i.Confidence),
-                    i.Severity >= Finding.Problem ? "Problem" : i.Severity == Finding.Warning ? "Warnung" : "Info", i.Category, i.Title, i.Object, i.Sources,
-                    i.FirstSeen.ToString("dd.MM. HH:mm"), i.LastSeen.ToString("dd.MM. HH:mm"), i.State);
-                DataGridViewRow row = grid.Rows[r];
+                Issue i = list[k];
+                object[] values = new object[] { Issue.ConfSymbol(i.Confidence) + " " + Issue.ConfText(i.Confidence),
+                    i.Severity >= Finding.Problem ? "Problem" : i.Severity == Finding.Warning ? "Warnung" : "Info", i.Category, i.Title, i.Object, HostOf(i), i.Sources,
+                    i.FirstSeen.ToString("dd.MM. HH:mm"), i.LastSeen.ToString("dd.MM. HH:mm"), i.State };
+                DataGridViewRow row;
+                if (same)
+                {
+                    row = grid.Rows[k];
+                    for (int c = 0; c < values.Length; c++) if (!Equals(row.Cells[c].Value, values[c])) row.Cells[c].Value = values[c];
+                }
+                else row = grid.Rows[grid.Rows.Add(values)];
                 row.Tag = i;
                 Color back = i.State == Issue.Fixed || i.State == Issue.Gone ? Color.FromArgb(225, 245, 228) :
                     i.State == Issue.Checking ? Color.FromArgb(225, 236, 252) : i.State == Issue.Ignored ? Color.FromArgb(238, 238, 238) : Issue.ConfColor(i.Confidence, i.Severity);
                 row.DefaultCellStyle.BackColor = back;
                 row.DefaultCellStyle.SelectionBackColor = ControlPaint.Dark(back, 0.25f);
                 row.DefaultCellStyle.SelectionForeColor = Color.Black;
-                if (i.State == Issue.NotFixed) row.Cells["State"].Style.ForeColor = Color.DarkRed;
-                if (i.Key == key) { grid.ClearSelection(); row.Selected = true; grid.CurrentCell = row.Cells[0]; }
+                row.Cells["State"].Style.ForeColor = i.State == Issue.NotFixed ? Color.DarkRed : Color.Empty;
+                if (!same && i.Key == key) { grid.ClearSelection(); row.Selected = true; grid.CurrentCell = row.Cells[0]; }
             }
+            if (!same && grid.Rows.Count > 0) try { grid.FirstDisplayedScrollingRowIndex = Math.Min(first, grid.Rows.Count - 1); } catch { }
             grid.ResumeLayout();
             if (grid.Rows.Count == 0) details.Text = current.Count == 0 ? "Noch keine Befunde. Die Überwachung (Switches, Controller, Ping, Syslog ...) bewertet jede Abfragerunde neu - " +
                 "sichere Befunde entstehen erst, wenn etwas mehrfach gemessen oder von einer zweiten Quelle bestätigt wurde." : "Keine Befunde in dieser Ansicht.";
@@ -16990,6 +18329,8 @@ namespace PingMonitor
     {
         readonly ComboBox cboDns = new ComboBox();
         readonly CheckBox chkEach = new CheckBox(), chkLarge = new CheckBox();
+        readonly TextBox txtFrom = new TextBox(), txtTo = new TextBox();
+        readonly CheckBox[] chkDays = new CheckBox[7];
         string lastDns;
 
         public OptionsForm()
@@ -16998,7 +18339,7 @@ namespace PingMonitor
             Font = new Font("Segoe UI", 9F);
             FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(620, 300);
+            ClientSize = new Size(620, 400);
             Label h1 = new Label(); h1.Text = "DNS-Server für die Namensauflösung (Hostnamen in der Geräteliste, Rückwärtsauflösung)"; h1.Font = new Font(Font, FontStyle.Bold); h1.SetBounds(12, 12, 596, 20);
             cboDns.SetBounds(12, 36, 400, 24);
             Label h2 = new Label(); h2.ForeColor = SystemColors.GrayText; h2.SetBounds(12, 64, 596, 34);
@@ -17009,10 +18350,27 @@ namespace PingMonitor
             chkLarge.Text = "Leitungstest mit großen Paketen (1500 Byte, erkennt Bitfehler/MTU-Probleme)"; chkLarge.SetBounds(12, 160, 596, 22);
             Label h4 = new Label(); h4.ForeColor = SystemColors.GrayText; h4.SetBounds(12, 186, 596, 34);
             h4.Text = "Benachrichtigungen, Filter und Tagesbericht: Einstellungen → Benachrichtigungen. Syslog, UniFi, OPNsense: Netzwerk → Switches / Controller.";
-            Button ok = new Button(); ok.Text = "Speichern"; ok.SetBounds(392, 256, 110, 30);
-            Button cancel = new Button(); cancel.Text = "Abbrechen"; cancel.DialogResult = DialogResult.Cancel; cancel.SetBounds(508, 256, 100, 30);
+            Label h5 = new Label(); h5.Text = "Arbeitszeit (für Geräteklasse \"nur in der Arbeitszeit immer an\")"; h5.Font = new Font(Font, FontStyle.Bold); h5.SetBounds(12, 228, 596, 20);
+            Label lf = new Label(); lf.Text = "von"; lf.SetBounds(12, 255, 30, 20);
+            txtFrom.SetBounds(44, 252, 60, 24);
+            Label lt = new Label(); lt.Text = "bis"; lt.SetBounds(112, 255, 30, 20);
+            txtTo.SetBounds(144, 252, 60, 24);
+            string[] dn = { "Mo", "Di", "Mi", "Do", "Fr", "Sa", "So" };
+            string days = Config.Cached("Arbeitszeit.Tage", "12345");
+            for (int k = 0; k < 7; k++)
+            {
+                chkDays[k] = new CheckBox(); chkDays[k].Text = dn[k]; chkDays[k].SetBounds(220 + k * 48, 252, 46, 24);
+                chkDays[k].Checked = days.IndexOf((char)('1' + k)) >= 0;
+                Controls.Add(chkDays[k]);
+            }
+            txtFrom.Text = Config.Cached("Arbeitszeit.Von", "07:00"); txtTo.Text = Config.Cached("Arbeitszeit.Bis", "18:00");
+            Label h6 = new Label(); h6.ForeColor = SystemColors.GrayText; h6.SetBounds(12, 282, 596, 50);
+            h6.Text = "Außerhalb der Arbeitszeit dürfen diese Geräte aus sein (kein Ausfall, keine Meldung). Geräteklasse je Gerät: Rechtsklick → Geräteklasse. " +
+                "Arbeitsplatz-PCs und WLAN-Geräte erkennt PingMonitor automatisch als \"darf aus sein\", Server/Drucker/Netzwerk als \"immer an\".";
+            Button ok = new Button(); ok.Text = "Speichern"; ok.SetBounds(392, 356, 110, 30);
+            Button cancel = new Button(); cancel.Text = "Abbrechen"; cancel.DialogResult = DialogResult.Cancel; cancel.SetBounds(508, 356, 100, 30);
             ok.Click += delegate { if (Save()) DialogResult = DialogResult.OK; };
-            Controls.AddRange(new Control[] { h1, cboDns, h2, h3, chkEach, chkLarge, h4, ok, cancel });
+            Controls.AddRange(new Control[] { h1, cboDns, h2, h3, chkEach, chkLarge, h4, h5, lf, txtFrom, lt, txtTo, h6, ok, cancel });
             AcceptButton = ok; CancelButton = cancel;
             Dictionary<string, string> d = Config.LoadSettings();
             chkEach.Checked = Config.LoadLogEachFailure();
@@ -17055,12 +18413,21 @@ namespace PingMonitor
                 }
                 value = string.Join(", ", servers.ConvertAll(delegate (IPAddress a) { return a.ToString(); }).ToArray());
             }
+            TimeSpan from, to;
+            if (!TimeSpan.TryParse(txtFrom.Text.Trim(), out from) || !TimeSpan.TryParse(txtTo.Text.Trim(), out to) || from.TotalHours >= 24 || to.TotalHours > 24)
+            {
+                MessageBox.Show(this, "Arbeitszeit bitte als Uhrzeit angeben, z. B. 07:00 und 18:00.", Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+            string wd = "";
+            for (int k = 0; k < 7; k++) if (chkDays[k].Checked) wd += (char)('1' + k);
             try
             {
                 if (value != lastDns) Resolver.Save(value);
                 Config.SaveLogEachFailure(chkEach.Checked);
                 Dictionary<string, string> d = new Dictionary<string, string>();
                 d["Qualitaet.GrossePakete"] = chkLarge.Checked ? "1" : "0";
+                d["Arbeitszeit.Von"] = from.ToString(@"hh\:mm"); d["Arbeitszeit.Bis"] = to.ToString(@"hh\:mm"); d["Arbeitszeit.Tage"] = wd;
                 Config.SaveSettings(d);
                 return true;
             }

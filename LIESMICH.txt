@@ -1,4 +1,4 @@
-PingMonitor 4.3 - Geräte per Ping überwachen, Netzwerkfehler finden (App und optional Windows-Dienst)
+PingMonitor 4.4 - Geräte per Ping überwachen, Netzwerkfehler finden (App und optional Windows-Dienst)
 ==========================================================================
 
 Ablage
@@ -125,6 +125,10 @@ Menü Netzwerk -> "Switches / Controller / Firewall ...": Switches mit IP-Adress
 
 Suchen, Filtern, WLAN-Geräte
 ----------------------------
+- Befunde-Fenster: Spalte "IP", Suchfeld (IP, Name, Switch/Port, Text der Belege). Die Liste springt nicht mehr:
+  Auswahl und Scrollposition bleiben, geänderte Zeilen werden nur aktualisiert; während man in der Liste arbeitet
+  (und 15 s danach), wird nicht umsortiert. "Automatisch aktualisieren" abschaltbar, dann "Aktualisieren (F5)" mit
+  Hinweis "n neue/geänderte Befunde".
 - Suchfeld über der Geräteliste: durchsucht alle Spalten (Name, Kommentar, IP, MAC, Hersteller, DNS,
   NetBIOS, Switch-Port, Verbindung ...). Mehrere Begriffe = alle müssen passen (z. B. "og drucker").
 - Auswahlliste: alle / nur erreichbare / nur Ausfälle / nur auffällige / nur LAN / nur WLAN /
@@ -167,9 +171,42 @@ Ausgeschaltete Geräte / Ausfall-Diagnose
 - Gateway antwortet auch nicht       -> eigene Verbindung dieses PCs/Gateway gestört
 Den zuletzt bekannten Switch-Port merkt sich die App (mac_ports.txt) - auch wenn ein ausgeschaltetes
 Gerät aus der MAC-Tabelle des Switches gefallen ist.
-Ist ein Gerät vermutlich AUSGESCHALTET, wird es als "OFFLINE" (grau) geführt und NICHT als Störung
-gewertet: Die Fehlschläge werden aus Verlust-Statistik und Leitungsqualität herausgerechnet.
-Im Protokoll stehen nur "Offline" und später "Wieder online" mit Zeitraum und Dauer.
+- Port von 1 Gbit/s auf 10/100 Mbit/s gefallen -> PC heruntergefahren (Wake-on-LAN hält die Karte aktiv)
+- WLAN (UniFi): angemeldet, antwortet nicht -> Standby; vorher schwaches Signal -> schlechter Empfang;
+  abgemeldet -> aus / außer Haus
+- Switch/AP im selben Zeitraum neu gestartet -> "Switch-Neustart" (Firmware-Update, Stromausfall)
+- 3 und mehr Geräte am selben Switch/AP gleichzeitig weg -> Switch/Uplink statt einzelner Geräte
+Die Diagnose wird während des Ausfalls wiederholt (nach 20 s, 2 min, 6 min, dann alle 10 min): Erst wenn die
+MAC-Tabelle der Switches abgelaufen ist (ca. 5 min), lässt sich "ausgeschaltet" sicher von "hängt" unterscheiden.
+Weitere Belege: "sauberes Ende" (vorher keine Aussetzer) und das gelernte Muster ("an 5 der letzten 14 Tage um
+diese Uhrzeit ebenfalls aus", Logs\Offline_Verlauf.csv).
+
+Geräteklasse (Spalte "Klasse", Rechtsklick -> Geräteklasse):
+- "immer an"       Server, Drucker, Switch, Firewall, NAS ... - jeder Ausfall ist eine Störung.
+- "darf aus sein"  Arbeitsplatz-PCs, Notebooks - ausgeschaltet/Standby ist kein Ausfall.
+- "WLAN-Gerät"     Smartphones/Tablets (UniFi-WLAN-Client, zufällige MAC) - Standby/abgemeldet ist kein Ausfall.
+- "Arbeitszeit"    innerhalb der Arbeitszeit (Einstellungen -> Optionen, Standard Mo-Fr 07:00-18:00) "immer an",
+                   außerhalb "darf aus sein".
+- "(auto)"         automatisch geschätzt aus Geräteinfo, Name (PC-..., DESKTOP-...), Hersteller, WLAN-Zuordnung und
+                   bisherigem Verhalten (mehrfach ausgeschaltet -> darf aus sein). Unbekannt = wie bisher: nur eindeutige
+                   Diagnosen (kein Link, keine ARP-Antwort, WLAN abgemeldet) gelten als ausgeschaltet.
+Bei Geräten, die aus sein dürfen, wird OFFLINE auch dokumentiert, wenn der Grund nicht ersichtlich ist
+("offline, Grund nicht ersichtlich"). Echte Störungen bleiben Ausfälle: Link mit voller Geschwindigkeit und MAC
+weiter aktiv (Gerät hängt), IP-Konflikt, viele Geräte gleichzeitig.
+Rechtsklick -> "Laufenden Ausfall einordnen": manuell "als ausgeschaltet" oder "als Ausfall" werten (auch im Dienst).
+
+OFFLINE-Geräte werden grau geführt und NICHT als Störung gewertet: Die Fehlschläge werden aus Verlust-Statistik,
+Ausfallzähler, Leitungsqualität, Instabilitäts-Befund und Tagesbericht herausgerechnet. Im Ausfallprotokoll steht
+eine eigene Zeile, z. B. "offline 16:31 – 07:45 (Dauer ...) – ausgeschaltet (Port auf 100 Mbit/s gefallen) – kein Ausfall".
+Meldungen: Für Geräte, die aus sein dürfen, wartet PingMonitor mit der Ausfall-Meldung, bis die Einordnung feststeht
+(bis ca. 6 Minuten); ausgeschaltete Geräte werden nie gemeldet. Der Befund "Geschwindigkeit gefallen" entsteht nicht,
+solange das Gerät am Port aus ist (Wake-on-LAN).
+Filter: Auswahlliste "Nur Klasse immer an" / "Nur Geräte, die aus sein dürfen", Häkchen "Offline ausblenden".
+
+Neustart von Switches/APs: Setzt ein Switch seine Laufzeit zurück (SNMP sysUpTime bzw. UniFi-Controller, mit
+Firmware-Wechsel als Grund), werden Ausfälle der angeschlossenen Geräte in diesem Zeitfenster nachträglich NICHT als
+Störung gezählt ("Neustart Netzwerkgerät" im Protokoll). Befund "neu gestartet" (Info) bzw. "startet wiederholt neu"
+(Warnung bei mehreren Neustarts ohne Update).
 
 Zurücksetzen
 ------------
@@ -409,13 +446,36 @@ TP-Link/HP (System Log / Syslog Server).
 OPNsense-API
 ------------
 Netzwerk -> "Switches / Controller / Firewall ..." -> "OPNsense-API ...": Adresse, API-Schlüssel und -Geheimnis (System -> Zugang -> Benutzer -> eigener
-Benutzer mit Leserechten "Status: Gateways", "Diagnostics: ARP Table", DHCP-Leases (ISC/Kea/Dnsmasq) -> API-Schlüssel).
+Benutzer mit Leserechten "Status: Gateways", "Diagnostics: ARP Table", DHCP-Leases (ISC/Kea/Dnsmasq), optional
+"Diagnostics: pfInfo" für die Verbindungsanzahl -> API-Schlüssel).
 Das Geheimnis wird verschlüsselt gespeichert. Genutzt für:
   - Gateway-Überwachung (dpinger): Paketverlust, Latenz, Status zum Provider. "Internet-Leitung beeinträchtigt"
     (ab 5 % Verlust / 150 ms), "gestört" (ab 20 % / down), "wieder normal" - im Ausfallprotokoll, in der
     Ausfall-Diagnose und in der Dokumentation. Trennt Provider-Probleme von LAN-Problemen.
   - DHCP-Leases und ARP-Tabelle: fehlende MAC-Adressen und Gerätenamen (auch ohne SNMP, auch andere VLANs) für
     Geräteliste, Scan, Netzwerkplan und Mitschnitt-Befunde.
+  - Verbindungen durch die Firewall (pf-State-Tabelle) mit Obergrenze - in der Firewall-Zeile der Switch-Ansicht
+    ("8432 Verbindungen durch die Firewall (States, 84 % von 10000)"). Ab 80 % Befund "State-Tabelle zu voll".
+    ("TCP-Verbindungen zum Gerät selbst" per SNMP zählt dagegen nur Verbindungen zur Firewall: Weboberfläche, SSH.)
+
+Proxmox-API
+-----------
+Netzwerk -> "Switches / Controller / Firewall ..." -> "Proxmox-API ...": Adresse eines Knotens (https://IP:8006),
+API-Token (Rechenzentrum -> Berechtigungen -> API-Token, z. B. root@pam!pingmonitor) und Geheimnis. Rechte:
+Berechtigungen -> API-Token-Berechtigung, Pfad "/", Rolle "PVEAuditor" (nur lesend). Abfrage alle 5 Minuten.
+Befunde:
+  - Cluster ohne Quorum, Knoten offline (auch im Protokoll: "QUORUM VERLOREN", "Knoten OFFLINE").
+  - Corosync nur mit einem Link: ein Switch-Neustart trennt den Cluster -> zweiten Link (link1) über anderen Switch/VLAN.
+  - Zwei IP-Adressen im selben Subnetz auf einem Knoten (z. B. vmbr0 und "MGMT"-vmbr1 beide in 192.168.100.0/24):
+    ARP-Flux und asymmetrisches Routing -> eine IP entfernen oder eigenes Management-VLAN.
+  - Bridge gleichen Namens bedeutet auf den Knoten Unterschiedliches bzw. fehlt auf einem Knoten
+    (Migration verbindet die VM mit der Bridge gleichen Namens).
+
+Zwei Netzwerkkarten im selben Subnetz (ARP-Flux) - auch ohne Proxmox-API
+-------------------------------------------------------------------------
+Meldet die ARP-Tabelle für eine IP eine andere MAC als die Geräteliste, und gehört diese MAC zu einer weiteren IP im
+selben Netz, ist es EIN Host mit zwei Karten/IPs im selben Subnetz: Befund "Zwei Netzwerkkarten im selben Subnetz"
+mit Maßnahmenplan (zweite IP entfernen, Management-VLAN, Bond, notfalls arp_ignore/arp_announce).
 
 Diesen PC prüfen (Windows-Ereignisprotokoll und Netzwerkkarten)
 ---------------------------------------------------------------
@@ -601,12 +661,13 @@ Protokoll
 
 Dateien
 -------
-hosts.txt          Geräteliste (Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller;Kommentar;DNS-Name;NetBIOS;Geräteinfo)
+hosts.txt          Geräteliste (Name;Host;Intervall_ms;Timeout_ms;MAC;Hersteller;Kommentar;DNS-Name;NetBIOS;Geräteinfo;Klasse)
 settings.txt       Einstellungen inkl. Benachrichtigungen, DNS-Server, SNMP-Community
-Logs\              Ausfallprotokolle (PingLog_*), Syslog (Syslog_*), Langzeitdaten (Verlauf_*)
+Logs\              Ausfallprotokolle (PingLog_*), Syslog (Syslog_*), Langzeitdaten (Verlauf_*), Offline-Zeiten (Offline_Verlauf.csv)
 befunde.txt        Befunde mit Status und Maßnahmen (schreibt die Überwachung)
 massnahmen.txt     gemeldete Maßnahmen aus der Oberfläche (wird von der Überwachung übernommen und gelöscht)
 abfragen.txt       Signal "sofort neu abfragen" (Aktualisieren) an den Dienst
+einordnung.txt     manuelle Einordnung eines laufenden Ausfalls (ausgeschaltet/Ausfall) an den Dienst
 switches.txt       Switch-Liste (Name;IP;Community)
 mac_ports.txt      zuletzt bekannter Switch-Port je Geräte-MAC
 Switch_Status.csv  aktueller Switch-Status des Dienstes (für die Anzeige in der App)
