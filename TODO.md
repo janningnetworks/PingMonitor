@@ -11,4 +11,6 @@ ARP-Scan, TCP-Wiederholungen (dieser PC, Agent, Mitschnitt).
 - Discovery-Lauscher unter Windows prüfen: Ports 137/138 sind meist von NetBIOS belegt (dann nur im Mitschnitt);
   ob 5353 neben dem Windows-mDNS-Dienst geteilt werden kann, hängt von der Windows-Version ab (Status unter „Quellen“).
 - Einordnung vergangener Ereignisse im Ausfallprotokoll per Rechtsklick korrigieren.
+- PAUSE-Zähler: prüfen, welche Switches die dot3PauseTable liefern (UniFi per SNMP?); UniFi-Controller-API liefert keine.
+- Normalwert je Port geht beim Neustart verloren (30 min Anlernzeit) - ggf. aus den Langzeitdaten vorbelegen.
 - Proxmox: Ceph-Zustand, Speicher (Storage voll), Backups.

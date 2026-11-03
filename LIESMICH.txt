@@ -1,4 +1,4 @@
-PingMonitor 4.5 - Geräte per Ping überwachen, Netzwerkfehler finden (App und optional Windows-Dienst)
+PingMonitor 4.6 - Geräte per Ping überwachen, Netzwerkfehler finden (App und optional Windows-Dienst)
 ==========================================================================
 
 Ablage
@@ -475,6 +475,22 @@ Steam, Plex, Tuya/Smart-Home, Ubiquiti-Discovery. Jeder Befund hat Ursachen und 
 abschalten, nur EIN mDNS-Reflektor, IGMP-Snooping, Drucker mit Standard-TCP/IP-Port statt Suche/WSD).
 Zusätzlich im Mitschnitt: "Kein IGMP-Querier zu sehen" (Multicast ohne IGMP-Abfragen - Snooping-Switches verlieren
 Gruppen oder fluten), mehrere IGMP-Querier, "Gerät tastet das Netz ab (ARP-Scan)".
+
+"Gerät dreht frei" (Drucker, IoT, hängende Netzwerkkarte)
+--------------------------------------------------------
+Typisch: Ein Drucker mit Firmware-Fehler oder eine hängende Netzwerkkarte müllt das Netz zu, und "alles ist langsam".
+  - Ausreißer zum eigenen Normalwert (SNMP/UniFi, Endgeräte-Ports): PingMonitor lernt je Port, wie viele Pakete das
+    Gerät normalerweise sendet (ca. 30 Minuten Anlernzeit, Ausreißer zählen nicht mit). Sendet es dauerhaft das
+    10-Fache (mind. 200/s), entsteht der Befund "Drucker/Gerät sendet das N-Fache seines Normalwerts" - bei kleinen
+    Paketen oder viel Broadcast/Multicast nach 3 Minuten, sonst nach 10 Minuten; Datenübertragungen mit großen
+    Paketen (Kopie, Sicherung) lösen nichts aus. Mit Gerätename, Pakettyp, Sofort-Test (Kabel ziehen) und Storm Control.
+  - PAUSE-Frames (802.3x Flow Control, SNMP EtherLike-MIB dot3PauseTable): Ein Gerät, das ständig PAUSE sendet, hält
+    den Switch-Port bzw. je nach Switch den ganzen Switch an - klassisch bei hängenden Netzwerkkarten. Befund
+    "PAUSE-Frames vom Gerät ... bremst den Switch" (bzw. "Switch bremst Gerät" bei Überlast), Abhilfe: Gerät neu
+    starten, Flow Control am Port aus. Nicht jeder Switch liefert diese Zähler (UniFi-Controller liefert sie nicht).
+  - Im Mitschnitt je Absender: ARP-Flut (mit der immer wieder gefragten Adresse), Broadcast-Flut, IPv6-Flut
+    (Nachbarermittlung/MLD), "sendet immer wieder dasselbe Paket", PAUSE-Frames -> Befund "Gerät dreht frei: MAC
+    (Hersteller, IP)" mit Wireshark-Filter eth.src == ...
 
 TCP-Wiederholungen (Retransmissions)
 -----------------------------------

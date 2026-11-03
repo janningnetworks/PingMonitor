@@ -1,4 +1,4 @@
-# PingMonitor 4.5
+# PingMonitor 4.6
 
 Windows-App (optional als Windows-Dienst), die mehrere Geräte parallel per Ping überwacht
 und jeden Ausfall mit Zeitstempel in eine tägliche CSV-Datei protokolliert.
@@ -13,6 +13,7 @@ Netzwerk-Werkzeuge: DNS (wie dig/nslookup, Serververgleich), Ping/Traceroute/MTU
 Geräteklassen ("immer an" / "darf aus sein" / WLAN-Gerät / Arbeitszeit): ausgeschaltete Arbeitsplatz-PCs (Link aus, Wake-on-LAN mit 10/100 Mbit, sauberes Ende, gelerntes Muster) und WLAN-Geräte im Standby oder bei schlechtem Empfang werden als "offline" dokumentiert statt als Ausfall gezählt; Switch-Neustarts (Firmware-Update) werden mit den Ausfällen verknüpft.
 Proxmox-API (nur lesend): Quorum, Knoten, Corosync-Links, zwei IPs im selben Subnetz (ARP-Flux), uneinheitliche Bridges; OPNsense-State-Tabelle; Befundliste mit IP-Spalte und Suche.
 Discovery-Wächter (live und im Mitschnitt): mDNS/Bonjour, SSDP, LLMNR, NetBIOS, WS-Discovery, Druckersuche per Broadcast u. a. mit Verursacher, Dauerschleifen und Reflektor-Doppelungen; fehlender IGMP-Querier, ARP-Scans; TCP-Wiederholungen dieses PCs und der Agent-PCs.
+"Gerät dreht frei": Ausreißer je Endgeräte-Port gegenüber dem gelernten Normalwert, PAUSE-Frames (Flow Control), im Mitschnitt ARP-/Broadcast-/IPv6-Fluten und Dauerschleifen je Absender.
 Benachrichtigung per Webhook (JSON) und/oder E-Mail (SMTP) bei Ausfall/Wiederherstellung und bei sicheren Befunden - mit Filtern (Mindestdauer, Geräte, WLAN-Geräte, Sicherheit, Bereiche), Ruhezeit und Tagesbericht.
 
 - Kompilieren: `build.bat` ausführen (nutzt den in Windows enthaltenen .NET-Framework-4.x-Compiler, keine Installation nötig)

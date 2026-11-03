@@ -35,8 +35,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCompany("janning networks")]
 [assembly: System.Reflection.AssemblyProduct("PingMonitor")]
 [assembly: System.Reflection.AssemblyCopyright("janning networks")]
-[assembly: System.Reflection.AssemblyVersion("4.5.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("4.5.0.0")]
+[assembly: System.Reflection.AssemblyVersion("4.6.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("4.6.0.0")]
 
 namespace PingMonitor
 {
@@ -2215,7 +2215,7 @@ namespace PingMonitor
 
         public MainForm()
         {
-            Text = "PingMonitor 4.5";
+            Text = "PingMonitor 4.6";
             Size = new Size(1360, 800);
             MinimumSize = new Size(850, 520);
             StartPosition = FormStartPosition.CenterScreen;
@@ -2536,7 +2536,7 @@ namespace PingMonitor
             });
             help.DropDownItems.Add("Über PingMonitor", null, delegate
             {
-                MessageBox.Show(this, "PingMonitor 4.5\n\nÜberwacht Geräte, Switches, WLAN, Firewall und Internet-Leitung, erkennt Fehler im Netz mit Sicherheitsstufe " +
+                MessageBox.Show(this, "PingMonitor 4.6\n\nÜberwacht Geräte, Switches, WLAN, Firewall und Internet-Leitung, erkennt Fehler im Netz mit Sicherheitsstufe " +
                     "und Maßnahmenplan und prüft Maßnahmen nach.\n\nProgrammordner: " + Config.BaseDir, Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
             });
             m.Items.AddRange(new ToolStripItem[] { file, dev, net, ana, set, svc, help });
@@ -6050,6 +6050,16 @@ namespace PingMonitor
         public readonly Queue<double> RecentPps = new Queue<double>(), RecentMcastIn = new Queue<double>(), RecentMcastOut = new Queue<double>();
         public readonly List<long[]> PktHist = new List<long[]>();   // je Abfrage: Zeit (Ticks), +Eingang verworfen, +Ausgang verworfen, +Pakete ein, +Pakete aus
         public long DropsHour = -1;      // im Ausgang verworfene Pakete der letzten Stunde (für Anzeige/Statusdatei)
+        // Normalwert der vom Gerät gesendeten Pakete (Endgeräte-Ports) und Beginn eines Ausreißers ("Gerät dreht frei")
+        public double BasePps = -1;
+        public int BaseSamples;
+        public DateTime AnomSince = DateTime.MinValue;
+        public double AnomPeak;
+        // PAUSE-Frames (802.3x Flow Control): vom Gerät empfangen (Gerät bremst den Switch) bzw. an das Gerät gesendet
+        public long PInPause = -1, POutPause = -1;
+        public DateTime PauseAt;
+        public double InPausePs, OutPausePs;
+        public readonly List<long[]> PauseHist = new List<long[]>();   // Zeit (Ticks), +Pause ein, +Pause aus (24 h)
 
         public long Sum(int idx, TimeSpan span)
         {
@@ -6281,7 +6291,8 @@ namespace PingMonitor
                      QStaticName = "1.3.6.1.2.1.17.7.1.4.3.1.1", QStaticEgress = "1.3.6.1.2.1.17.7.1.4.3.1.2", QStaticUntagged = "1.3.6.1.2.1.17.7.1.4.3.1.4";
         // EtherLike-MIB (dot3StatsTable)
         const string Dot3Align = "1.3.6.1.2.1.10.7.2.1.2", Dot3Fcs = "1.3.6.1.2.1.10.7.2.1.3",
-                     Dot3Late = "1.3.6.1.2.1.10.7.2.1.8", Dot3Duplex = "1.3.6.1.2.1.10.7.2.1.19";
+                     Dot3Late = "1.3.6.1.2.1.10.7.2.1.8", Dot3Duplex = "1.3.6.1.2.1.10.7.2.1.19",
+                     Dot3InPause = "1.3.6.1.2.1.10.7.10.1.3", Dot3OutPause = "1.3.6.1.2.1.10.7.10.1.4";
         // BRIDGE-MIB / Q-BRIDGE-MIB (MAC-Adresstabelle)
         const string IfInOctets = "1.3.6.1.2.1.2.2.1.10", IfOutOctets = "1.3.6.1.2.1.2.2.1.16",
                      IfHCInOctets = "1.3.6.1.2.1.31.1.1.1.6", IfHCOutOctets = "1.3.6.1.2.1.31.1.1.1.10",
@@ -6825,6 +6836,7 @@ namespace PingMonitor
             Dictionary<int, SnmpValue> align = Column(ip, s.Community, Dot3Align);
             Dictionary<int, SnmpValue> late = Column(ip, s.Community, Dot3Late);
             Dictionary<int, SnmpValue> duplex = Column(ip, s.Community, Dot3Duplex);
+            Dictionary<int, SnmpValue> inPause = Column(ip, s.Community, Dot3InPause), outPause = Column(ip, s.Community, Dot3OutPause);
             Dictionary<int, SnmpValue> inOct = Column(ip, s.Community, IfHCInOctets);
             Dictionary<int, SnmpValue> outOct = Column(ip, s.Community, IfHCOutOctets);
             if (inOct.Count == 0) { inOct = Column(ip, s.Community, IfInOctets); outOct = Column(ip, s.Community, IfOutOctets); }
@@ -6917,6 +6929,7 @@ namespace PingMonitor
                     Packets(p, iu < 0 ? -1 : iu + Math.Max(0, Num(inM, idx, 0)) + Math.Max(0, Num(bcast, idx, 0)), Num(inM, idx, -1),
                         ou < 0 ? -1 : ou + Math.Max(0, Num(outM, idx, 0)) + Math.Max(0, Num(outB, idx, 0)), Num(outM, idx, -1),
                         Num(inDisc, idx, -1), Num(outDisc, idx, -1), now);
+                    Pause(p, Num(inPause, idx, -1), Num(outPause, idx, -1), now);
 
                     // Link-Wechsel: ifLastChange hat sich geändert
                     long lc = Num(change, idx, -1);
@@ -6999,6 +7012,7 @@ namespace PingMonitor
                 p.McastInPps = inMcast >= 0 && p.PInMcast >= 0 ? (inMcast - p.PInMcast) / secs : 0;
                 p.McastOutPps = outMcast >= 0 && p.POutMcast >= 0 ? (outMcast - p.POutMcast) / secs : 0;
                 if (inPkts >= 0) { p.RecentPps.Enqueue(p.InPps); while (p.RecentPps.Count > 5) p.RecentPps.Dequeue(); }
+                if (inPkts >= 0) Baseline(p, now);
                 if (inMcast >= 0) { p.RecentMcastIn.Enqueue(p.McastInPps); while (p.RecentMcastIn.Count > 5) p.RecentMcastIn.Dequeue(); }
                 if (outMcast >= 0) { p.RecentMcastOut.Enqueue(p.McastOutPps); while (p.RecentMcastOut.Count > 5) p.RecentMcastOut.Dequeue(); }
                 p.PktHist.Add(new long[] { now.Ticks, dInD, dOutD, dIn, dOut });
@@ -7007,6 +7021,40 @@ namespace PingMonitor
                 p.DropsHour = outDisc >= 0 ? p.Sum(2, TimeSpan.FromHours(1)) : -1;
             }
             p.PInPkts = inPkts; p.POutPkts = outPkts; p.PInMcast = inMcast; p.POutMcast = outMcast; p.PInDisc = inDisc; p.POutDisc = outDisc; p.PktsAt = now;
+        }
+
+        /// <summary>
+        /// Normalwert der vom Gerät gesendeten Pakete (langsamer Mittelwert, Ausreißer zählen nicht mit). Liegt die Rate über dem
+        /// 10-Fachen (mind. 200/s), beginnt ein Ausreißer - bewertet wird er erst, wenn er anhält (Issues.AnomalyIssue).
+        /// </summary>
+        static void Baseline(PortState p, DateTime now)
+        {
+            bool outlier = p.BaseSamples >= 30 && p.InPps > Math.Max(200, p.BasePps * 10);
+            if (outlier)
+            {
+                if (p.AnomSince == DateTime.MinValue) { p.AnomSince = now; p.AnomPeak = 0; }
+                p.AnomPeak = Math.Max(p.AnomPeak, p.InPps);
+                return;
+            }
+            p.AnomSince = DateTime.MinValue;
+            p.BasePps = p.BaseSamples == 0 || p.BasePps < 0 ? p.InPps : p.BasePps + (p.InPps - p.BasePps) * (p.BaseSamples < 30 ? 0.1 : 0.02);
+            p.BaseSamples++;
+        }
+
+        /// <summary>PAUSE-Frames je Sekunde (EtherLike-MIB dot3PauseTable).</summary>
+        static void Pause(PortState p, long inP, long outP, DateTime now)
+        {
+            if (inP < 0 && outP < 0) return;
+            if (p.PauseAt != DateTime.MinValue && inP >= p.PInPause && outP >= p.POutPause && p.PInPause >= 0)
+            {
+                double secs = Math.Max(1, (now - p.PauseAt).TotalSeconds);
+                long di = inP - p.PInPause, dO = outP - p.POutPause;
+                p.InPausePs = di / secs; p.OutPausePs = dO / secs;
+                p.PauseHist.Add(new long[] { now.Ticks, di, dO });
+                long cut = now.AddDays(-1).Ticks;
+                p.PauseHist.RemoveAll(delegate (long[] x) { return x[0] < cut; });
+            }
+            p.PInPause = inP; p.POutPause = outP; p.PauseAt = now;
         }
 
         /// <summary>Datenrate aus den Byte-Zählern.</summary>
@@ -8360,6 +8408,15 @@ namespace PingMonitor
             int flapsDay = p.FlapsSince(TimeSpan.FromDays(1));
             long maxSpeed = 0;
             foreach (PortState o in s.Ports.Values) if (o.Up && o.SpeedMbps > maxSpeed) maxSpeed = o.SpeedMbps;
+
+            if (p.InPausePs >= 1 || p.OutPausePs >= 5)
+                f.Add(new Finding(p.InPausePs >= 100 ? Finding.Problem : Finding.Warning, "PAUSE-Frames " + (p.InPausePs >= 1 ? "vom Gerät (" + p.InPausePs.ToString("0") + "/s)" : "an das Gerät (" + p.OutPausePs.ToString("0") + "/s)"),
+                    p.InPausePs >= 1 ? "Das angeschlossene Gerät sendet Flow-Control-PAUSE: Der Switch muss den Verkehr zu diesem Port anhalten. Bei Dauer-PAUSE hängt die Netzwerkkarte des Geräts " +
+                        "(Neustart) - und je nach Switch stockt auch anderer Verkehr. Flow Control am Port abschalten."
+                                     : "Der Switch bremst das Gerät (eigene Puffer voll) - Uplink-Auslastung prüfen."));
+            if (p.AnomSince != DateTime.MinValue && p.Role.Length == 0 && !p.IsInfrastructure && DateTime.Now - p.AnomSince >= TimeSpan.FromMinutes(3))
+                f.Add(new Finding(Finding.Warning, "Gerät sendet " + (p.InPps / Math.Max(1, p.BasePps)).ToString("0") + "× mehr als normal",
+                    "Seit " + p.AnomSince.ToString("HH:mm") + " " + p.InPps.ToString("0") + " Pakete/s vom Gerät, normal Ø " + p.BasePps.ToString("0.#") + "/s. Siehe Befunde."));
 
             if (p.RxErrors > 0)
                 f.Add(new Finding(recentErr >= 5 ? Finding.Problem : Finding.Warning,
@@ -13333,6 +13390,33 @@ namespace PingMonitor
         readonly Dictionary<long, int> retransPerSecond = new Dictionary<long, int>();
         int tcpData, tcpRetrans, tcpDupAck, tcpRst, tcpSyn, tcpSynAck, tcpZeroWin;
         readonly DiscoveryStats discovery = new DiscoveryStats();
+        /// <summary>Was ein einzelnes Gerät sendet (für "Gerät dreht frei": ARP-/Broadcast-/IPv6-Flut, immer gleiches Paket, PAUSE).</summary>
+        class SenderFlood
+        {
+            public long Frames, Arp, Bcast, Nd, Pause;
+            public readonly Dictionary<long, int> ArpSec = new Dictionary<long, int>(), BcSec = new Dictionary<long, int>(), NdSec = new Dictionary<long, int>();
+            public readonly Dictionary<string, int> ArpTargets = new Dictionary<string, int>();
+            public readonly Dictionary<long, int> Hashes = new Dictionary<long, int>();
+        }
+        readonly Dictionary<string, SenderFlood> floods = new Dictionary<string, SenderFlood>();
+
+        SenderFlood Flood(string mac)
+        {
+            SenderFlood f;
+            if (!floods.TryGetValue(mac, out f) && floods.Count < 5000) { f = new SenderFlood(); floods[mac] = f; }
+            return f;
+        }
+
+        static void Inc(Dictionary<long, int> d, DateTime t)
+        {
+            long sec = t.Ticks / TimeSpan.TicksPerSecond;
+            int n;
+            if (!d.TryGetValue(sec, out n) && d.Count >= 20000) return;
+            d[sec] = n + 1;
+        }
+
+        static int Peak(Dictionary<long, int> d) { int m = 0; foreach (int v in d.Values) if (v > m) m = v; return m; }
+
         int igmpQueries, igmpReports; long mcastData;   // IGMP-Querier vorhanden? Multicast-Nutzdaten (ohne 224.0.0.x)
         readonly Dictionary<string, string> igmpQueriers = new Dictionary<string, string>();
         readonly Dictionary<string, HashSet<string>> arpTargets = new Dictionary<string, HashSet<string>>();   // Anfragender -> gefragte IPs   // mDNS, SSDP, LLMNR, NetBIOS, WS-Discovery, Druckersuche ...
@@ -13399,6 +13483,20 @@ namespace PingMonitor
                     {
                         if (dstMac == "FF-FF-FF-FF-FF-FF") { broadcast++; Count(bcastPerSecond, t); }
                         else { multicast++; Count(mcastPerSecond, t); }
+                    }
+                    if ((d[6] & 1) == 0)
+                    {
+                        SenderFlood sf = Flood(srcMac);
+                        if (sf != null)
+                        {
+                            sf.Frames++;
+                            if (dstMac == "FF-FF-FF-FF-FF-FF") { sf.Bcast++; Inc(sf.BcSec, t); }
+                            long h = 1469598103934665603L;
+                            for (int i = 0; i < len; i++) { h ^= d[i]; h *= 1099511628211L; }
+                            int hc;
+                            if (sf.Hashes.TryGetValue(h, out hc) || sf.Hashes.Count < 3000) sf.Hashes[h] = hc + 1;
+                            if (U16(d, 12) == 0x8808 && len >= 16 && U16(d, 14) == 1) sf.Pause++;   // 802.3x PAUSE
+                        }
                     }
                     curVlan = 0;
                     int tags = 0;
@@ -13644,6 +13742,16 @@ namespace PingMonitor
                     AddEvent(t, "Doppelte IP-Adresse", ipKey + " wird von " + string.Join(" und ", new List<string>(macs).ToArray()) + " verwendet", Finding.Problem);
                 }
             }
+            if (op == 1)
+            {
+                SenderFlood sf = Flood(sMac);
+                if (sf != null)
+                {
+                    sf.Arp++; Inc(sf.ArpSec, t);
+                    int n0;
+                    if (sf.ArpTargets.TryGetValue(tIp, out n0) || sf.ArpTargets.Count < 500) sf.ArpTargets[tIp] = n0 + 1;
+                }
+            }
             if (op == 1 && sIp != tIp)
             {
                 string key = sMac + "|" + tIp;
@@ -13697,6 +13805,11 @@ namespace PingMonitor
             {
                 icmp++;
                 int type = d[l4];
+                if (srcMac.Length > 0 && (type >= 130 && type <= 136 || type == 143))   // Nachbarermittlung/MLD
+                {
+                    SenderFlood sf = Flood(srcMac);
+                    if (sf != null) { sf.Nd++; Inc(sf.NdSec, t); }
+                }
                 if (type == 134 && !raRouters.ContainsKey(src))
                 {
                     raRouters[src] = srcMac;
@@ -14299,6 +14412,59 @@ namespace PingMonitor
                     "(z. B. ein entferntes Gerät, auf das noch eine Verknüpfung/ein Drucker-Port zeigt).",
                     "arp.opcode == 1", "https://de.wikipedia.org/wiki/Address_Resolution_Protocol");
             }
+            // "Gerät dreht frei": Fluten je Absender (ARP, Broadcast, IPv6-Nachbarermittlung/MLD), immer gleiches Paket, PAUSE-Frames
+            Dictionary<string, List<string>> ipsOf = new Dictionary<string, List<string>>();
+            foreach (KeyValuePair<string, string> kv in ipMac) { if (!ipsOf.ContainsKey(kv.Value)) ipsOf[kv.Value] = new List<string>(); if (ipsOf[kv.Value].Count < 3) ipsOf[kv.Value].Add(kv.Key); }
+            double fsecs = Math.Max(1, dur.TotalSeconds);
+            foreach (KeyValuePair<string, SenderFlood> kv in floods)
+            {
+                SenderFlood f = kv.Value;
+                List<string> what = new List<string>();
+                int level = Finding.Info;
+                string filter = "eth.src == " + kv.Key.ToLowerInvariant().Replace('-', ':');
+                int pa = Peak(f.ArpSec), pb = Peak(f.BcSec), pn = Peak(f.NdSec);
+                if (f.Arp >= 200 && (f.Arp / fsecs >= 10 || pa >= 100))
+                {
+                    string top = ""; int topN = 0;
+                    foreach (KeyValuePair<string, int> t in f.ArpTargets) if (t.Value > topN) { topN = t.Value; top = t.Key; }
+                    what.Add("ARP-Flut: " + f.Arp + " ARP-Anfragen (Ø " + (f.Arp / fsecs).ToString("0.#") + "/s, Spitze " + pa + "/s)" +
+                        (topN * 2 >= f.Arp ? ", fast immer nach " + top + " (" + topN + "×) - bekommt keine Antwort oder vergisst sie sofort" : ", nach " + f.ArpTargets.Count + " Adressen"));
+                    level = Math.Max(level, f.Arp / fsecs >= 100 ? Finding.Problem : Finding.Warning);
+                }
+                if (f.Bcast >= 500 && (f.Bcast / fsecs >= 50 || pb >= 300))
+                {
+                    what.Add("Broadcast-Flut: " + f.Bcast + " Broadcasts (Ø " + (f.Bcast / fsecs).ToString("0") + "/s, Spitze " + pb + "/s) - gehen an jedes Gerät im Netz");
+                    level = Math.Max(level, f.Bcast / fsecs >= 300 ? Finding.Problem : Finding.Warning);
+                }
+                if (f.Nd >= 500 && (f.Nd / fsecs >= 20 || pn >= 200))
+                {
+                    what.Add("IPv6-Flut (Nachbarermittlung/MLD): " + f.Nd + " Pakete (Ø " + (f.Nd / fsecs).ToString("0") + "/s, Spitze " + pn + "/s) - bekannt bei Drucker-/IoT-Firmware mit IPv6-Fehlern");
+                    level = Math.Max(level, Finding.Warning);
+                }
+                int same = 0;
+                foreach (int v in f.Hashes.Values) if (v > same) same = v;
+                if (same >= 500 && same * 3 >= f.Frames && same / fsecs >= 5)
+                {
+                    what.Add("Sendet immer wieder dasselbe Paket: " + same + "× byte-gleich (" + (100.0 * same / f.Frames).ToString("0") + " % seiner " + f.Frames + " Pakete) - Dauerschleife in Firmware/Treiber");
+                    level = Math.Max(level, Finding.Warning);
+                }
+                if (f.Pause >= 10)
+                {
+                    what.Add(f.Pause + " PAUSE-Frames (Flow Control) - die Netzwerkkarte hält den Switch an; Dauer-PAUSE = Karte hängt");
+                    level = Math.Max(level, f.Pause >= 1000 ? Finding.Problem : Finding.Warning);
+                }
+                if (what.Count == 0) continue;
+                List<string> ips;
+                string ipText = ipsOf.TryGetValue(kv.Key, out ips) ? ", IP " + string.Join("/", ips.ToArray()) : "";
+                string vendor = MacVendors.Lookup(kv.Key);
+                Add(level, "Gerät dreht frei: " + kv.Key + " (" + vendor + ")",
+                    kv.Key + " (" + vendor + ipText + ") fällt auf:\r\n  • " + string.Join("\r\n  • ", what.ToArray()) + "\r\n" +
+                    "Typisch für Drucker/IoT-Geräte mit Firmware-Fehler, eine hängende Netzwerkkarte oder Schadsoftware.\r\n" +
+                    "Vorgehen: 1. Gerät vom Netz trennen bzw. Switch-Port abschalten - wird das Netz sofort normal, ist es gefunden. 2. Gerät neu starten (Netzteil), " +
+                    "Firmware aktualisieren, nicht genutzte Protokolle (IPv6, Bonjour, WSD, SLP) abschalten. 3. Am Switch-Port Storm Control einschalten, Flow Control aus.",
+                    filter, "");
+            }
+
             // Ein Gerät fragt per ARP sehr viele Adressen ab: Netzwerkscan (Inventarisierung, NAS/Drucker-Suche, Schadsoftware)
             foreach (KeyValuePair<string, HashSet<string>> kv in arpTargets)
                 if (kv.Value.Count >= 100)
@@ -17133,6 +17299,8 @@ namespace PingMonitor
                     foreach (Finding vf in p.VlanIssues) found.Add(VlanIssue(s, p, pk, vf));
                     if (p.Up) { Issue d = DropIssue(s, p, pk); if (d != null) found.Add(d); }
                     if (p.Up && p.RecentPps.Count >= 3) { Issue pp = PpsIssue(s, p, pk); if (pp != null) found.Add(pp); }
+                    if (p.Up && p.AnomSince != DateTime.MinValue) { Issue an = AnomalyIssue(s, p, pk); if (an != null) found.Add(an); }
+                    if (p.PauseHist.Count > 0) { Issue pa = PauseIssue(s, p, pk); if (pa != null) found.Add(pa); }
                     if (p.Up && p.RecentMcastIn.Count >= 3) { Issue mc = McastSourceIssue(s, p, pk); if (mc != null) found.Add(mc); }
                     if (p.IsWan && !p.Up) found.Add(WanIssue(s, p, pk));
                 }
@@ -17423,6 +17591,87 @@ namespace PingMonitor
         }
 
         /// <summary>Paketflut: sehr viele (kleine) Pakete - belastet Firewall, APs und CPU der Geräte, auch wenn Mbit/s gering sind.</summary>
+        /// <summary>
+        /// Endgerät sendet dauerhaft ein Vielfaches seines Normalwerts ("dreht frei": Drucker/IoT mit Firmware-Fehler, hängende
+        /// Netzwerkkarte, Schadsoftware). Kleine Pakete oder viel Broadcast/Multicast ab 3 Minuten, sonst ab 10 Minuten (Druckaufträge,
+        /// Datensicherungen sind kurz bzw. haben große Pakete).
+        /// </summary>
+        static Issue AnomalyIssue(SwitchState s, PortState p, string pk)
+        {
+            if (p.IsInfrastructure || p.Role.Length > 0 || p.Wireless || p.BasePps < 0) return null;
+            TimeSpan dur = DateTime.Now - p.AnomSince;
+            double size = p.InPps > 0 ? p.InMbps * 1000000 / 8 / p.InPps : 0;
+            double share = p.InPps > 0 ? Math.Min(1, (p.BcastPps + p.McastInPps) / p.InPps) : 0;
+            bool suspicious = size > 0 && size < 300 || share >= 0.3;
+            if (dur < TimeSpan.FromMinutes(suspicious ? 3 : 10) || p.InPps < Math.Max(200, p.BasePps * 10)) return null;
+            if (!suspicious && size >= 1000) return null;   // große Pakete = Datenübertragung (Kopie, Sicherung, Video)
+            double factor = p.InPps / Math.Max(1, p.BasePps);
+            PingTarget dev = DevAt(p);
+            string who = dev != null ? dev.Name + " (" + dev.Host + ")" : p.DeviceNames.Length > 0 ? p.DeviceNames : "Gerät an " + p.DisplayName;
+            string kind = dev != null ? (dev.Info + " " + dev.Vendor + " " + dev.Name).ToLowerInvariant() : "";
+            bool printer = System.Text.RegularExpressions.Regex.IsMatch(kind, "drucker|printer|laserjet|officejet|jetdirect|hp ethernet|kyocera|brother|ricoh|canon|epson|lexmark|xerox|konica|sharp");
+            Issue i = New("anomaly", pk, "Gerät", (printer ? "Drucker" : "Gerät") + " sendet das " + factor.ToString("0") + "-Fache seines Normalwerts: " + who, PortObj(s, p),
+                p.InPps >= 5000 || factor >= 100 ? Finding.Problem : Finding.Warning, dur >= TimeSpan.FromMinutes(15) ? Issue.Certain : Issue.Likely);
+            i.Ref = dev != null ? dev.Host : pk; i.Occurred = DateTime.Now;
+            i.Evidence.Add("Pakete vom Gerät in den Switch: jetzt " + p.InPps.ToString("0") + "/s (Spitze " + p.AnomPeak.ToString("0") + "/s), normal Ø " + p.BasePps.ToString("0.#") +
+                "/s - seit " + p.AnomSince.ToString("HH:mm") + " (" + Milestones.Fmt(dur) + ")");
+            i.Evidence.Add("Art: " + (size > 0 ? "Ø " + size.ToString("0") + " Byte je Paket" + (size < 300 ? " (kleine Pakete - keine Datenübertragung)" : "") : "Größe unbekannt") +
+                ", davon Broadcast " + p.BcastPps.ToString("0") + "/s, Multicast " + p.McastInPps.ToString("0") + "/s" + (share >= 0.3 ? " → Broadcast/Multicast geht an ALLE Geräte" : ""));
+            if (p.InPausePs >= 1) i.Evidence.Add("Zusätzlich PAUSE-Frames vom Gerät: " + p.InPausePs.ToString("0") + "/s");
+            if (dev != null && dev.Outages > 0) i.Evidence.Add("Ping-Ausfälle des Geräts: " + dev.Outages);
+            i.Causes.Add(printer ? "Drucker-Firmware-Fehler (bekannt z. B. bei IPv6, Bonjour/mDNS, SLP, WSD) - der Drucker sendet in Dauerschleife" : "Firmware-/Softwarefehler des Geräts sendet in Dauerschleife");
+            i.Causes.Add("Hängende Netzwerkkarte oder Treiber sendet immer wieder dieselben Pakete");
+            i.Causes.Add("Schadsoftware/Scan (viele kleine Pakete an viele Ziele)");
+            i.Causes.Add("Schleife HINTER dem Port (kleiner Switch, Dockingstation, zwei Kabel zum selben Gerät)");
+            i.Fix.Add("Sofort-Test: Kabel des Geräts ziehen bzw. Port " + p.DisplayName + " abschalten - wird das Netz sofort wieder schnell, ist es dieses Gerät.");
+            i.Fix.Add(printer ? "Drucker aus- und einschalten (Netzteil), danach Firmware aktualisieren; nicht genutzte Protokolle am Drucker abschalten (IPv6, Bonjour/mDNS, WSD, SLP, LLMNR, NetBIOS)."
+                              : "Gerät neu starten, Firmware/Treiber aktualisieren; bei PCs auf Schadsoftware prüfen.");
+            i.Fix.Add(IsUniFi(s) ? "Schutz für die Zukunft: UniFi → Port " + PortNo(p) + " → Storm Control (Broadcast/Multicast/Unknown-Unicast begrenzen); Flow Control am Port aus."
+                                 : "Schutz für die Zukunft: am Switch-Port Storm Control/Broadcast-Begrenzung einschalten, Flow Control aus.");
+            i.Narrow.AddRange(Mirror(s, p));
+            i.Narrow.Add(Wireshark("dem Laptop am Spiegel-Port", dev != null ? "host " + dev.Host : "", dev != null && NetTools.MacHex(dev.Mac).Length == 12 ? "eth.src == " + dev.Mac.Replace('-', ':').ToLowerInvariant() : "",
+                "Statistik → Endpunkte/Konversationen: wohin sendet es? Die Mitschnitt-Analyse nennt Fluten je Absender (ARP, Broadcast, IPv6, immer gleiches Paket)."));
+            i.Read.Add("Rate wieder im Normalbereich → behoben. Kommt es nach dem Neustart wieder, ist es ein Firmware-Fehler: Hersteller-Update bzw. Protokolle abschalten.");
+            return i;
+        }
+
+        /// <summary>
+        /// PAUSE-Frames (802.3x): Ein Gerät, das ständig PAUSE sendet, hält den Switch-Port bzw. den Switch an - typisch für eine hängende
+        /// Netzwerkkarte (Drucker, PC im Absturz). Der Switch, der PAUSE an das Gerät sendet, ist selbst überlastet.
+        /// </summary>
+        static Issue PauseIssue(SwitchState s, PortState p, string pk)
+        {
+            long inH = 0, outH = 0; int polls = 0, active = 0;
+            DateTime from = DateTime.Now.AddHours(-1);
+            foreach (long[] x in p.PauseHist)
+                if (new DateTime(x[0]) >= from) { inH += x[1]; outH += x[2]; polls++; if (x[1] > 0) active++; }
+            if (inH < 1000 && outH < 5000) return null;
+            bool fromDev = inH >= 1000;
+            PingTarget dev = DevAt(p);
+            string who = dev != null ? dev.Name + " (" + dev.Host + ")" : p.DeviceNames.Length > 0 ? p.DeviceNames : p.DisplayName;
+            Issue i = New("pause", pk, "Port", fromDev ? "PAUSE-Frames vom Gerät: " + who + " bremst den Switch" : "Switch bremst " + who + " per PAUSE (Überlast)", PortObj(s, p),
+                fromDev && (p.InPausePs >= 1000 || active >= 5) ? Finding.Problem : Finding.Warning, active >= 3 || !fromDev ? Issue.Certain : Issue.Likely);
+            i.Ref = dev != null ? dev.Host : pk; i.Occurred = DateTime.Now;
+            i.Evidence.Add("Zähler der EtherLike-MIB (SNMP): in der letzten Stunde " + inH + " PAUSE-Frames VOM Gerät, " + outH + " AN das Gerät; jetzt " +
+                p.InPausePs.ToString("0") + "/s bzw. " + p.OutPausePs.ToString("0") + "/s; in " + active + " von " + polls + " Abfragen aktiv");
+            if (fromDev)
+            {
+                i.Evidence.Add("Ein PAUSE-Frame hält den Sendeverkehr des Switches zu diesem Port an; bei Dauer-PAUSE stauen sich Puffer - je nach Switch stockt auch der Verkehr anderer Ports (\"ganzes Netz hängt\")");
+                i.Causes.Add("Netzwerkkarte des Geräts hängt bzw. der Treiber verarbeitet keine Pakete mehr (Absturz, Standby-Fehler) - die Karte sendet automatisch PAUSE");
+                i.Causes.Add("Gerät ist überlastet (zu schwache CPU, z. B. Drucker/IoT/NAS) und Flow Control ist aktiv");
+                i.Fix.Add("Gerät neu starten bzw. vom Netz trennen - stockt das Netz danach nicht mehr, ist die Ursache gefunden.");
+                i.Fix.Add(IsUniFi(s) ? "UniFi → Port " + PortNo(p) + " → Flow Control ausschalten (dann ignoriert der Switch PAUSE vom Gerät)." : "Flow Control am Switch-Port " + p.DisplayName + " ausschalten.");
+                i.Fix.Add("Am Gerät Firmware/Treiber aktualisieren; bei PCs \"Flusssteuerung\" in den Netzwerkkarten-Einstellungen aus.");
+            }
+            else
+            {
+                i.Causes.Add("Der Switch kommt nicht hinterher (Uplink voll, kleine Puffer) und bremst das Gerät");
+                i.Fix.Add("Auslastung des Uplinks prüfen; Flow Control nur dort, wo sie gebraucht wird (meist: aus).");
+            }
+            i.Read.Add("Keine PAUSE-Frames mehr in der nächsten Stunde → behoben.");
+            return i;
+        }
+
         static Issue PpsIssue(SwitchState s, PortState p, string pk)
         {
             double mn = double.MaxValue, sum = 0;
