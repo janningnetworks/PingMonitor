@@ -1,4 +1,4 @@
-PingMonitor 4.4 - Geräte per Ping überwachen, Netzwerkfehler finden (App und optional Windows-Dienst)
+PingMonitor 4.5 - Geräte per Ping überwachen, Netzwerkfehler finden (App und optional Windows-Dienst)
 ==========================================================================
 
 Ablage
@@ -457,6 +457,33 @@ Das Geheimnis wird verschlüsselt gespeichert. Genutzt für:
   - Verbindungen durch die Firewall (pf-State-Tabelle) mit Obergrenze - in der Firewall-Zeile der Switch-Ansicht
     ("8432 Verbindungen durch die Firewall (States, 84 % von 10000)"). Ab 80 % Befund "State-Tabelle zu voll".
     ("TCP-Verbindungen zum Gerät selbst" per SNMP zählt dagegen nur Verbindungen zur Firewall: Weboberfläche, SSH.)
+
+Discovery-Verkehr: mDNS/Bonjour, SSDP, LLMNR, NetBIOS, WS-Discovery, Druckersuche
+-------------------------------------------------------------------------------
+Typische "Netz ist langsam"-Ursachen, die kein Switch-Zähler benennt. PingMonitor wertet sie zweifach aus:
+  - Live (Einstellungen -> Optionen -> "Discovery-Verkehr im eigenen Netz mithören", Standard an): Der PC tritt den
+    Gruppen bei (mDNS 224.0.0.251/ff02::fb, SSDP/WS-Discovery 239.255.255.250/ff02::c, LLMNR 224.0.0.252, SLP) und
+    hört die Broadcast-Ports mit. Bewertung in 10-Minuten-Fenstern. Sieht NUR das Netz/VLAN dieses PCs (bzw. des PCs
+    mit dem Dienst). Status unter Netzwerk -> Quellen ("Discovery-Lauscher").
+  - Im Mitschnitt (alle VLANs, die der Mitschnitt enthält, z. B. an der Firewall/am Trunk).
+Erkannt werden je Protokoll: Rate und Spitzen über der Warnschwelle (mDNS ab 20/s, SSDP ab 10/s, LLMNR/NetBIOS ab 5/s,
+SNMP-Druckersuche per Broadcast ab 0,5/s ...), der Hauptverursacher (mit Gerätename/Hersteller und bei SSDP der
+SERVER-Kennung), ein Gerät, das ständig dasselbe fragt (z. B. Chromecast nach _googlecast, Windows per LLMNR nach einem
+alten Servernamen oder "WPAD"), doppelt verteilte Pakete (mDNS-Reflektor/Repeater zwischen VLANs, Schleife) sowie die
+gesuchten Dienste/Namen. Weitere Protokolle: NetBIOS-Browser, SLP, Epson/Canon-Druckersuche, Dropbox LAN-Sync, Spotify,
+Steam, Plex, Tuya/Smart-Home, Ubiquiti-Discovery. Jeder Befund hat Ursachen und Abhilfe (z. B. LLMNR/NetBIOS per GPO
+abschalten, nur EIN mDNS-Reflektor, IGMP-Snooping, Drucker mit Standard-TCP/IP-Port statt Suche/WSD).
+Zusätzlich im Mitschnitt: "Kein IGMP-Querier zu sehen" (Multicast ohne IGMP-Abfragen - Snooping-Switches verlieren
+Gruppen oder fluten), mehrere IGMP-Querier, "Gerät tastet das Netz ab (ARP-Scan)".
+
+TCP-Wiederholungen (Retransmissions)
+-----------------------------------
+  - Dieser PC: aus den Windows-TCP-Zählern (gesendete vs. wiederholte Segmente), laufend gemessen. Befund ab 1 %
+    in der letzten Stunde (mind. 5000 Segmente), Problem ab 5 %. Auch in "Diesen PC prüfen" und unter Quellen.
+  - Andere Windows-PCs: über den Agenten (meldet stündlich, wenn auffällig, und "wieder normal").
+  - Im Mitschnitt: Anteil, Verbindungen mit den meisten Wiederholungen, Häufungen auf der Zeitachse.
+Ursache ist fast immer Paketverlust auf dem Weg (Kabel/CRC, Halbduplex, WLAN, Überlast) - die anderen Befunde zum
+Gerät zeigen meist, wo.
 
 Proxmox-API
 -----------

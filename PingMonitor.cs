@@ -21,6 +21,7 @@ using System.IO;
 using System.Net;
 using System.Net.Mail;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.ServiceProcess;
@@ -34,8 +35,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCompany("janning networks")]
 [assembly: System.Reflection.AssemblyProduct("PingMonitor")]
 [assembly: System.Reflection.AssemblyCopyright("janning networks")]
-[assembly: System.Reflection.AssemblyVersion("4.4.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("4.4.0.0")]
+[assembly: System.Reflection.AssemblyVersion("4.5.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("4.5.0.0")]
 
 namespace PingMonitor
 {
@@ -2214,7 +2215,7 @@ namespace PingMonitor
 
         public MainForm()
         {
-            Text = "PingMonitor 4.4";
+            Text = "PingMonitor 4.5";
             Size = new Size(1360, 800);
             MinimumSize = new Size(850, 520);
             StartPosition = FormStartPosition.CenterScreen;
@@ -2535,7 +2536,7 @@ namespace PingMonitor
             });
             help.DropDownItems.Add("Über PingMonitor", null, delegate
             {
-                MessageBox.Show(this, "PingMonitor 4.4\n\nÜberwacht Geräte, Switches, WLAN, Firewall und Internet-Leitung, erkennt Fehler im Netz mit Sicherheitsstufe " +
+                MessageBox.Show(this, "PingMonitor 4.5\n\nÜberwacht Geräte, Switches, WLAN, Firewall und Internet-Leitung, erkennt Fehler im Netz mit Sicherheitsstufe " +
                     "und Maßnahmenplan und prüft Maßnahmen nach.\n\nProgrammordner: " + Config.BaseDir, Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
             });
             m.Items.AddRange(new ToolStripItem[] { file, dev, net, ana, set, svc, help });
@@ -2653,6 +2654,14 @@ namespace PingMonitor
                 {
                     DateTime.TryParseExact(f[2], Fmt.Time, null, System.Globalization.DateTimeStyles.None, out t);
                     sb.AppendLine((f[1] == "1" ? "✓ " : "– ") + "Windows-Ereignisse dieses PCs: " + (f[1] == "1" ? "gelesen " + age(t) : "aus"));
+                }
+                else if (f[0] == "DW" && f.Count >= 4)
+                    sb.AppendLine((f[1] == "1" ? "✓ " : "– ") + "Discovery-Lauscher (mDNS, SSDP, LLMNR, WS-Discovery ...): " + (f[1] == "1" ? f[2] + (f[3].Length > 0 ? " - " + f[3] : " - noch kein Verkehr") : "aus"));
+                else if (f[0] == "TR" && f.Count >= 4)
+                {
+                    double rr;
+                    double.TryParse(f[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out rr);
+                    sb.AppendLine((rr >= 0 ? "✓ " : "– ") + "TCP-Wiederholungen dieses PCs (1 h): " + (rr >= 0 ? rr.ToString("0.00") + " % (" + f[3] + " von " + f[2] + " Segmenten)" : "wird ermittelt"));
                 }
             }
             sb.AppendLine((LogForward.Target.Length > 0 ? "✓ " : "– ") + "Weiterleitung: " + (LogForward.Target.Length > 0 ? LogForward.Target + (LogForward.OnlyWindows ? " (nur Windows-Ereignisse, Agent)" : "") : "aus") +
@@ -6673,6 +6682,8 @@ namespace PingMonitor
                     if (Syslog.Enabled) { if (!Syslog.Running) Syslog.Start(owner); }
                     else if (Syslog.Running) Syslog.Stop();
                     try { WinEvents.Poll(owner); } catch { }
+                    try { DiscoveryWatch.Tick(); } catch { }
+                    try { TcpRetrans.Sample(); } catch { }
                     try { Agent.Tick(owner); } catch { }
                     try { Retention.Run(); } catch { }
                     AssignRoles();
@@ -7611,6 +7622,12 @@ namespace PingMonitor
             foreach (KeyValuePair<string, string[]> kv in Syslog.AgentList())
                 sb.Append("AG;" + Fmt.Csv(kv.Key) + ";" + kv.Value[0] + ";" + kv.Value[1] + "\r\n");
             sb.Append("WE;" + (WinEvents.Enabled ? "1" : "0") + ";" + (WinEvents.LastPoll == DateTime.MinValue ? "" : WinEvents.LastPoll.ToString(Fmt.Time)) + "\r\n");
+            TimeSpan dwDur;
+            DiscoveryStats dw = DiscoveryWatch.Window(out dwDur);
+            sb.Append("DW;" + (DiscoveryWatch.Enabled ? "1" : "0") + ";" + Fmt.Csv(DiscoveryWatch.Status) + ";" + Fmt.Csv(dw.Summary(dwDur)) + "\r\n");
+            long ts, tr;
+            double rr = TcpRetrans.Rate(TimeSpan.FromHours(1), out ts, out tr);
+            sb.Append("TR;" + rr.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + ";" + ts + ";" + tr + "\r\n");
             lock (sync)
                 foreach (Conflict c in conflicts.Values)
                     sb.Append("C;" + c.Level + ";" + c.Since.ToString(Fmt.Time) + ";" + Fmt.Csv(c.Title) + ";" + Fmt.Csv(c.Detail) + "\r\n");
@@ -11463,6 +11480,7 @@ namespace PingMonitor
                     if (t.Contains("zurückgesetzt")) return "nicreset";
                     if (t.Contains("adresskonflikt")) return "ipconflict";
                     if (t.Contains("energiespar-/geschwindigkeit")) return "nicpower";
+                    if (t.Contains("tcp-wiederholungen")) return "retrans";
                     if (t.Contains("standby") || t.Contains("ruhezustand") || t.Contains("aufgewacht") || t.Contains("heruntergefahren") || t.Contains("neustart") || t.Contains("gestartet")) return "power";
                     if (t.Contains("getrennt") || t.Contains("link") || t.Contains("treiber")) return "link";
                     return "";
@@ -12617,6 +12635,15 @@ namespace PingMonitor
             List<WinEvent> ev = Read(TimeSpan.FromDays(days), 3000);
             Dictionary<string, int> count = new Dictionary<string, int>();
             foreach (WinEvent e in ev) { int c; count.TryGetValue(e.Title, out c); count[e.Title] = c + 1; }
+            long segs, resent;
+            double rr = TcpRetrans.Rate(TimeSpan.FromHours(1), out segs, out resent);
+            string span = "letzte Stunde";
+            if (rr < 0 || segs < 1000) { rr = TcpRetrans.SinceBoot(out segs, out resent); span = "seit dem Windows-Start"; }
+            sb.AppendLine("=== TCP-WIEDERHOLUNGEN (Windows-Zähler) ===");
+            sb.AppendLine(rr >= 0 ? rr.ToString("0.00") + " % der gesendeten Segmente wurden wiederholt (" + resent + " von " + segs + ", " + span + ") - " +
+                (rr < 0.5 ? "normal." : rr < 2 ? "erhöht: Paketverlust auf dem Weg (WLAN, Kabel, Überlast) prüfen." : "HOCH: deutlicher Paketverlust - Port-/WLAN-Befunde und Mitschnitt ansehen.")
+                : "Nicht lesbar.");
+            sb.AppendLine();
             sb.AppendLine("=== ZUSAMMENFASSUNG ===");
             if (ev.Count == 0) sb.AppendLine("Keine relevanten Ereignisse gefunden (oder Ereignisprotokoll nicht lesbar).");
             List<KeyValuePair<string, int>> top = new List<KeyValuePair<string, int>>(count);
@@ -12774,7 +12801,8 @@ namespace PingMonitor
     static class Agent
     {
         public static bool Active { get { return Config.Cached("Agent.Aktiv", "0") == "1"; } }
-        static DateTime lastBeat = DateTime.MinValue, lastNic = DateTime.MinValue;
+        static DateTime lastBeat = DateTime.MinValue, lastNic = DateTime.MinValue, lastRetrans = DateTime.Now;
+        static bool retransHigh;
         static string lastNicText = "";
 
         /// <summary>Einrichten: Weiterleitung nur der Windows-Ereignisse an die Zentrale, Dienst installieren und starten.</summary>
@@ -12798,6 +12826,24 @@ namespace PingMonitor
             {
                 lastBeat = DateTime.Now;
                 Write("Agent aktiv", "PingMonitor-Agent auf " + Environment.MachineName + " (" + Environment.OSVersion.VersionString + ") meldet an " + LogForward.Target, owner);
+            }
+            // TCP-Wiederholungen dieses PCs: stündlich melden, wenn auffällig (und einmal "wieder normal")
+            TcpRetrans.Sample();
+            if ((DateTime.Now - lastRetrans).TotalMinutes >= 60)
+            {
+                long segs, resent;
+                double rr = TcpRetrans.Rate(TimeSpan.FromHours(1), out segs, out resent);
+                if (rr >= 0) lastRetrans = DateTime.Now;
+                if (rr >= 1 && segs >= 5000)
+                {
+                    Write("TCP-Wiederholungen hoch", rr.ToString("0.00") + " % (" + resent + " von " + segs + " Segmenten in 1 h)", owner);
+                    retransHigh = true;
+                }
+                else if (retransHigh && rr >= 0 && rr < 0.5)
+                {
+                    Write("TCP-Wiederholungen normal", rr.ToString("0.00") + " % (" + resent + " von " + segs + " Segmenten in 1 h)", owner);
+                    retransHigh = false;
+                }
             }
             if ((DateTime.Now - lastNic).TotalHours >= 6)
             {
@@ -13286,6 +13332,11 @@ namespace PingMonitor
         readonly Dictionary<string, Flow> flows = new Dictionary<string, Flow>();
         readonly Dictionary<long, int> retransPerSecond = new Dictionary<long, int>();
         int tcpData, tcpRetrans, tcpDupAck, tcpRst, tcpSyn, tcpSynAck, tcpZeroWin;
+        readonly DiscoveryStats discovery = new DiscoveryStats();
+        int igmpQueries, igmpReports; long mcastData;   // IGMP-Querier vorhanden? Multicast-Nutzdaten (ohne 224.0.0.x)
+        readonly Dictionary<string, string> igmpQueriers = new Dictionary<string, string>();
+        readonly Dictionary<string, HashSet<string>> arpTargets = new Dictionary<string, HashSet<string>>();   // Anfragender -> gefragte IPs   // mDNS, SSDP, LLMNR, NetBIOS, WS-Discovery, Druckersuche ...
+        readonly Dictionary<string, string> ipMac = new Dictionary<string, string>();   // Absender-IP -> MAC (für Herstellernamen)
         readonly Dictionary<string, int> synTargets = new Dictionary<string, int>();
         readonly HashSet<string> synAnswered = new HashSet<string>();
 
@@ -13597,6 +13648,9 @@ namespace PingMonitor
             {
                 string key = sMac + "|" + tIp;
                 int n; arpRequests.TryGetValue(key, out n); arpRequests[key] = n + 1;
+                HashSet<string> tg;
+                if (!arpTargets.TryGetValue(sMac, out tg) && arpTargets.Count < 2000) { tg = new HashSet<string>(); arpTargets[sMac] = tg; }
+                if (tg != null && tg.Count < 5000) tg.Add(tIp);
                 if (!arpFirstReq.ContainsKey(key)) arpFirstReq[key] = t;
             }
             else if (op == 2)
@@ -13619,7 +13673,15 @@ namespace PingMonitor
             long b; talkers.TryGetValue(src, out b); talkers[src] = b + total;
             if ((flagsFrag & 0x1FFF) != 0 || (flagsFrag & 0x2000) != 0) { fragments++; if ((flagsFrag & 0x1FFF) != 0) return; }
             int l4 = p + ihl, end = p + total;
-            if (proto == 1) { icmp++; DecodeIcmp(t, d, l4, end, src, dst); }
+            int o1;
+            if ((dst.StartsWith("22") || dst.StartsWith("23")) && int.TryParse(dst.Split('.')[0], out o1) && o1 >= 224 && o1 <= 239 && !dst.StartsWith("224.0.0.")) mcastData++;
+            if (proto == 2 && l4 < end)
+            {
+                int it = d[l4];
+                if (it == 0x11) { igmpQueries++; if (!igmpQueriers.ContainsKey(src) && igmpQueriers.Count < 20) igmpQueriers[src] = srcMac; }
+                else if (it == 0x12 || it == 0x16 || it == 0x22) igmpReports++;
+            }
+            else if (proto == 1) { icmp++; DecodeIcmp(t, d, l4, end, src, dst); }
             else if (proto == 6) { tcp++; DecodeTcp(t, d, l4, end, src, dst); }
             else if (proto == 17) { udp++; DecodeUdp(t, d, l4, end, src, dst, srcMac); }
         }
@@ -13645,6 +13707,11 @@ namespace PingMonitor
             {
                 udp++;
                 if (U16(d, l4) == 547 && U16(d, l4 + 2) == 546 && l4 + 9 <= end && (d[l4 + 8] == 2 || d[l4 + 8] == 7)) dhcpv6Servers.Add(src);
+                else if (end > l4 + 8)
+                {
+                    discovery.Add(t, src, Ip6(d, p + 24), U16(d, l4), U16(d, l4 + 2), d, l4 + 8, end - l4 - 8);
+                    if (srcMac.Length > 0 && ipMac.Count < 5000) ipMac[src] = srcMac;
+                }
             }
             else if (next == 6) tcp++;
         }
@@ -13757,6 +13824,11 @@ namespace PingMonitor
             int data = p + 8;
             if ((sport == 67 || sport == 68) && (dport == 67 || dport == 68)) DecodeDhcp(t, d, data, end, src, srcMac);
             else if (dport == 53 || sport == 53) DecodeDns(t, d, data, end, src, dst, sport, dport);
+            else if (end > data)
+            {
+                discovery.Add(t, src, dst, sport, dport, d, data, end - data);
+                if (srcMac.Length > 0 && ipMac.Count < 5000) ipMac[src] = srcMac;
+            }
         }
 
         void DecodeDhcp(DateTime t, byte[] d, int p, int end, string src, string srcMac)
@@ -14227,6 +14299,29 @@ namespace PingMonitor
                     "(z. B. ein entferntes Gerät, auf das noch eine Verknüpfung/ein Drucker-Port zeigt).",
                     "arp.opcode == 1", "https://de.wikipedia.org/wiki/Address_Resolution_Protocol");
             }
+            // Ein Gerät fragt per ARP sehr viele Adressen ab: Netzwerkscan (Inventarisierung, NAS/Drucker-Suche, Schadsoftware)
+            foreach (KeyValuePair<string, HashSet<string>> kv in arpTargets)
+                if (kv.Value.Count >= 100)
+                    Add(kv.Value.Count >= 500 ? Finding.Warning : Finding.Info, "Gerät tastet das Netz ab (ARP-Scan)",
+                        kv.Key + " (" + MacVendors.Lookup(kv.Key) + ") hat per ARP nach " + kv.Value.Count + " verschiedenen Adressen gefragt. Gewollt bei Inventarisierung, " +
+                        "Netzwerkscannern (auch PingMonitor \"Netzwerk scannen\"), Überwachung oder NAS/Drucker-Software, die Geräte sucht. Ist der Absender ein normaler PC, " +
+                        "ein Drucker oder ein IoT-Gerät ohne Grund dafür: Software prüfen (Schadsoftware/Würmer scannen so nach Opfern).",
+                        "arp.opcode == 1 && eth.src == " + kv.Key.ToLowerInvariant().Replace('-', ':'), "");
+            // Multicast ohne IGMP-Querier: Switches mit IGMP-Snooping vergessen Gruppen bzw. fluten alles
+            if (dur.TotalSeconds >= 150 && mcastData >= 1000 && igmpQueries == 0)
+                Add(Finding.Warning, "Kein IGMP-Querier zu sehen",
+                    mcastData + " Multicast-Pakete (IPTV, Kameras, Sonos, Discovery), aber in " + Milestones.Fmt(dur) + " keine einzige IGMP-Abfrage (Query). " +
+                    "Ohne Querier verlieren Switches mit IGMP-Snooping nach einigen Minuten die Gruppenmitglieder (Bild/Ton bricht ab) oder fluten Multicast an alle Ports " +
+                    "(\"Netz langsam\", WLAN überlastet). Abhilfe: Auf genau einem Gerät je VLAN den IGMP-Querier aktivieren (UniFi: Netzwerk → IGMP-Snooping + \"Querier\" bzw. " +
+                    "Multicast-Einstellungen; sonst Firewall/Core-Switch), IGMP-Snooping auf allen Switches einschalten.", "igmp", "https://de.wikipedia.org/wiki/Internet_Group_Management_Protocol");
+            else if (igmpQueriers.Count > 1)
+            {
+                List<string> q = new List<string>();
+                foreach (KeyValuePair<string, string> kv in igmpQueriers) q.Add(kv.Key + (kv.Value.Length > 0 ? " (" + MacVendors.Lookup(kv.Value) + ")" : ""));
+                Add(Finding.Info, igmpQueriers.Count + " IGMP-Querier", "Mehrere Geräte senden IGMP-Abfragen: " + string.Join(", ", q.ToArray()) +
+                    ". Gewählt wird automatisch die niedrigste IP - meist harmlos. Bei Multicast-Abbrüchen nur einen Querier je VLAN festlegen.", "igmp.type == 0x11", "");
+            }
+
             if (dur.TotalSeconds > 0 && gratuitous > 50 && gratuitous / dur.TotalMinutes > 30)
                 Add(Finding.Info, "Viele Gratuitous-ARP", gratuitous + " Gratuitous-ARP-Pakete (Geräte melden sich selbst an). Bei sehr vielen: Geräte, die ständig ihre Verbindung neu aufbauen, oder Hochverfügbarkeits-Wechsel.", "arp.isgratuitous == 1", "");
 
@@ -14342,6 +14437,14 @@ namespace PingMonitor
                         "Weiterleitung zum Provider, ggf. zweiten DNS-Server eintragen.", "dns.flags.rcode != 0 || dns.flags.response == 0", "");
             }
 
+            // Discovery-Protokolle: mDNS/Bonjour, SSDP, LLMNR/NetBIOS, WS-Discovery, Druckersuche, App-Suchen
+            foreach (DiscoFinding df in discovery.Evaluate(dur, delegate (string ip)
+            {
+                string mac;
+                return ipMac.TryGetValue(ip, out mac) ? MacVendors.Lookup(mac) : "";
+            }))
+                Add(df.Level, df.Title, df.Text.TrimEnd(), df.Filter, df.Proto.StartsWith("mDNS") ? "https://de.wikipedia.org/wiki/Zeroconf" : "");
+
             if (Drops > 0)
                 Add(Finding.Info, Drops + " Pakete beim Aufzeichnen verloren", "Der Mitschnitt selbst ist unvollständig (das Aufzeichnungsprogramm kam nicht hinterher). Einzelne \"Verluste\" können daher vom Mitschnitt stammen.", "", "");
 
@@ -14408,6 +14511,8 @@ namespace PingMonitor
             sb.AppendLine("DNS-Server:" + (dnsServers.Count == 0 ? " keiner gesehen" : ""));
             foreach (KeyValuePair<string, DnsServer> kv in dnsServers)
                 sb.AppendLine("  • " + kv.Key + ": " + kv.Value.Queries + " Anfragen, " + kv.Value.Answers + " Antworten" + (kv.Value.Answers > 0 ? ", Ø " + (kv.Value.RttSum / kv.Value.Answers).ToString("0") + " ms" : ""));
+            string disc = discovery.Summary(dur);
+            if (disc.Length > 0) sb.AppendLine("Discovery/Namensdienste: " + disc);
             if (raRouters.Count > 0) { sb.AppendLine("IPv6-Router:"); foreach (KeyValuePair<string, string> kv in raRouters) sb.AppendLine("  • " + kv.Key + "  " + kv.Value); }
             if (neighbors.Count > 0) { sb.AppendLine("Nachbar-Switches (LLDP/CDP) - hier hängt der mitschneidende Anschluss:"); foreach (string v in neighbors.Values) sb.AppendLine("  • " + v); }
             sb.AppendLine("TCP: " + tcpData + " Datenpakete, " + tcpRetrans + " Wiederholungen, " + tcpDupAck + " doppelte ACK-Serien, " + tcpRst + " Abbrüche (RST), " + tcpSyn + " Verbindungsaufbauten");
@@ -14588,6 +14693,591 @@ namespace PingMonitor
     /// Mitschnitt auf DIESEM PC mit dem in Windows 10/11 eingebauten pktmon (keine Installation nötig, Administratorrechte nötig):
     /// starten, stoppen, in pcapng umwandeln. Die pktmon-Befehle laufen in einer Skriptdatei mit Administratorrechten (UAC-Abfrage).
     /// </summary>
+    /// <summary>Ergebnis der Discovery-Auswertung (für Mitschnitt-Befunde und Live-Befunde).</summary>
+    class DiscoFinding
+    {
+        public int Level;
+        public string Key = "", Proto = "", Title = "", Text = "", Filter = "", TopIp = "";
+        public readonly List<string> Evidence = new List<string>(), Causes = new List<string>(), Fix = new List<string>();
+    }
+
+    /// <summary>
+    /// Zählt Discovery- und Namensdienst-Pakete (mDNS/Bonjour, SSDP/UPnP, LLMNR, NetBIOS, WS-Discovery, Druckersuche per
+    /// SNMP-Broadcast/SLP/Epson/Canon, Dropbox, Spotify, Steam, Plex, Tuya, Ubiquiti) je Protokoll und Absender und bewertet:
+    /// Rate und Spitzen, Hauptverursacher, ständig wiederholte Anfragen, doppelt verteilte Pakete (Reflektor/Schleife).
+    /// Wird vom Mitschnitt (alle Pakete) und vom Live-Lauscher (Multicast/Broadcast im eigenen Netz) gefüttert.
+    /// </summary>
+    class DiscoveryStats
+    {
+        public class Proto
+        {
+            public int Port; public string Name = "", Filter = "", Note = "";
+            public double Warn, Problem;
+            public long Packets, Bytes, Queries, Answers;
+            public readonly Dictionary<string, long> BySender = new Dictionary<string, long>();
+            public readonly Dictionary<long, int> Per10s = new Dictionary<long, int>();
+            public readonly Dictionary<string, int> Repeats = new Dictionary<string, int>();   // Absender|Name -> Anzahl
+            public readonly Dictionary<string, int> Names = new Dictionary<string, int>();     // gefragte Namen/Dienste
+            public readonly Dictionary<string, string> Servers = new Dictionary<string, string>();   // SSDP: Absender -> SERVER-Kopf
+            public long Reflected;
+        }
+
+        // Port, Name, Wireshark-Filter, Warnung ab Pakete/s, Problem ab Pakete/s, Erläuterung
+        static readonly object[][] Table = {
+            new object[] { 5353, "mDNS (Bonjour/Avahi)", "mdns", 20.0, 100.0, "Apple-Geräte, Drucker, Chromecast, Sonos, Smart-TVs melden ihre Dienste" },
+            new object[] { 1900, "SSDP (UPnP)", "ssdp", 10.0, 50.0, "Smart-TVs, Mediaplayer, Router, Windows-Medienfreigabe suchen sich gegenseitig" },
+            new object[] { 5355, "LLMNR", "llmnr", 5.0, 30.0, "Windows fragt so nach Namen, die DNS nicht kennt" },
+            new object[] { 137, "NetBIOS-Namensdienst", "nbns", 5.0, 30.0, "Windows-Namensauflösung per Broadcast (Altlast)" },
+            new object[] { 138, "NetBIOS-Browser", "browser", 2.0, 20.0, "Windows-\"Netzwerkumgebung\" (Altlast)" },
+            new object[] { 3702, "WS-Discovery", "udp.port == 3702", 5.0, 30.0, "Windows-Netzwerkerkennung, WSD-Drucker und -Scanner" },
+            new object[] { 161, "SNMP-Druckersuche (Broadcast)", "snmp && (eth.dst == ff:ff:ff:ff:ff:ff || ip.dst == 255.255.255.255)", 0.5, 5.0, "Druckertreiber (z. B. HP, Brother) suchen per SNMP-Broadcast" },
+            new object[] { 427, "SLP (Dienstsuche)", "srvloc", 2.0, 20.0, "Drucker/Kopierer und deren Treiber" },
+            new object[] { 3289, "Epson-Druckersuche (ENPC)", "udp.port == 3289", 1.0, 10.0, "Epson-Treiber/-Software" },
+            new object[] { 8612, "Canon-Druckersuche (BJNP)", "udp.port == 8612", 1.0, 10.0, "Canon-Treiber/-Software" },
+            new object[] { 17500, "Dropbox LAN-Sync", "db-lsp-disc", 1.0, 10.0, "Dropbox-Clients suchen sich im LAN" },
+            new object[] { 57621, "Spotify Connect", "udp.port == 57621", 1.0, 10.0, "Spotify-Clients" },
+            new object[] { 27036, "Steam-Suche", "udp.port == 27036", 1.0, 10.0, "Steam-Clients" },
+            new object[] { 32414, "Plex-Suche (GDM)", "udp.port == 32412 || udp.port == 32414", 1.0, 10.0, "Plex-Server/-Clients" },
+            new object[] { 6667, "Tuya/Smart-Home", "udp.port == 6666 || udp.port == 6667", 1.0, 10.0, "Smart-Steckdosen/-Lampen (Tuya, Smart Life)" },
+            new object[] { 10001, "Ubiquiti-Discovery", "udp.port == 10001", 2.0, 20.0, "UniFi-Geräte melden sich" },
+        };
+
+        public static readonly int[] Ports = { 5353, 1900, 5355, 137, 138, 3702, 161, 427, 3289, 8612, 17500, 57621, 27036, 32414, 32412, 6666, 6667, 10001 };
+
+        public readonly Dictionary<int, Proto> Protos = new Dictionary<int, Proto>();
+        public DateTime First = DateTime.MinValue, Last = DateTime.MinValue;
+        readonly Dictionary<long, KeyValuePair<string, DateTime>> recent = new Dictionary<long, KeyValuePair<string, DateTime>>();   // Prüfsumme -> Absender, Zeit
+        public string OwnIp = "";
+
+        public DiscoveryStats()
+        {
+            foreach (object[] r in Table)
+            {
+                Proto p = new Proto();
+                p.Port = (int)r[0]; p.Name = (string)r[1]; p.Filter = (string)r[2]; p.Warn = (double)r[3]; p.Problem = (double)r[4]; p.Note = (string)r[5];
+                Protos[p.Port] = p;
+            }
+        }
+
+        static int Map(int port)
+        {
+            if (port == 32412) return 32414;
+            if (port == 6666) return 6667;
+            return port;
+        }
+
+        /// <summary>Ein UDP-Paket übernehmen (nur Discovery-Ports; SNMP nur als Broadcast/Multicast).</summary>
+        public void Add(DateTime t, string src, string dst, int sport, int dport, byte[] d, int off, int len)
+        {
+            bool group = dst == "255.255.255.255" || dst.EndsWith(".255") || dst.StartsWith("224.") || dst.StartsWith("239.") || dst.StartsWith("ff0", StringComparison.OrdinalIgnoreCase);
+            Proto p;
+            if (!Protos.TryGetValue(Map(dport), out p) && !Protos.TryGetValue(Map(sport), out p)) return;
+            if (p.Port == 161 && !group) return;
+            if (p.Port != 5353 && p.Port != 137 && p.Port != 5355 && !group && Map(dport) != p.Port) return;   // Antworten an einzelne Geräte zählen nicht als Flut
+            lock (this)
+            {
+                if (First == DateTime.MinValue || t < First) First = t;
+                if (t > Last) Last = t;
+                p.Packets++; p.Bytes += len;
+                long n; p.BySender.TryGetValue(src, out n); p.BySender[src] = n + 1;
+                long bucket = t.Ticks / (TimeSpan.TicksPerSecond * 10);
+                int b; p.Per10s.TryGetValue(bucket, out b); p.Per10s[bucket] = b + 1;
+                if (p.Per10s.Count > 2000) p.Per10s.Remove(MinKey(p.Per10s));
+                try { Parse(p, t, src, d, off, len); } catch { }
+                // Gleiches Paket kurz danach von einem ANDEREN Absender: wird weiterverteilt (Reflektor, Repeater, Schleife)
+                if (p.Port == 5353 || p.Port == 1900)
+                {
+                    long h = Hash(d, off, len) ^ p.Port;
+                    KeyValuePair<string, DateTime> seen;
+                    if (recent.TryGetValue(h, out seen) && seen.Key != src && (t - seen.Value).TotalSeconds < 2) p.Reflected++;
+                    recent[h] = new KeyValuePair<string, DateTime>(src, t);
+                    if (recent.Count > 5000)
+                    {
+                        List<long> old = new List<long>();
+                        foreach (KeyValuePair<long, KeyValuePair<string, DateTime>> kv in recent) if ((t - kv.Value.Value).TotalSeconds > 5) old.Add(kv.Key);
+                        foreach (long k in old) recent.Remove(k);
+                        if (recent.Count > 5000) recent.Clear();
+                    }
+                }
+            }
+        }
+
+        static long MinKey(Dictionary<long, int> d) { long m = long.MaxValue; foreach (long k in d.Keys) if (k < m) m = k; return m; }
+
+        static long Hash(byte[] d, int off, int len)
+        {
+            long h = 1469598103934665603L;
+            for (int i = off; i < off + len && i < d.Length; i++) { h ^= d[i]; h *= 1099511628211L; }
+            return h;
+        }
+
+        static void Count(Dictionary<string, int> d, string k, int max)
+        {
+            if (k.Length == 0) return;
+            int n;
+            if (!d.TryGetValue(k, out n) && d.Count >= max) return;
+            d[k] = n + 1;
+        }
+
+        void Parse(Proto p, DateTime t, string src, byte[] d, int off, int len)
+        {
+            if (p.Port == 5353 || p.Port == 5355)
+            {
+                if (len < 12) return;
+                bool response = (d[off + 2] & 0x80) != 0;
+                int qd = d[off + 4] << 8 | d[off + 5], an = d[off + 6] << 8 | d[off + 7];
+                if (response) p.Answers++; else p.Queries++;
+                int pos = off + 12, end = off + len;
+                for (int i = 0; i < qd && i < 20 && pos < end; i++)
+                {
+                    string name = Name(d, ref pos, off, end);
+                    pos += 4;
+                    if (!response) { Count(p.Repeats, src + "|" + name, 500); Count(p.Names, Service(name), 300); }
+                }
+                for (int i = 0; i < an && i < 30 && pos + 10 <= end; i++)
+                {
+                    string name = Name(d, ref pos, off, end);
+                    if (pos + 10 > end) break;
+                    int type = d[pos] << 8 | d[pos + 1], rdl = d[pos + 8] << 8 | d[pos + 9];
+                    pos += 10;
+                    if (type == 12) { int rp = pos; Count(p.Names, Service(Name(d, ref rp, off, end)), 300); }
+                    else Count(p.Names, Service(name), 300);
+                    pos += rdl;
+                }
+            }
+            else if (p.Port == 137)
+            {
+                if (len < 12 + 34) return;
+                bool response = (d[off + 2] & 0x80) != 0;
+                if (response) { p.Answers++; return; }
+                p.Queries++;
+                if (d[off + 12] != 32) return;
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < 15; i++) sb.Append((char)(((d[off + 13 + i * 2] - 'A') << 4) | (d[off + 14 + i * 2] - 'A')));
+                string name = sb.ToString().Trim();
+                Count(p.Repeats, src + "|" + name, 500); Count(p.Names, name, 300);
+            }
+            else if (p.Port == 1900)
+            {
+                string text = Encoding.ASCII.GetString(d, off, Math.Min(len, 1500));
+                string first = text.Split('\n')[0].Trim();
+                if (first.StartsWith("M-SEARCH")) p.Queries++; else p.Answers++;
+                string st = Header(text, first.StartsWith("M-SEARCH") ? "ST" : "NT");
+                if (first.StartsWith("M-SEARCH")) Count(p.Repeats, src + "|" + st, 500);
+                Count(p.Names, st, 300);
+                string server = Header(text, "SERVER");
+                if (server.Length == 0) server = Header(text, "USER-AGENT");
+                if (server.Length > 0 && !p.Servers.ContainsKey(src) && p.Servers.Count < 300) p.Servers[src] = server.Length > 80 ? server.Substring(0, 80) : server;
+            }
+            else if (p.Port == 3702)
+            {
+                string text = Encoding.UTF8.GetString(d, off, Math.Min(len, 4000));
+                if (text.Contains("Probe") && !text.Contains("ProbeMatch")) { p.Queries++; Count(p.Repeats, src + "|Probe", 500); }
+                else p.Answers++;
+            }
+            else p.Queries++;
+        }
+
+        static string Header(string text, string name)
+        {
+            foreach (string l in text.Split('\n'))
+            {
+                int c = l.IndexOf(':');
+                if (c > 0 && string.Equals(l.Substring(0, c).Trim(), name, StringComparison.OrdinalIgnoreCase)) return l.Substring(c + 1).Trim();
+            }
+            return "";
+        }
+
+        /// <summary>"_googlecast._tcp.local" aus einem längeren Namen, sonst der Name selbst.</summary>
+        static string Service(string name)
+        {
+            System.Text.RegularExpressions.Match m = System.Text.RegularExpressions.Regex.Match(name, @"(_[A-Za-z0-9-]+\._(tcp|udp))\.local", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            return m.Success ? m.Groups[1].Value.ToLowerInvariant() : name;
+        }
+
+        static string Name(byte[] d, ref int pos, int msg, int end)
+        {
+            StringBuilder sb = new StringBuilder();
+            int p = pos, jumps = 0;
+            bool jumped = false;
+            while (p < end && jumps < 20)
+            {
+                int l = d[p];
+                if (l == 0) { p++; break; }
+                if ((l & 0xC0) == 0xC0)
+                {
+                    if (p + 1 >= end) break;
+                    if (!jumped) pos = p + 2;
+                    jumped = true;
+                    p = msg + ((l & 0x3F) << 8 | d[p + 1]);
+                    jumps++;
+                    continue;
+                }
+                if (p + 1 + l > end) break;
+                if (sb.Length > 0) sb.Append('.');
+                sb.Append(Encoding.UTF8.GetString(d, p + 1, l));
+                p += 1 + l;
+                if (sb.Length > 255) break;
+            }
+            if (!jumped) pos = p;
+            return sb.ToString();
+        }
+
+        /// <summary>Kurzübersicht: "mDNS 3,2/s · SSDP 1,1/s ..." (nur Protokolle mit Verkehr).</summary>
+        public string Summary(TimeSpan dur)
+        {
+            double s = Math.Max(1, dur.TotalSeconds);
+            List<string> r = new List<string>();
+            lock (this)
+                foreach (Proto p in Protos.Values)
+                    if (p.Packets > 0) r.Add(p.Name.Split(' ')[0] + " " + (p.Packets / s).ToString(p.Packets / s >= 10 ? "0" : "0.0") + "/s");
+            return string.Join(" · ", r.ToArray());
+        }
+
+        /// <summary>Befunde für den Zeitraum dur. who: IP -> lesbarer Name (Gerät, Hersteller), darf null sein.</summary>
+        public List<DiscoFinding> Evaluate(TimeSpan dur, Func<string, string> who)
+        {
+            List<DiscoFinding> r = new List<DiscoFinding>();
+            double secs = Math.Max(1, dur.TotalSeconds);
+            Func<string, string> W = delegate (string ip)
+            {
+                string n = ip == OwnIp ? "dieser PC" : who != null ? who(ip) : "";
+                return ip + (n.Length > 0 && n != ip ? " (" + n + ")" : "");
+            };
+            lock (this)
+                foreach (Proto p in Protos.Values)
+                {
+                    if (p.Packets == 0) continue;
+                    double rate = p.Packets / secs;
+                    int peak = 0;
+                    foreach (int v in p.Per10s.Values) if (v > peak) peak = v;
+                    double peakRate = peak / 10.0;
+                    List<KeyValuePair<string, long>> top = new List<KeyValuePair<string, long>>(p.BySender);
+                    top.Sort(delegate (KeyValuePair<string, long> a, KeyValuePair<string, long> b) { return b.Value.CompareTo(a.Value); });
+                    // Ständig dieselbe Anfrage vom selben Absender
+                    string repKey = ""; int repN = 0;
+                    foreach (KeyValuePair<string, int> kv in p.Repeats) if (kv.Value > repN) { repN = kv.Value; repKey = kv.Key; }
+                    double repRate = repN / secs;
+                    bool flood = rate >= p.Warn || peakRate >= p.Warn * 3 && secs >= 60;
+                    bool repeat = repN >= 30 && repRate >= 0.2 && p.Port != 10001;
+                    bool reflect = p.Reflected >= 30 && p.Reflected * 5 >= p.Packets;
+                    bool printer = p.Port == 161 || p.Port == 427 || p.Port == 3289 || p.Port == 8612;
+                    if (!flood && !repeat && !reflect && !(printer && rate >= p.Warn / 5 && p.Packets >= 20)) continue;
+
+                    DiscoFinding f = new DiscoFinding();
+                    f.Proto = p.Name; f.Key = p.Port.ToString(); f.Filter = p.Filter;
+                    f.TopIp = top.Count > 0 ? top[0].Key : "";
+                    f.Level = rate >= p.Problem || peakRate >= p.Problem * 3 ? Finding.Problem : flood || reflect ? Finding.Warning : Finding.Info;
+                    if (repeat && f.Level < Finding.Warning && repRate >= 1) f.Level = Finding.Warning;
+                    string rateText = rate.ToString(rate >= 10 ? "0" : "0.0") + " Pakete/s im Schnitt, Spitze " + peakRate.ToString("0.#") + "/s";
+                    f.Title = reflect && !flood ? p.Name + " wird doppelt verteilt" : flood ? p.Name + ": " + (f.Level >= Finding.Problem ? "Flut" : "sehr viel Verkehr") + " (" + rate.ToString(rate >= 10 ? "0" : "0.0") + "/s)"
+                        : repeat ? p.Name + ": Gerät fragt ständig dasselbe" : p.Name + " im Netz";
+                    f.Evidence.Add(p.Name + ": " + p.Packets + " Pakete in " + Milestones.Fmt(dur) + " (" + rateText + "; Warnschwelle " + p.Warn + "/s) - " + p.Note);
+                    if (p.Queries + p.Answers > 0 && (p.Port == 5353 || p.Port == 5355 || p.Port == 137 || p.Port == 1900 || p.Port == 3702))
+                        f.Evidence.Add("Anfragen: " + p.Queries + ", Antworten/Ankündigungen: " + p.Answers);
+                    List<string> senders = new List<string>();
+                    for (int i = 0; i < Math.Min(5, top.Count); i++)
+                    {
+                        string srv;
+                        p.Servers.TryGetValue(top[i].Key, out srv);
+                        senders.Add(W(top[i].Key) + ": " + top[i].Value + " (" + (100.0 * top[i].Value / p.Packets).ToString("0") + " %)" + (srv != null ? " [" + srv + "]" : ""));
+                    }
+                    f.Evidence.Add("Absender (" + p.BySender.Count + "): " + string.Join("; ", senders.ToArray()));
+                    if (top.Count > 0 && top[0].Value * 2 >= p.Packets && p.BySender.Count > 1)
+                        f.Evidence.Add("Ein Gerät verursacht den Großteil: " + W(top[0].Key));
+                    if (repeat)
+                    {
+                        string[] k = repKey.Split(new char[] { '|' }, 2);
+                        f.Evidence.Add(W(k[0]) + " fragt " + repN + "× nach \"" + (k.Length > 1 ? k[1] : "") + "\" (" + (repRate * 60).ToString("0") + " pro Minute) - normal sind wenige Anfragen pro Minute");
+                    }
+                    if (reflect) f.Evidence.Add(p.Reflected + " Pakete kamen innerhalb von 2 s identisch von einem zweiten Absender → werden weiterverteilt (mDNS-Reflektor/Repeater) oder kreisen (Schleife)");
+                    if (p.Names.Count > 0)
+                    {
+                        List<KeyValuePair<string, int>> names = new List<KeyValuePair<string, int>>(p.Names);
+                        names.Sort(delegate (KeyValuePair<string, int> a, KeyValuePair<string, int> b) { return b.Value.CompareTo(a.Value); });
+                        List<string> nl = new List<string>();
+                        for (int i = 0; i < Math.Min(8, names.Count); i++) nl.Add(names[i].Key + " (" + names[i].Value + ")");
+                        f.Evidence.Add((p.Port == 5353 ? "Dienste" : p.Port == 1900 ? "Gesuchte/angekündigte Gerätetypen" : "Gefragte Namen") + ": " + string.Join(", ", nl.ToArray()));
+                    }
+                    Advice(p, f, reflect, repeat);
+                    StringBuilder text = new StringBuilder();
+                    foreach (string e in f.Evidence) text.AppendLine("• " + e);
+                    text.AppendLine("Mögliche Ursachen: " + string.Join("; ", f.Causes.ToArray()));
+                    text.Append("Abhilfe: " + string.Join(" ", f.Fix.ToArray()));
+                    f.Text = text.ToString();
+                    r.Add(f);
+                }
+            return r;
+        }
+
+        static void Advice(Proto p, DiscoFinding f, bool reflect, bool repeat)
+        {
+            switch (p.Port)
+            {
+                case 5353:
+                    f.Causes.Add("ein fehlerhaftes Gerät (häufig: Chromecast/Google-TV, Sonos, Android, ältere Drucker, Bonjour-Dienst unter Windows) fragt oder antwortet in Dauerschleife");
+                    f.Causes.Add("mDNS-Reflektor (UniFi \"Multicast DNS\"/\"mDNS\", OPNsense mdns-repeater, Avahi-Reflector) verteilt zwischen VLANs - bei zwei Reflektoren oder einer Schleife kreisen die Pakete");
+                    f.Causes.Add("viele Apple-/Smart-Home-Geräte in einem großen flachen Netz");
+                    f.Fix.Add("1. Hauptverursacher (siehe Absender) neu starten bzw. Firmware aktualisieren; bei Windows-PCs den Dienst \"Bonjour-Dienst\" (iTunes/Druckertreiber) prüfen.");
+                    f.Fix.Add("2. Nur EINEN mDNS-Reflektor betreiben und nur zwischen den VLANs, die ihn brauchen (UniFi: Einstellungen → Netzwerke → Multicast DNS bzw. Global Network Settings).");
+                    f.Fix.Add("3. IGMP-Snooping und WLAN-\"Multicast Enhancement\" aktivieren; IoT-Geräte in ein eigenes VLAN.");
+                    break;
+                case 1900:
+                    f.Causes.Add("Smart-TV, Mediaplayer, Sonos oder ein UPnP-Gerät sendet M-SEARCH/NOTIFY in Dauerschleife (Firmware-Fehler)");
+                    f.Causes.Add("UPnP-Proxy/Reflektor zwischen VLANs oder eine Schleife");
+                    f.Fix.Add("1. Hauptverursacher (Absender/SERVER-Kennung) identifizieren, Firmware aktualisieren oder UPnP/DLNA am Gerät abschalten.");
+                    f.Fix.Add("2. Windows: Dienst \"SSDP-Suche\" nur, wo Medienfreigabe gebraucht wird; IGMP-Snooping am Switch aktivieren.");
+                    break;
+                case 5355:
+                case 137:
+                    f.Causes.Add("Windows fragt per Broadcast/Multicast nach Namen, weil DNS sie nicht auflöst (fehlender DNS-Eintrag/Suffix, alter Server- oder Druckername, \"WPAD\")");
+                    f.Causes.Add("Programme/Freigaben verweisen auf Rechner, die es nicht mehr gibt");
+                    f.Fix.Add("1. Die gefragten Namen (siehe oben) im DNS eintragen bzw. alte Verknüpfungen, Laufwerkszuordnungen und Drucker entfernen.");
+                    f.Fix.Add("2. LLMNR per Gruppenrichtlinie abschalten (Computerkonfiguration → Administrative Vorlagen → Netzwerk → DNS-Client → \"Multicastnamensauflösung deaktivieren\"), NetBIOS über TCP/IP in den Adapter- bzw. DHCP-Einstellungen deaktivieren - verbessert auch die Sicherheit (Responder-Angriffe).");
+                    f.Fix.Add("3. Bei \"WPAD\": Automatische Proxyerkennung abschalten oder WPAD im DNS eintragen.");
+                    break;
+                case 138:
+                    f.Causes.Add("Windows-Computersuchdienst (Netzwerkumgebung, Master-Browser-Wahlen) - Altlast aus SMB1-Zeiten");
+                    f.Fix.Add("NetBIOS über TCP/IP deaktivieren und SMB1 entfernen; die Netzwerkumgebung nutzt heute WS-Discovery.");
+                    break;
+                case 3702:
+                    f.Causes.Add("Windows-Netzwerkerkennung (Funktionssuche) oder WSD-Drucker/Scanner, die ständig suchen");
+                    f.Fix.Add("Netzwerkerkennung nur in privaten Netzen aktiv lassen; WSD-Druckeranschlüsse durch Standard-TCP/IP-Anschlüsse ersetzen; Drucker-Firmware aktualisieren.");
+                    break;
+                case 161:
+                case 427:
+                case 3289:
+                case 8612:
+                    f.Causes.Add("Druckertreiber, Statusmonitor oder Hersteller-Software (HP Smart/Toolbox, Brother Status Monitor, Epson/Canon-Utilities) sucht ständig per Broadcast nach Druckern");
+                    f.Causes.Add("Drucker wurde per Suche statt mit fester IP eingerichtet - der Treiber sucht ihn bei jedem Druck/Statusabruf");
+                    f.Fix.Add("1. Drucker auf den PCs (siehe Absender) mit Standard-TCP/IP-Anschluss und fester IP bzw. DHCP-Reservierung einrichten; \"Bidirektionale Unterstützung\"/Statusmonitor abschalten, wenn nicht gebraucht.");
+                    f.Fix.Add("2. Überflüssige Hersteller-Software deinstallieren; am Drucker nicht genutzte Protokolle (SLP, WSD, LLMNR, Bonjour) abschalten.");
+                    break;
+                case 17500:
+                case 57621:
+                case 27036:
+                case 32414:
+                    f.Causes.Add("Programm sucht andere Instanzen im LAN (" + p.Note + ")");
+                    f.Fix.Add("In den Einstellungen des Programms die LAN-Suche abschalten (Dropbox: \"LAN-Synchronisierung\") oder per Firewall/VLAN trennen, wenn es stört.");
+                    break;
+                case 6667:
+                    f.Causes.Add("Smart-Home-Geräte (Tuya/Smart Life) senden regelmäßig Broadcasts");
+                    f.Fix.Add("IoT-Geräte in ein eigenes VLAN/WLAN legen; Firmware aktualisieren.");
+                    break;
+                default:
+                    f.Causes.Add(p.Note);
+                    f.Fix.Add("Absender prüfen, Firmware aktualisieren, ggf. in ein eigenes VLAN.");
+                    break;
+            }
+            if (reflect && p.Port != 5353) f.Fix.Add("Doppelt verteilte Pakete: Reflektor/Proxy zwischen VLANs prüfen und Schleifen ausschließen (STP, doppelte Verbindungen).");
+            if (repeat) f.Fix.Add("Das Gerät, das ständig dasselbe fragt, neu starten bzw. aktualisieren - meist ein Firmware-/Softwarefehler.");
+        }
+    }
+
+    /// <summary>
+    /// Live-Lauscher: tritt den Discovery-Gruppen bei (mDNS 224.0.0.251/ff02::fb, SSDP/WSD 239.255.255.250/ff02::c,
+    /// LLMNR 224.0.0.252/ff02::1:3, SLP 239.255.255.253) und hört Broadcast-Ports mit. Sieht nur das Netz/VLAN dieses PCs.
+    /// Auswertung in 10-Minuten-Fenstern.
+    /// </summary>
+    static class DiscoveryWatch
+    {
+        static readonly object sync = new object();
+        static DiscoveryStats cur = new DiscoveryStats(), last;
+        static DateTime curStart = DateTime.Now, lastStart, lastEnd;
+        static readonly List<Socket> sockets = new List<Socket>();
+        static Thread thread;
+        static volatile bool running;
+        static string status = "";
+
+        public static bool Enabled { get { return Config.Cached("Discovery.Aktiv", "1") != "0"; } }
+        public static string Status { get { return status; } }
+
+        /// <summary>Starten/Stoppen nach Einstellung, Fenster wechseln (jede Abfragerunde aufrufen).</summary>
+        public static void Tick()
+        {
+            if (Enabled && !running) Start();
+            else if (!Enabled && running) Stop();
+            lock (sync)
+                if (DateTime.Now - curStart >= TimeSpan.FromMinutes(10))
+                {
+                    last = cur; lastStart = curStart; lastEnd = DateTime.Now;
+                    cur = new DiscoveryStats(); cur.OwnIp = last.OwnIp; curStart = DateTime.Now;
+                }
+        }
+
+        /// <summary>Das letzte vollständige Fenster (bzw. das laufende ab 3 Minuten) zur Bewertung.</summary>
+        public static DiscoveryStats Window(out TimeSpan dur)
+        {
+            lock (sync)
+            {
+                if (DateTime.Now - curStart >= TimeSpan.FromMinutes(3) || last == null) { dur = DateTime.Now - curStart; return cur; }
+                dur = lastEnd - lastStart;
+                return last;
+            }
+        }
+
+        static void Start()
+        {
+            running = true;
+            List<string> failed = new List<string>();
+            string own = "";
+            List<IPAddress> locals = new List<IPAddress>();
+            try
+            {
+                foreach (System.Net.NetworkInformation.NetworkInterface ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up || ni.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+                    foreach (System.Net.NetworkInformation.UnicastIPAddressInformation a in ni.GetIPProperties().UnicastAddresses)
+                        if (a.Address.AddressFamily == AddressFamily.InterNetwork) { locals.Add(a.Address); if (own.Length == 0) own = a.Address.ToString(); }
+                }
+            }
+            catch { }
+            lock (sync) cur.OwnIp = own;
+            foreach (int port in DiscoveryStats.Ports)
+            {
+                if (port == 161) continue;   // SNMP-Port nicht belegen (Windows-SNMP-Dienst); Druckersuche per SLP/ENPC/BJNP und im Mitschnitt
+                Socket s = null;
+                try
+                {
+                    s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                    s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                    s.Bind(new IPEndPoint(IPAddress.Any, port));
+                    try { s.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.PacketInformation, true); } catch { }
+                    string grp = port == 5353 ? "224.0.0.251" : port == 1900 || port == 3702 ? "239.255.255.250" : port == 5355 ? "224.0.0.252" : port == 427 ? "239.255.255.253" : "";
+                    if (grp.Length > 0)
+                        foreach (IPAddress l in locals)
+                            try { s.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership, new MulticastOption(IPAddress.Parse(grp), l)); } catch { }
+                    lock (sockets) sockets.Add(s);
+                }
+                catch { failed.Add(port.ToString()); if (s != null) s.Close(); }
+                // IPv6-Gruppen (Apple-Geräte senden mDNS oft nur über IPv6)
+                string g6 = port == 5353 ? "ff02::fb" : port == 1900 || port == 3702 ? "ff02::c" : port == 5355 ? "ff02::1:3" : "";
+                if (g6.Length == 0 || !Socket.OSSupportsIPv6) continue;
+                Socket s6 = null;
+                try
+                {
+                    s6 = new Socket(AddressFamily.InterNetworkV6, SocketType.Dgram, ProtocolType.Udp);
+                    s6.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                    s6.Bind(new IPEndPoint(IPAddress.IPv6Any, port));
+                    try { s6.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.PacketInformation, true); } catch { }
+                    foreach (System.Net.NetworkInformation.NetworkInterface ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                    {
+                        if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up || !ni.Supports(System.Net.NetworkInformation.NetworkInterfaceComponent.IPv6)) continue;
+                        try
+                        {
+                            System.Net.NetworkInformation.IPv6InterfaceProperties p6 = ni.GetIPProperties().GetIPv6Properties();
+                            if (p6 != null) s6.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.AddMembership, new IPv6MulticastOption(IPAddress.Parse(g6), p6.Index));
+                        }
+                        catch { }
+                    }
+                    lock (sockets) sockets.Add(s6);
+                }
+                catch { if (s6 != null) s6.Close(); }
+            }
+            int n;
+            lock (sockets) n = sockets.Count;
+            status = n == 0 ? "keine Ports verfügbar" : "lauscht im eigenen Netz" + (own.Length > 0 ? " (" + own + ")" : "") + (failed.Count > 0 ? ", belegt: " + string.Join(", ", failed.ToArray()) : "");
+            thread = new Thread(Loop);
+            thread.IsBackground = true;
+            thread.Name = "Discovery";
+            thread.Start();
+        }
+
+        static void Stop()
+        {
+            running = false;
+            lock (sockets) { foreach (Socket s in sockets) try { s.Close(); } catch { } sockets.Clear(); }
+            status = "aus";
+        }
+
+        static void Loop()
+        {
+            byte[] buf = new byte[9000];
+            while (running)
+            {
+                List<Socket> read;
+                lock (sockets) read = new List<Socket>(sockets);
+                if (read.Count == 0) { Thread.Sleep(1000); continue; }
+                try { Socket.Select(read, null, null, 1000000); } catch { Thread.Sleep(500); continue; }
+                foreach (Socket s in read)
+                {
+                    try
+                    {
+                        EndPoint from = s.AddressFamily == AddressFamily.InterNetworkV6 ? (EndPoint)new IPEndPoint(IPAddress.IPv6Any, 0) : new IPEndPoint(IPAddress.Any, 0);
+                        IPPacketInformation info;
+                        SocketFlags flags = SocketFlags.None;
+                        int len;
+                        try { len = s.ReceiveMessageFrom(buf, 0, buf.Length, ref flags, ref from, out info); }
+                        catch (Exception) { len = s.ReceiveFrom(buf, ref from); info = new IPPacketInformation(); }
+                        IPEndPoint ep = (IPEndPoint)from;
+                        string dst = info.Address != null ? info.Address.ToString() : s.AddressFamily == AddressFamily.InterNetworkV6 ? "ff02::" : "255.255.255.255";
+                        int port = ((IPEndPoint)s.LocalEndPoint).Port;
+                        string src = ep.Address.IsIPv4MappedToIPv6 ? ep.Address.MapToIPv4().ToString() : ep.Address.ToString();
+                        int pct = src.IndexOf('%'); if (pct > 0) src = src.Substring(0, pct);
+                        DiscoveryStats st;
+                        lock (sync) st = cur;
+                        st.Add(DateTime.Now, src, dst, ep.Port, port, buf, 0, len);
+                    }
+                    catch { }
+                }
+            }
+        }
+    }
+
+    /// <summary>TCP-Wiederholungen dieses PCs aus den Windows-TCP-Zählern (gesendete vs. wiederholte Segmente).</summary>
+    static class TcpRetrans
+    {
+        static readonly List<long[]> samples = new List<long[]>();   // Ticks, gesendet, wiederholt
+
+        public static void Sample()
+        {
+            try
+            {
+                System.Net.NetworkInformation.IPGlobalProperties g = System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties();
+                System.Net.NetworkInformation.TcpStatistics s4 = g.GetTcpIPv4Statistics();
+                long sent = s4.SegmentsSent, resent = s4.SegmentsResent;
+                try { System.Net.NetworkInformation.TcpStatistics s6 = g.GetTcpIPv6Statistics(); sent += s6.SegmentsSent; resent += s6.SegmentsResent; } catch { }
+                lock (samples)
+                {
+                    samples.Add(new long[] { DateTime.Now.Ticks, sent, resent });
+                    while (samples.Count > 0 && new DateTime(samples[0][0]) < DateTime.Now.AddHours(-2)) samples.RemoveAt(0);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>Anteil seit dem Windows-Start (in %), -1 = nicht lesbar.</summary>
+        public static double SinceBoot(out long sent, out long resent)
+        {
+            sent = 0; resent = 0;
+            try
+            {
+                System.Net.NetworkInformation.IPGlobalProperties g = System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties();
+                System.Net.NetworkInformation.TcpStatistics s4 = g.GetTcpIPv4Statistics();
+                sent = s4.SegmentsSent; resent = s4.SegmentsResent;
+                try { System.Net.NetworkInformation.TcpStatistics s6 = g.GetTcpIPv6Statistics(); sent += s6.SegmentsSent; resent += s6.SegmentsResent; } catch { }
+                return sent == 0 ? -1 : 100.0 * resent / sent;
+            }
+            catch { return -1; }
+        }
+
+        /// <summary>Anteil wiederholter Segmente im Zeitraum (in %), sent = gesendete Segmente; -1 = zu wenig Daten.</summary>
+        public static double Rate(TimeSpan span, out long sent, out long resent)
+        {
+            sent = 0; resent = 0;
+            lock (samples)
+            {
+                if (samples.Count < 2) return -1;
+                long[] b = samples[samples.Count - 1], a = null;
+                foreach (long[] x in samples) if (new DateTime(x[0]) >= DateTime.Now - span) { a = x; break; }
+                if (a == null || a == b) a = samples[0];
+                sent = b[1] - a[1]; resent = b[2] - a[2];
+                if (sent < 0 || resent < 0) { sent = 0; resent = 0; return -1; }   // Zähler zurückgesetzt (Neustart)
+                return sent == 0 ? -1 : 100.0 * resent / sent;
+            }
+        }
+    }
+
     static class LocalCapture
     {
         public static string Dir { get { return Path.Combine(Config.LogDir, "Mitschnitte"); } }
@@ -15908,6 +16598,8 @@ namespace PingMonitor
                 add(all.Contains("Syslog"), "Syslog");
                 add(all.Contains("Windows-Ereignis") || all.Contains("Windows meldet") || Kind == "nicpower" && Category == "Dieser PC", "Windows");
                 add(all.Contains("Agent"), "Agent");
+                add(all.Contains("Discovery-Lauscher"), "Lauscher");
+                add(all.Contains("TCP-Zähler"), "Windows");
                 add(all.Contains("Mitschnitt") || Kind == "capture", "Mitschnitt");
                 add(all.Contains("Netzwerk-Werkzeuge"), "Werkzeuge");
                 add(all.Contains("Proxmox") || all.Contains("Corosync"), "Proxmox");
@@ -16035,6 +16727,7 @@ namespace PingMonitor
                 try { DetectPorts(found); } catch { }
                 try { DetectDevices(found); } catch { }
                 try { PveSnapshot pv = SwitchMonitor.CurrentPve(); if (pv.Valid) found.AddRange(ProxmoxFindings(pv)); } catch { }
+                try { DiscoveryIssues(found); } catch { }
                 try { DetectNetwork(found); } catch { }
                 try { DetectThisPc(found); } catch { }
                 foreach (SwitchMonitor.Conflict c in conflicts) try { found.Add(ConflictIssue(c)); } catch { }
@@ -17390,6 +18083,15 @@ namespace PingMonitor
             List<Syslog.AgentEvent> links = ev.FindAll(delegate (Syslog.AgentEvent a) { return a.Kind == "link"; });
             List<Syslog.AgentEvent> conflicts = ev.FindAll(delegate (Syslog.AgentEvent a) { return a.Kind == "ipconflict"; });
             Syslog.AgentEvent power = ev.FindLast(delegate (Syslog.AgentEvent a) { return a.Kind == "nicpower"; });
+            Syslog.AgentEvent rt = ev.FindLast(delegate (Syslog.AgentEvent a) { return a.Kind == "retrans" && DateTime.Now - a.Time < TimeSpan.FromHours(2); });
+            if (rt != null && !rt.Event.Contains("normal"))
+            {
+                System.Text.RegularExpressions.Match m = System.Text.RegularExpressions.Regex.Match(rt.Info, @"([\d,\.]+) % \((\d+) von (\d+)");
+                double rate; long rs, sg;
+                if (m.Success && double.TryParse(m.Groups[1].Value.Replace(',', '.'), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out rate) &&
+                    long.TryParse(m.Groups[2].Value, out rs) && long.TryParse(m.Groups[3].Value, out sg))
+                    found.Add(RetransIssue(t.Host, DevObj(t), "Agent " + rt.Pc + " (" + rt.Time.ToString("HH:mm") + ")", rate, sg, rs, "Gerät"));
+            }
             if (resets.Count > 0)
             {
                 Issue i = New("nicreset", t.Host, "Gerät", resets.Count + "× Netzwerkkarte zurückgesetzt (24 h)", DevObj(t), resets.Count >= 2 ? Finding.Problem : Finding.Warning,
@@ -17420,6 +18122,24 @@ namespace PingMonitor
                 found.Add(i);
             }
             if (power != null) found.Add(NicPowerIssue(t.Host, DevObj(t), "Agent " + power.Pc + " (" + power.Time.ToString("dd.MM. HH:mm") + ")", power.Info, resets.Count + links.Count, "Gerät"));
+        }
+
+        /// <summary>Hoher Anteil wiederholter TCP-Segmente eines Windows-PCs (eigene Zähler bzw. vom Agenten gemeldet).</summary>
+        static Issue RetransIssue(string key, string obj, string source, double rate, long segs, long resent, string category)
+        {
+            string k = "retrans|" + key;
+            Issue i = New("retrans", key, category, "TCP-Wiederholungen " + rate.ToString("0.0") + " %", obj, rate >= 5 ? Finding.Problem : Finding.Warning,
+                RoundsOf(k) >= 3 ? Issue.Certain : Issue.Likely);
+            i.Ref = key; i.Occurred = DateTime.Now;
+            i.Evidence.Add(source + ": " + resent + " von " + segs + " gesendeten TCP-Segmenten in der letzten Stunde wiederholt (" + rate.ToString("0.00") + " %; normal unter 0,5 %)");
+            i.Causes.Add("Paketverlust auf dem Weg: Kabel/Port mit CRC-Fehlern, Halbduplex, schwaches WLAN, überlasteter Uplink (verworfene Pakete)");
+            i.Causes.Add("Netzwerkkarten-Treiber/Energiesparen, falsche MTU (Jumbo Frames nur auf einer Seite)");
+            i.Causes.Add("Überlastete Gegenstelle (Server, Internet-Leitung) - dann betrifft es nur bestimmte Ziele");
+            i.Fix.Add("Andere Befunde zum Gerät ansehen (Port-Fehler, WLAN-Signal, Netzwerkkarte) - sie zeigen meist die Ursache.");
+            i.Fix.Add("Mitschnitt auf dem PC (Analyse → Mitschnitt, pktmon) - die Analyse nennt die Verbindungen mit den meisten Wiederholungen (Ziel = lokal oder Internet?).");
+            i.Fix.Add("Treiber aktualisieren, Energiesparfunktionen der Karte abschalten, Kabel/Port bzw. WLAN prüfen.");
+            i.Read.Add("Unter 1 % in den nächsten Stunden → behoben. Betrifft es nur Internet-Ziele: Leitung/Firewall (Gateway-Befunde).");
+            return i;
         }
 
         static Issue NicPowerIssue(string key, string obj, string source, string text, int related, string category)
@@ -17456,6 +18176,9 @@ namespace PingMonitor
 
         static void DetectThisPc(List<Issue> found)
         {
+            long segs, resent;
+            double rr = TcpRetrans.Rate(TimeSpan.FromHours(1), out segs, out resent);
+            if (rr >= 1 && segs >= 5000) found.Add(RetransIssue(Environment.MachineName, Environment.MachineName + " (dieser PC)", "Windows-TCP-Zähler dieses PCs", rr, segs, resent, "Dieser PC"));
             // Energiespar-Einstellungen der Netzwerkkarten dieses PCs (Registry, alle 6 Stunden)
             if (WinEvents.Enabled && (DateTime.Now - nicCheck).TotalHours >= 6) { nicCheck = DateTime.Now; try { nicLines = WinEvents.NicSettings(); } catch { nicLines = new List<string>(); } }
             List<WinEvent> recentEv;
@@ -17516,6 +18239,46 @@ namespace PingMonitor
             i.Fix.Add("Gerät in der Liste aktualisieren (Aktualisieren) bzw. Konfiguration anpassen.");
             i.Read.Add("Der Widerspruch verschwindet von selbst, sobald die Quellen wieder übereinstimmen.");
             return i;
+        }
+
+        /// <summary>Lesbarer Name zu einer IP: Gerät der Liste, UniFi-Client, DHCP-/ARP-Name der Firewall, Hersteller.</summary>
+        static string Who(string ip)
+        {
+            foreach (PingTarget t in hosts) if (t.Host == ip) return t.Name;
+            if (uf != null && uf.Valid)
+                foreach (UniFiClientInfo c in uf.Clients) if (c.Ip == ip && c.Name.Length > 0) return c.Name;
+            if (op != null)
+            {
+                OpnLease l = op.LeaseByIp(ip);
+                if (l != null && l.Host.Length > 0) return l.Host;
+                string h, mac;
+                if (op.ArpHost.TryGetValue(ip, out h) && h.Length > 0) return h;
+                if (op.Arp.TryGetValue(ip, out mac)) return MacVendors.Lookup(mac);
+            }
+            foreach (SwitchState s in sw) { string mac; if (s.Arp.TryGetValue(ip, out mac)) return MacVendors.Lookup(mac); }
+            return "";
+        }
+
+        /// <summary>Discovery-Verkehr im Netz dieses PCs (Live-Lauscher, 10-Minuten-Fenster).</summary>
+        static void DiscoveryIssues(List<Issue> found)
+        {
+            if (!DiscoveryWatch.Enabled) return;
+            TimeSpan dur;
+            DiscoveryStats st = DiscoveryWatch.Window(out dur);
+            if (dur < TimeSpan.FromMinutes(3)) return;
+            foreach (DiscoFinding f in st.Evaluate(dur, Who))
+            {
+                string key = "disco|" + f.Key;
+                Issue i = New("disco", f.Key, "Netz", f.Title, "Netz von " + Environment.MachineName + (st.OwnIp.Length > 0 ? " (" + st.OwnIp + ")" : ""),
+                    f.Level, f.Level >= Finding.Warning && RoundsOf(key) >= 3 ? Issue.Certain : f.Level >= Finding.Warning ? Issue.Likely : Issue.Hint);
+                i.Ref = f.TopIp; i.Occurred = DateTime.Now;
+                foreach (string e in f.Evidence) i.Evidence.Add("Discovery-Lauscher (" + Milestones.Fmt(dur) + "): " + e);
+                i.Causes.AddRange(f.Causes);
+                i.Fix.AddRange(f.Fix);
+                i.Narrow.Add("Mitschnitt mit Wireshark-Filter \"" + f.Filter + "\" (Analyse → Mitschnitt, auch an der Firewall für andere VLANs): zeigt Absender, Inhalte und Zeitpunkte.");
+                i.Read.Add("Rate unter der Warnschwelle in den nächsten Abfragen → behoben. Der Lauscher sieht nur das Netz/VLAN dieses PCs.");
+                found.Add(i);
+            }
         }
 
         /// <summary>Befunde aus der Proxmox-API: Quorum, Knoten offline, nur ein Corosync-Link, zwei IPs im selben Subnetz, Bridges uneinheitlich.</summary>
@@ -18328,7 +19091,7 @@ namespace PingMonitor
     class OptionsForm : Form
     {
         readonly ComboBox cboDns = new ComboBox();
-        readonly CheckBox chkEach = new CheckBox(), chkLarge = new CheckBox();
+        readonly CheckBox chkEach = new CheckBox(), chkLarge = new CheckBox(), chkDisco = new CheckBox();
         readonly TextBox txtFrom = new TextBox(), txtTo = new TextBox();
         readonly CheckBox[] chkDays = new CheckBox[7];
         string lastDns;
@@ -18348,29 +19111,31 @@ namespace PingMonitor
             Label h3 = new Label(); h3.Text = "Protokollierung und Messung"; h3.Font = new Font(Font, FontStyle.Bold); h3.SetBounds(12, 110, 596, 20);
             chkEach.Text = "Jeden fehlgeschlagenen Ping protokollieren (sonst nur Beginn und Ende eines Ausfalls)"; chkEach.SetBounds(12, 134, 596, 22);
             chkLarge.Text = "Leitungstest mit großen Paketen (1500 Byte, erkennt Bitfehler/MTU-Probleme)"; chkLarge.SetBounds(12, 160, 596, 22);
-            Label h4 = new Label(); h4.ForeColor = SystemColors.GrayText; h4.SetBounds(12, 186, 596, 34);
-            h4.Text = "Benachrichtigungen, Filter und Tagesbericht: Einstellungen → Benachrichtigungen. Syslog, UniFi, OPNsense: Netzwerk → Switches / Controller.";
-            Label h5 = new Label(); h5.Text = "Arbeitszeit (für Geräteklasse \"nur in der Arbeitszeit immer an\")"; h5.Font = new Font(Font, FontStyle.Bold); h5.SetBounds(12, 228, 596, 20);
-            Label lf = new Label(); lf.Text = "von"; lf.SetBounds(12, 255, 30, 20);
-            txtFrom.SetBounds(44, 252, 60, 24);
-            Label lt = new Label(); lt.Text = "bis"; lt.SetBounds(112, 255, 30, 20);
-            txtTo.SetBounds(144, 252, 60, 24);
+            chkDisco.Text = "Discovery-Verkehr im eigenen Netz mithören (mDNS/Bonjour, SSDP, LLMNR, WS-Discovery, Druckersuche)"; chkDisco.SetBounds(12, 186, 596, 22);
+            chkDisco.Checked = Config.Cached("Discovery.Aktiv", "1") != "0";
+            Label h4 = new Label(); h4.ForeColor = SystemColors.GrayText; h4.SetBounds(12, 210, 596, 18);
+            h4.Text = "Benachrichtigungen: Einstellungen → Benachrichtigungen. Syslog, UniFi, OPNsense, Proxmox: Netzwerk → Switches / Controller.";
+            Label h5 = new Label(); h5.Text = "Arbeitszeit (für Geräteklasse \"nur in der Arbeitszeit immer an\")"; h5.Font = new Font(Font, FontStyle.Bold); h5.SetBounds(12, 234, 596, 20);
+            Label lf = new Label(); lf.Text = "von"; lf.SetBounds(12, 259, 30, 20);
+            txtFrom.SetBounds(44, 256, 60, 24);
+            Label lt = new Label(); lt.Text = "bis"; lt.SetBounds(112, 259, 30, 20);
+            txtTo.SetBounds(144, 256, 60, 24);
             string[] dn = { "Mo", "Di", "Mi", "Do", "Fr", "Sa", "So" };
             string days = Config.Cached("Arbeitszeit.Tage", "12345");
             for (int k = 0; k < 7; k++)
             {
-                chkDays[k] = new CheckBox(); chkDays[k].Text = dn[k]; chkDays[k].SetBounds(220 + k * 48, 252, 46, 24);
+                chkDays[k] = new CheckBox(); chkDays[k].Text = dn[k]; chkDays[k].SetBounds(220 + k * 48, 256, 46, 24);
                 chkDays[k].Checked = days.IndexOf((char)('1' + k)) >= 0;
                 Controls.Add(chkDays[k]);
             }
             txtFrom.Text = Config.Cached("Arbeitszeit.Von", "07:00"); txtTo.Text = Config.Cached("Arbeitszeit.Bis", "18:00");
-            Label h6 = new Label(); h6.ForeColor = SystemColors.GrayText; h6.SetBounds(12, 282, 596, 50);
+            Label h6 = new Label(); h6.ForeColor = SystemColors.GrayText; h6.SetBounds(12, 286, 596, 50);
             h6.Text = "Außerhalb der Arbeitszeit dürfen diese Geräte aus sein (kein Ausfall, keine Meldung). Geräteklasse je Gerät: Rechtsklick → Geräteklasse. " +
                 "Arbeitsplatz-PCs und WLAN-Geräte erkennt PingMonitor automatisch als \"darf aus sein\", Server/Drucker/Netzwerk als \"immer an\".";
             Button ok = new Button(); ok.Text = "Speichern"; ok.SetBounds(392, 356, 110, 30);
             Button cancel = new Button(); cancel.Text = "Abbrechen"; cancel.DialogResult = DialogResult.Cancel; cancel.SetBounds(508, 356, 100, 30);
             ok.Click += delegate { if (Save()) DialogResult = DialogResult.OK; };
-            Controls.AddRange(new Control[] { h1, cboDns, h2, h3, chkEach, chkLarge, h4, h5, lf, txtFrom, lt, txtTo, h6, ok, cancel });
+            Controls.AddRange(new Control[] { h1, cboDns, h2, h3, chkEach, chkLarge, chkDisco, h4, h5, lf, txtFrom, lt, txtTo, h6, ok, cancel });
             AcceptButton = ok; CancelButton = cancel;
             Dictionary<string, string> d = Config.LoadSettings();
             chkEach.Checked = Config.LoadLogEachFailure();
@@ -18427,6 +19192,7 @@ namespace PingMonitor
                 Config.SaveLogEachFailure(chkEach.Checked);
                 Dictionary<string, string> d = new Dictionary<string, string>();
                 d["Qualitaet.GrossePakete"] = chkLarge.Checked ? "1" : "0";
+                d["Discovery.Aktiv"] = chkDisco.Checked ? "1" : "0";
                 d["Arbeitszeit.Von"] = from.ToString(@"hh\:mm"); d["Arbeitszeit.Bis"] = to.ToString(@"hh\:mm"); d["Arbeitszeit.Tage"] = wd;
                 Config.SaveSettings(d);
                 return true;
