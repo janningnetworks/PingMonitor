@@ -35,8 +35,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCompany("janning networks")]
 [assembly: System.Reflection.AssemblyProduct("PingMonitor")]
 [assembly: System.Reflection.AssemblyCopyright("janning networks")]
-[assembly: System.Reflection.AssemblyVersion("4.6.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("4.6.1.0")]
+[assembly: System.Reflection.AssemblyVersion("4.6.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("4.6.2.0")]
 
 namespace PingMonitor
 {
@@ -13451,15 +13451,23 @@ namespace PingMonitor
                 {
                     // WLAN: pktmon speichert auf WLAN-Karten rohe 802.11-Frames, kennzeichnet sie aber als "Ethernet" (Linktyp 1);
                     // dazu echte 802.11- (105) und Radiotap-Mitschnitte (127). Datenframes werden in Ethernet-Frames umgewandelt.
+                    // pktmon kann beides in EINE Datei schreiben (mehrere Karten bzw. Schichten): darum jedes Frame einzeln prüfen.
                     bool wifi = link == 105 || link == 127;
                     int off = 0;
                     if (link == 127 && len >= 4) { off = d[2] | d[3] << 8; if (off >= len) { Undecoded++; return; } }
-                    List<byte[]> frames = wifi || link == 1 && (WifiFrames > 0 || LooksWifi(d, len)) ? Wifi(d, off, len, wifi || WifiFrames > 0) : null;
+                    List<byte[]> frames = null;
+                    if (wifi) frames = Wifi(d, off, len, true);
+                    else if (link == 1 && !PlausibleEth(d, len))
+                    {
+                        if (LooksWifi(d, len)) frames = Wifi(d, 0, len, true);
+                        else if (WifiFrames > 0 && WifiControl(d, len)) { WifiOther++; return; }   // WLAN-Verwaltungs-/Steuer-/Null-Frame
+                    }
                     if (frames != null)
                     {
-                        foreach (byte[] f in frames) Decode(t, 1, f, f.Length);
+                        foreach (byte[] f in frames) if (!Duplicate(t, f, f.Length)) Decode(t, 1, f, f.Length);
                         return;
                     }
+                    if (link == 1) { EthFrames++; if (Duplicate(t, d, len)) return; }
                     Decode(t, link, d, len);
                 }
                 catch (IndexOutOfRangeException) { Undecoded++; }
@@ -13470,7 +13478,49 @@ namespace PingMonitor
             Evaluate();
         }
 
-        public long WifiFrames, WifiRetry, WifiRetryIn, WifiIn, WifiOther;
+        public long WifiFrames, WifiRetry, WifiRetryIn, WifiIn, WifiOther, EthFrames, Duplicates;
+        readonly Dictionary<long, long> recentFrames = new Dictionary<long, long>();   // Prüfsumme -> Zeit (Ticks)
+
+        /// <summary>
+        /// Enthält die Datei 802.11- UND Ethernet-Frames (pktmon auf mehreren Schichten), steht jedes Paket doppelt drin:
+        /// byte-gleiche Kopie innerhalb von 2 ms verwerfen. Nur bei gemischten Dateien - sonst wäre eine echte Schleife unsichtbar.
+        /// </summary>
+        bool Duplicate(DateTime t, byte[] d, int len)
+        {
+            if (WifiFrames == 0 || EthFrames == 0) return false;
+            long h = 1469598103934665603L;
+            for (int i = 0; i < len; i++) { h ^= d[i]; h *= 1099511628211L; }
+            h ^= len;
+            long seen;
+            bool dup = recentFrames.TryGetValue(h, out seen) && Math.Abs(t.Ticks - seen) <= 2 * TimeSpan.TicksPerMillisecond;
+            recentFrames[h] = t.Ticks;
+            if (recentFrames.Count > 20000) recentFrames.Clear();
+            if (dup) Duplicates++;
+            return dup;
+        }
+
+        /// <summary>Plausibles Ethernet-Frame: bekannter Ethertype mit passendem Inhalt bzw. LLC.</summary>
+        static bool PlausibleEth(byte[] d, int len)
+        {
+            if (len < 15) return false;
+            int et = U16(d, 12);
+            switch (et)
+            {
+                case 0x0800: return (d[14] >> 4) == 4;
+                case 0x86DD: return (d[14] >> 4) == 6;
+                case 0x0806: return len >= 22 && U16(d, 14) == 1;
+                case 0x8100: case 0x88A8: case 0x9100: case 0x88CC: case 0x888E: case 0x8808: case 0x8809: case 0x893A: case 0x88E1: case 0x8899: return true;
+            }
+            return et <= 1500 && len >= 17 && (d[14] == 0x42 || d[14] == 0xAA || d[14] == 0xF0 || d[14] == 0xFE || d[14] == 0xE0 || d[14] == 0x00);
+        }
+
+        /// <summary>802.11-Verwaltungs-, Steuer- oder Null-Daten-Frame (Version 0).</summary>
+        static bool WifiControl(byte[] d, int len)
+        {
+            if (len < 10 || (d[0] & 3) != 0) return false;
+            int type = (d[0] >> 2) & 3, sub = d[0] >> 4;
+            return type == 0 || type == 1 || type == 2 && (sub & 4) != 0;
+        }
 
         static bool Snap(byte[] d, int o, int len) { return o + 8 <= len && d[o] == 0xAA && d[o + 1] == 0xAA && d[o + 2] == 0x03; }
 
@@ -14732,6 +14782,7 @@ namespace PingMonitor
                 Add(rin >= 10 ? Finding.Warning : Finding.Info, "Mitschnitt über WLAN" + (rin >= 10 ? ": viele Funk-Wiederholungen (" + rin.ToString("0.0") + " %)" : ""),
                     WifiFrames + " WLAN-Datenframes (802.11, z. B. pktmon auf der WLAN-Karte) - umgewandelt und ausgewertet. Funk-Wiederholungen vom Access Point: " +
                     WifiRetryIn + " von " + WifiIn + " (" + rin.ToString("0.0") + " %; normal unter 10 %).\r\n" +
+                    (EthFrames > 0 ? "Die Datei enthält zusätzlich " + EthFrames + " Ethernet-Frames (pktmon auf mehreren Karten/Schichten); " + Duplicates + " doppelte Kopien wurden aussortiert.\r\n" : "") +
                     "Einschränkungen: Ein WLAN-Mitschnitt sieht nur den eigenen Verkehr sowie Broadcast/Multicast - keine Unicast-Antworten an andere Geräte. " +
                     "Einzelne eingehende Frames können im Mitschnitt fehlen; Ping-Verluste und unbeantwortete DNS-Anfragen daher mit der Ping-Überwachung bzw. " +
                     "einem Mitschnitt an der Firewall/am Spiegel-Port gegenprüfen. Für Switch-/Kabelprobleme immer kabelgebunden mitschneiden.",

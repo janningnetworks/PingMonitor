@@ -480,6 +480,8 @@ WLAN-Mitschnitte
 ----------------
 pktmon speichert auf WLAN-Karten rohe 802.11-Frames, kennzeichnet die Datei aber als "Ethernet" (auch Wireshark zeigt
 dann Unsinn). PingMonitor erkennt das und wandelt die Datenframes um (auch A-MSDU, 802.11- und Radiotap-Mitschnitte).
+Enthält die Datei 802.11- UND Ethernet-Frames (pktmon auf mehreren Karten/Schichten), wird jedes Frame einzeln
+erkannt und doppelte Kopien desselben Pakets (innerhalb 2 ms) werden aussortiert.
 Befund "Mitschnitt über WLAN" mit Funk-Wiederholungen (Retry) und den Grenzen: nur eigener Verkehr plus Broadcast/
 Multicast, einzelne eingehende Frames können fehlen. Wireshark: Datei mit "editcap -T ieee-802-11" umwandeln und unter
 Einstellungen -> Protokolle -> IEEE 802.11 "Ignore the Protection bit" = "Yes - without IV" setzen.
