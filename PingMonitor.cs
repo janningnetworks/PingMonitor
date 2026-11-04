@@ -35,8 +35,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCompany("janning networks")]
 [assembly: System.Reflection.AssemblyProduct("PingMonitor")]
 [assembly: System.Reflection.AssemblyCopyright("janning networks")]
-[assembly: System.Reflection.AssemblyVersion("4.6.3.0")]
-[assembly: System.Reflection.AssemblyFileVersion("4.6.3.0")]
+[assembly: System.Reflection.AssemblyVersion("4.7.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("4.7.0.0")]
 
 namespace PingMonitor
 {
@@ -613,7 +613,7 @@ namespace PingMonitor
 
         static readonly System.Text.RegularExpressions.Regex AlwaysWords = new System.Text.RegularExpressions.Regex(
             @"server|esxi?\b|vmware|proxmox|hyper-v|\bnas\b|synology|qnap|drucker|printer|jetdirect|laserjet|officejet|kyocera|ricoh|brother|canon|lexmark|" +
-            @"switch|firewall|router|opnsense|pfsense|fritz|access point|unifi|ubiquiti|hp ethernet|multi-environment|\busv\b|\bups\b|idrac|\bilo\b|ipmi|kamera|camera|telefonanlage|\bpbx\b|voip|yealink|snom",
+            @"switch|firewall|router|opnsense|pfsense|fritz|access point|kamera|videorekorder|tk-anlage|ip-telefon|dect|wechselrichter|steuerung|modbus|usv|unifi|ubiquiti|hp ethernet|multi-environment|\busv\b|\bups\b|idrac|\bilo\b|ipmi|kamera|camera|telefonanlage|\bpbx\b|voip|yealink|snom",
             System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         static readonly System.Text.RegularExpressions.Regex ClientNames = new System.Text.RegularExpressions.Regex(
             @"^(pc|nb|laptop|notebook|desktop|ws|client|arbeitsplatz)[-_0-9]", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
@@ -2956,6 +2956,7 @@ namespace PingMonitor
                                 string arp = local ? NetTools.GetMac(ip) : "";
                                 if (arp.Length > 0) mac = arp;
                                 else if (mac.Length == 0) mac = d.NetBiosMac;
+                                d.Classify(mac, t.Name + " " + t.Comment);
                             }
                             PingTarget target = t;
                             DeviceInfo info = d;
@@ -4785,6 +4786,7 @@ namespace PingMonitor
             string arpHost;
             if (r.ControllerName.Length == 0 && known.Opn.ArpHost.TryGetValue(ip.ToString(), out arpHost)) r.ControllerName = arpHost;
             if (r.Mac.Length > 0) r.Vendor = MacVendors.Lookup(r.Mac);
+            if (r.Info != null) r.Info.Classify(r.Mac, r.ControllerName);
             return r;
         }
 
@@ -5625,6 +5627,198 @@ namespace PingMonitor
         public string WebTitle = "", WebServer = "";
         public string OsGuess = "";
 
+        // ------------------------------------------------ Geräteart erkennen (Ports, Hersteller, Namen, Web, SNMP, mDNS-Dienste)
+
+        public readonly List<int> OpenPorts = new List<int>();
+        public readonly List<string> MdnsServices = new List<string>();
+        public string Kind = "", KindWhy = "";
+
+        /// <summary>Typische Ports zur Erkennung (TCP, nur Verbindungsaufbau - es wird nichts gesendet).</summary>
+        public static readonly int[] ProbePorts = {
+            21, 22, 23, 53, 80, 88, 102, 111, 135, 139, 389, 443, 445, 502, 515, 548, 554, 631, 636, 902, 1400, 1433, 1720, 1883,
+            2049, 3260, 3306, 3389, 4840, 5000, 5001, 5060, 5061, 5357, 5432, 5900, 5985, 6053, 6668, 7000, 7547, 8000, 8001, 8006,
+            8008, 8009, 8080, 8081, 8123, 8291, 8443, 9100, 9999, 32400, 37777, 44818, 55443, 62078 };
+
+        /// <summary>Offene TCP-Ports parallel prüfen (je 800 ms).</summary>
+        static List<int> Probe(IPAddress ip, int[] ports, int timeoutMs)
+        {
+            List<int> open = new List<int>();
+            List<KeyValuePair<int, Socket>> socks = new List<KeyValuePair<int, Socket>>();
+            List<IAsyncResult> res = new List<IAsyncResult>();
+            foreach (int port in ports)
+            {
+                try
+                {
+                    Socket s = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                    socks.Add(new KeyValuePair<int, Socket>(port, s));
+                    res.Add(s.BeginConnect(new IPEndPoint(ip, port), null, null));
+                }
+                catch { }
+            }
+            DateTime end = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            for (int i = 0; i < res.Count; i++)
+            {
+                TimeSpan left = end - DateTime.UtcNow;
+                try { if (res[i].AsyncWaitHandle.WaitOne(left > TimeSpan.Zero ? left : TimeSpan.Zero) && socks[i].Value.Connected) open.Add(socks[i].Key); } catch { }
+            }
+            foreach (KeyValuePair<int, Socket> s in socks) try { s.Value.Close(); } catch { }
+            open.Sort();
+            return open;
+        }
+
+        static string PortName(int p)
+        {
+            switch (p)
+            {
+                case 21: return "FTP"; case 22: return "SSH"; case 23: return "Telnet"; case 53: return "DNS"; case 80: return "HTTP"; case 88: return "Kerberos";
+                case 102: return "Siemens S7"; case 111: return "RPC"; case 135: return "Windows-RPC"; case 139: return "NetBIOS"; case 389: return "LDAP";
+                case 443: return "HTTPS"; case 445: return "SMB"; case 502: return "Modbus"; case 515: return "LPD"; case 548: return "AFP"; case 554: return "RTSP";
+                case 631: return "IPP"; case 636: return "LDAPS"; case 902: return "VMware"; case 1400: return "Sonos"; case 1433: return "MS-SQL"; case 1720: return "H.323";
+                case 1883: return "MQTT"; case 2049: return "NFS"; case 3260: return "iSCSI"; case 3306: return "MySQL"; case 3389: return "RDP"; case 4840: return "OPC UA";
+                case 5000: case 5001: return "DSM/Web"; case 5060: case 5061: return "SIP"; case 5357: return "WSD"; case 5432: return "PostgreSQL"; case 5900: return "VNC";
+                case 5985: return "WinRM"; case 6053: return "ESPHome"; case 6668: return "Tuya"; case 7000: return "AirPlay"; case 7547: return "TR-069";
+                case 8000: return "Kamera/Web"; case 8001: return "Samsung-TV"; case 8006: return "Proxmox"; case 8008: case 8009: return "Cast"; case 8080: return "Web";
+                case 8081: return "Sonoff-LAN"; case 8123: return "Home Assistant"; case 8291: return "Winbox"; case 8443: return "Web/UniFi"; case 9100: return "Druck (RAW)";
+                case 9999: return "TP-Link Kasa"; case 32400: return "Plex"; case 37777: return "Dahua"; case 44818: return "EtherNet/IP"; case 55443: return "Yeelight";
+                case 62078: return "iPhone/iPad";
+                default: return p.ToString();
+            }
+        }
+
+        /// <summary>
+        /// Geräteart aus allen Merkmalen bestimmen: Hersteller (MAC), Namen, offene Ports, Webseite/Server, SNMP-Beschreibung, mDNS-Dienste,
+        /// TTL. Ergebnis in Kind (z. B. "Drucker (HP)") und KindWhy (Belege).
+        /// </summary>
+        public void Classify(string mac, string names)
+        {
+            string vendor = MacVendors.Lookup(mac);
+            string v = vendor.ToLowerInvariant();
+            string n = (names + " " + DnsName + " " + NetBiosName + " " + MdnsName + " " + SnmpName).ToLowerInvariant();
+            string web = (WebTitle + " " + WebServer).ToLowerInvariant();
+            string snmp = SnmpDescr.ToLowerInvariant();
+            string all = v + " " + n + " " + web + " " + snmp + " " + string.Join(" ", MdnsServices.ToArray()).ToLowerInvariant();
+            Func<int, bool> P = delegate (int port) { return OpenPorts.Contains(port); };
+            Func<string, bool> A = delegate (string re) { return System.Text.RegularExpressions.Regex.IsMatch(all, re); };
+            string own = n + " " + web + " " + snmp;   // ohne Hersteller der Netzwerkkarte (VMs haben z. B. "Proxmox" als Hersteller)
+            Func<string, bool> O = delegate (string re) { return System.Text.RegularExpressions.Regex.IsMatch(own, re); };
+            Func<string, bool> S = delegate (string svc) { return MdnsServices.Exists(delegate (string x) { return x.StartsWith(svc); }); };
+            string kind = "", why = "";
+            string hex = NetTools.MacHex(mac);
+            bool random = hex.Length == 12 && (Convert.ToInt32(hex.Substring(0, 2), 16) & 2) != 0;
+
+            // --- Server, Virtualisierung, Fernwartung
+            if (P(88) && P(389) && P(445)) { kind = "Windows-Server (Domänencontroller)"; why = "Kerberos, LDAP und SMB offen"; }
+            else if (P(8123) || O("home assistant|homeassistant")) { kind = "Home Assistant"; why = P(8123) ? "Port 8123" : "Name"; }
+            else if (P(8006) || O("proxmox")) { kind = "Proxmox-Server"; why = P(8006) ? "Port 8006 (Proxmox-Weboberfläche)" : "Name/Webseite"; }
+            else if (O("esxi|vmware esx") || P(902) && P(443) && !P(445)) { kind = "VMware ESXi"; why = "VMware-Dienst/Webseite"; }
+            else if (A("idrac|integrated lights-out|\\bilo\\b|ipmi|supermicro|\\bbmc\\b|xclarity|irmc")) { kind = "Server-Fernwartung (iDRAC/iLO/IPMI)"; why = "Webseite/SNMP"; }
+            // --- Speicher
+            else if (A("synology|diskstation") || P(5000) && P(5001) && v.Contains("synology")) { kind = "NAS (Synology)"; why = "Hersteller/DSM"; }
+            else if (A("qnap|qts")) { kind = "NAS (QNAP)"; why = "Hersteller/Webseite"; }
+            else if (A("truenas|freenas|unraid|openmediavault|netapp|asustor|terramaster")) { kind = "NAS/Speichersystem"; why = "Webseite/Name"; }
+            else if (P(3260) || P(2049) && !P(3389)) { kind = "Speicher/NAS (iSCSI/NFS)"; why = P(3260) ? "iSCSI offen" : "NFS offen"; }
+            // --- Drucker
+            else if (P(9100) || P(631) && !P(22) || P(515) || S("_ipp") || S("_printer") || S("_pdl-datastream") ||
+                     A("printer|drucker|laserjet|officejet|deskjet|jetdirect|hp ethernet|kyocera|ecosys|taskalfa|ricoh|aficio|lexmark|xerox|brother|bizhub|konica|imagerunner|i-sensys|epson|sharp mx|\\boki\\b|canon"))
+            {
+                kind = "Drucker/Multifunktionsgerät"; why = (P(9100) ? "Port 9100 (RAW-Druck)" : P(631) ? "IPP" : P(515) ? "LPD" : S("_ipp") ? "mDNS _ipp" : "Name/Hersteller");
+                string brand = Brand(all, new string[] { "hp", "hewlett", "kyocera", "ricoh", "lexmark", "xerox", "brother", "konica", "canon", "epson", "sharp", "oki", "samsung" });
+                if (brand.Length > 0) kind += " (" + brand + ")";
+            }
+            // --- Kameras, Video
+            else if (P(37777) || A("hikvision|dahua|axis|reolink|mobotix|hanwha|wisenet|network camera|ipcam|ip camera|\\bnvr\\b|\\bdvr\\b|uniview|annke|foscam|amcrest") || P(554) && !S("_airplay"))
+            { kind = "IP-Kamera/Videorekorder"; why = P(554) ? "RTSP (Videostream)" : P(37777) ? "Dahua-Port" : "Hersteller/Webseite"; }
+            else if (P(1720) || A("polycom|poly studio|cisco webex|yealink meeting|logitech rally|crestron|barco clickshare|clickshare"))
+            { kind = "Konferenz-/Präsentationssystem"; why = P(1720) ? "H.323" : "Hersteller/Name"; }
+            // --- Telefonie
+            else if (A("starface|3cx|auerswald|compact 5|agfeo|innovaphone|unify|openscape|mitel|swyx|asterisk|freepbx|telefonanlage"))
+            { kind = "TK-Anlage"; why = "Name/Webseite"; }
+            else if (P(5060) || P(5061) || A("yealink|snom|gigaset|polycom|grandstream|fanvil|cisco ip phone|panasonic kx|siemens openstage|tiptel"))
+            { kind = A("gigaset|dect|n510|n670|n870") ? "DECT-Basis/IP-Telefon" : "IP-Telefon"; why = P(5060) || P(5061) ? "SIP offen" : "Hersteller"; }
+            // --- Industrie, Gebäude, Energie
+            else if (P(102)) { kind = "Siemens-Steuerung (S7)"; why = "Port 102 (S7comm)"; }
+            else if (P(44818)) { kind = "Industriesteuerung (EtherNet/IP, Rockwell)"; why = "Port 44818"; }
+            else if (P(4840)) { kind = "Industriegerät (OPC UA)"; why = "Port 4840"; }
+            else if (A("sma regelsysteme|sma solar|fronius|kostal|huawei.*sun|solaredge|sungrow|victron|e3/dc|senec|wechselrichter|inverter"))
+            { kind = "Wechselrichter/Energiemanager" + (v.Contains("sma") ? " (SMA)" : ""); why = "Hersteller" + (P(502) ? ", Modbus offen" : ""); }
+            else if (P(502)) { kind = "Modbus-Gerät (Zähler, Wechselrichter, Steuerung)"; why = "Port 502"; }
+            else if (A("wago|beckhoff|phoenix contact|schneider electric|loxone|\\bgira\\b|\\bjung\\b|\\bknx\\b|siemens building|honeywell|viessmann|vaillant|stiebel|wolf gmbh|buderus|bosch thermo|kermi|nibe"))
+            { kind = "Gebäude-/Heizungstechnik"; why = "Hersteller/Name"; }
+            else if (A("\\bapc\\b|american power|schneider.*ups|eaton|riello|socomec|cyberpower|usv|\\bups\\b|network management card"))
+            { kind = "USV (Netzwerkkarte)"; why = "Hersteller/SNMP"; }
+            // --- Netzwerk
+            else if (A("fritz!box|fritzbox|\\bavm\\b") || P(7547) && P(53)) { kind = A("repeater") ? "FRITZ!Repeater" : "Router (FRITZ!Box/Provider-Router)"; why = P(7547) ? "TR-069 offen" : "Hersteller/Webseite"; }
+            else if (P(8291) || v.Contains("routerboard") || A("mikrotik")) { kind = "MikroTik-Router/Switch"; why = "Winbox/Hersteller"; }
+            else if (A("opnsense|pfsense|fortigate|fortinet|sophos|watchguard|sonicwall|securepoint|lancom|bintec|draytek|zyxel usg|zywall"))
+            { kind = "Firewall/Router"; why = "Webseite/Hersteller"; }
+            else if (A("ubiquiti|unifi|cisco|aruba|hewlett packard enterprise|procurve|netgear|tp-link|tplink|zyxel|d-link|juniper|extreme|ruckus|mikrotik|lancom|allied telesis|edgecore|meraki") &&
+                     (P(22) || P(443) || P(80) || P(8443)) && !P(9100))
+            {
+                string brand = Brand(all, new string[] { "ubiquiti", "cisco", "aruba", "netgear", "tp-link", "zyxel", "d-link", "juniper", "ruckus", "lancom", "meraki" });
+                kind = (A("access point|\\buap|u6|u7|\\bap\\b|wireless|wlan") ? "Access Point" : A("switch|usw|\\bus-|gs\\d|sg\\d") ? "Switch" : "Netzwerkgerät") + (brand.Length > 0 ? " (" + brand + ")" : "");
+                why = "Hersteller + Verwaltungszugang";
+            }
+            // --- Smart Home / IoT
+            else if (P(6668)) { kind = "Tuya/Smart-Life-Gerät"; why = "Port 6668 (Tuya lokal)"; }
+            else if (P(6053) || A("esphome")) { kind = "ESPHome-Gerät"; why = "Port 6053/Name"; }
+            else if (A("shelly")) { kind = "Shelly-Gerät"; why = "Name/Webseite"; }
+            else if (A("tasmota")) { kind = "Tasmota-Gerät"; why = "Webseite"; }
+            else if (P(8081) && v.Contains("espressif")) { kind = "Sonoff (eWeLink, LAN-Modus)"; why = "Port 8081 + Espressif"; }
+            else if (A("philips lighting|signify|hue bridge|philips hue")) { kind = "Philips Hue Bridge"; why = "Hersteller"; }
+            else if (P(9999) && v.Contains("tp-link")) { kind = "TP-Link Kasa/Tapo"; why = "Port 9999"; }
+            else if (P(55443)) { kind = "Yeelight-Lampe"; why = "Port 55443"; }
+            else if (A("nabu casa")) { kind = "Home-Assistant-Gerät (Nabu Casa)"; why = "Hersteller"; }
+            else if (A("amazon technologies|echo|alexa")) { kind = "Amazon Echo/Fire TV"; why = "Hersteller/Name"; }
+            else if (P(1400) || A("sonos")) { kind = "Sonos-Lautsprecher"; why = P(1400) ? "Port 1400" : "Hersteller"; }
+            else if (P(8008) || P(8009) || S("_googlecast") || A("google-home|google home|\\bnest\\b|chromecast")) { kind = "Google Cast (Nest/Home/Chromecast/TV)"; why = P(8009) ? "Cast-Port 8009" : "mDNS/Name"; }
+            else if (P(62078)) { kind = "iPhone/iPad"; why = "Apple-Synchronisationsport 62078"; }
+            else if (S("_airplay") || P(7000) && A("apple")) { kind = A("apple") ? "Apple TV/AirPlay-Gerät" : "AirPlay-Lautsprecher/-Gerät"; why = "AirPlay"; }
+            else if (P(8001) && A("samsung")) { kind = "Samsung Smart-TV"; why = "Port 8001"; }
+            else if (A("lg electronics|webos") && (P(3000) || P(3001))) { kind = "LG Smart-TV"; why = "Hersteller"; }
+            else if (P(32400)) { kind = "Plex-Medienserver"; why = "Port 32400"; }
+            else if (A("audio pro|ampak|bluesound|denon|marantz|yamaha|bose|teufel|harman|heos")) { kind = "Audio-/Multiroom-Gerät"; why = "Hersteller"; }
+            else if (P(1883)) { kind = "MQTT-Server (Smart Home/IoT)"; why = "Port 1883"; }
+            else if (v.Contains("espressif") || v.Contains("tuya") || A("^esp_|\\besp_[0-9a-f]{6}|esp-[0-9a-f]{6}"))
+            {
+                kind = "ESP-basiertes IoT-Gerät (Steckdose, Schalter, Sensor)";
+                why = "Espressif-Chip" + (A("esp_[0-9a-f]{6}") ? ", Standardname des Chips (Firmware setzt keinen eigenen Namen - oft Sonoff/eWeLink oder älteres Tuya)" : "") +
+                    (OpenPorts.Count == 0 ? ", keine offenen Ports" : "");
+            }
+            // --- PCs, Server, VMs, Mobilgeräte
+            else if (P(3389) || P(135) && P(445) || P(5985))
+            {
+                kind = P(5985) || P(1433) || O("server") ? "Windows-Server" : "Windows-PC";
+                List<string> w = new List<string>();
+                if (P(3389)) w.Add("RDP"); if (P(445)) w.Add("SMB"); if (P(5985)) w.Add("WinRM");
+                why = string.Join(", ", w.ToArray());
+                if (P(1433)) kind += " mit SQL-Server";
+            }
+            else if (P(1433) || P(3306) || P(5432)) { kind = "Datenbankserver"; why = P(1433) ? "MS-SQL" : P(3306) ? "MySQL/MariaDB" : "PostgreSQL"; }
+            else if (P(548) || A("apple") && P(22)) { kind = "Mac"; why = P(548) ? "AFP" : "Apple + SSH"; }
+            else if (v.Contains("raspberry")) { kind = "Raspberry Pi"; why = "Hersteller" + (P(22) ? ", SSH" : ""); }
+            else if (P(22) && OsGuess.Contains("Linux")) { kind = "Linux-/Unix-System"; why = "SSH, TTL 64"; }
+            else if (random) { kind = "Smartphone/Tablet/Laptop (private WLAN-Adresse)"; why = "zufällige MAC-Adresse"; }
+            else if (A("apple")) { kind = "Apple-Gerät"; why = "Hersteller"; }
+            else if (A("samsung|xiaomi|huawei|oneplus|oppo|motorola|google")) { kind = "Smartphone/Tablet/Smart-TV"; why = "Hersteller"; }
+
+            // Virtuelle Maschine (Hersteller der virtuellen Netzwerkkarte) ergänzen
+            string vm = v.Contains("proxmox") ? "VM auf Proxmox" : hex.StartsWith("000C29") || hex.StartsWith("005056") ? "VM auf VMware" : hex.StartsWith("00155D") ? "VM auf Hyper-V" :
+                v.Contains("qemu") ? "VM (KVM/QEMU)" : "";
+            if (vm.Length > 0) { kind = kind.Length > 0 ? kind + " (" + vm + ")" : "Virtuelle Maschine (" + vm.Substring(6) + ")"; why += (why.Length > 0 ? ", " : "") + "virtuelle Netzwerkkarte"; }
+            Kind = kind;
+            List<string> ports = new List<string>();
+            foreach (int p in OpenPorts) ports.Add(p + " " + PortName(p));
+            KindWhy = why + (ports.Count > 0 ? " · offene Ports: " + string.Join(", ", ports.ToArray()) : "");
+        }
+
+        static string Brand(string all, string[] brands)
+        {
+            foreach (string b in brands)
+                if (System.Text.RegularExpressions.Regex.IsMatch(all, "\\b" + System.Text.RegularExpressions.Regex.Escape(b)))
+                    return b == "hewlett" ? "HP" : b.Length <= 3 ? b.ToUpperInvariant() : char.ToUpperInvariant(b[0]) + b.Substring(1);
+            return "";
+        }
+
         /// <summary>Betriebssystem grob anhand der TTL der Ping-Antwort schätzen.</summary>
         public static string GuessOs(int ttl)
         {
@@ -5646,6 +5840,7 @@ namespace PingMonitor
             get
             {
                 List<string> parts = new List<string>();
+                if (Kind.Length > 0) parts.Add("Typ: " + Kind);
                 if (SnmpName.Length > 0) parts.Add("SNMP: " + SnmpName);
                 if (SnmpDescr.Length > 0) parts.Add(Short(SnmpDescr, 70));
                 if (MdnsName.Length > 0) parts.Add("mDNS: " + MdnsName);
@@ -5662,6 +5857,8 @@ namespace PingMonitor
             get
             {
                 StringBuilder sb = new StringBuilder();
+                Line(sb, "Geräteart", Kind.Length > 0 ? Kind + (KindWhy.Length > 0 ? "  (" + KindWhy + ")" : "") : (KindWhy.Length > 0 ? "nicht erkannt (" + KindWhy + ")" : ""));
+                Line(sb, "mDNS-Dienste", string.Join(", ", MdnsServices.ToArray()));
                 Line(sb, "DNS-Name", DnsName.Length > 0 ? DnsName + "  (Quelle: " + DnsSource + ")" : "-");
                 Line(sb, "NetBIOS", NetBiosDisplay);
                 Line(sb, "mDNS", MdnsName);
@@ -5715,6 +5912,20 @@ namespace PingMonitor
                     if (s.TryGetValue(Snmp.SysName, out v)) d.SnmpName = v;
                     if (s.TryGetValue(Snmp.SysDescr, out v)) d.SnmpDescr = v;
                     if (s.TryGetValue(Snmp.SysLocation, out v)) d.SnmpLocation = v;
+                }));
+                jobs.Add(new Thread(delegate () { List<int> open = Probe(ip, ProbePorts, 800); lock (d) d.OpenPorts.AddRange(open); }));
+                jobs.Add(new Thread(delegate ()
+                {
+                    // Dienste per Unicast-mDNS erfragen (Drucker, AirPlay, Cast, HomeKit ...)
+                    int rc;
+                    List<DnsClient.Answer> a = DnsClient.Query(ip, 5353, "_services._dns-sd._udp.local", DnsClient.TypePtr, 1000, out rc);
+                    if (a != null)
+                        foreach (DnsClient.Answer x in a)
+                            if (x.Type == DnsClient.TypePtr && x.Data.StartsWith("_"))
+                            {
+                                string svc = x.Data.Replace(".local", "").TrimEnd('.');
+                                lock (d) if (!d.MdnsServices.Contains(svc)) d.MdnsServices.Add(svc);
+                            }
                 }));
                 jobs.Add(new Thread(delegate () { WebInfo(d, "http://" + ip + "/"); }));
                 jobs.Add(new Thread(delegate () { WebInfo(d, "https://" + ip + "/"); }));

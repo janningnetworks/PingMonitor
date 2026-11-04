@@ -1,4 +1,4 @@
-PingMonitor 4.6 - Geräte per Ping überwachen, Netzwerkfehler finden (App und optional Windows-Dienst)
+PingMonitor 4.7 - Geräte per Ping überwachen, Netzwerkfehler finden (App und optional Windows-Dienst)
 ==========================================================================
 
 Ablage
@@ -86,6 +86,24 @@ Namensauflösung und Geräteinfos
   Doppelklick auf ein Gerät bzw. Maus über der Zeile zeigt alle Infos.
 - Kommentar: Spalte "Kommentar" in der Geräteliste (und im Scanner) anklicken und lostippen,
   z. B. "Router", "WLAN-AP Flur". Wird in hosts.txt gespeichert.
+
+Geräteart erkennen
+------------------
+Bei "Aktualisieren" und im Netzwerkscanner (erweiterte Geräteinfos) bestimmt PingMonitor die Geräteart aus Hersteller
+(MAC), Namen, Webseite, SNMP, den mDNS-Diensten des Geräts und typischen offenen TCP-Ports (nur Verbindungsaufbau, es
+wird nichts gesendet; ca. 60 Ports, max. 4 s je Gerät). Anzeige in der Spalte "Geräteinfo" ("Typ: ...") und in den
+Details mit Belegen und offenen Ports. Erkannt werden u. a.:
+  Unternehmen:  Domänencontroller, Windows-Server/-PC (RDP, SMB, WinRM, SQL), Datenbankserver, Proxmox, VMware ESXi,
+                virtuelle Maschinen (Proxmox/VMware/Hyper-V), iDRAC/iLO/IPMI, NAS (Synology, QNAP, iSCSI/NFS), Drucker/MFP
+                mit Marke, IP-Kameras/NVR, Konferenzsysteme, TK-Anlagen, IP-Telefone/DECT-Basen, USV-Netzwerkkarten,
+                Firewalls/Router (OPNsense, FRITZ!Box, MikroTik ...), Switches/APs mit Hersteller, Linux, Mac, Raspberry Pi.
+  Industrie/Gebäude: Siemens S7, EtherNet/IP, OPC UA, Modbus, Wechselrichter/Energiemanager (SMA, Fronius ...),
+                Heizungs-/Gebäudetechnik.
+  Smart Home/Unterhaltung: Tuya/Smart Life, Sonoff (eWeLink), ESPHome, Shelly, Tasmota, ESP-Geräte ohne Namen
+                ("ESP_xxxxxx" = Standardname des Chips), Home Assistant, Hue Bridge, Kasa, Yeelight, Google Cast, Sonos,
+                AirPlay/Apple TV, iPhone/iPad, Samsung/LG-TV, Plex, Amazon Echo, Multiroom-Audio, Smartphones (private MAC).
+Die erkannte Art fließt in die automatische Geräteklasse ein (z. B. Kamera/TK-Anlage/Wechselrichter = "immer an").
+Hinweis: Ein Intrusion-Detection-System (z. B. Suricata auf der OPNsense) kann die Port-Prüfung als Scan melden.
 
 Netzwerkfehler finden: Leitungsqualität (Stufe 1)
 ------------------------------------------------

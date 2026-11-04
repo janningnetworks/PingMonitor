@@ -1,4 +1,4 @@
-# PingMonitor 4.6
+# PingMonitor 4.7
 
 Windows-App (optional als Windows-Dienst), die mehrere Geräte parallel per Ping überwacht
 und jeden Ausfall mit Zeitstempel in eine tägliche CSV-Datei protokolliert.
@@ -14,6 +14,7 @@ Geräteklassen ("immer an" / "darf aus sein" / WLAN-Gerät / Arbeitszeit): ausge
 Proxmox-API (nur lesend): Quorum, Knoten, Corosync-Links, zwei IPs im selben Subnetz (ARP-Flux), uneinheitliche Bridges; OPNsense-State-Tabelle; Befundliste mit IP-Spalte und Suche.
 Discovery-Wächter (live und im Mitschnitt): mDNS/Bonjour, SSDP, LLMNR, NetBIOS, WS-Discovery, Druckersuche per Broadcast u. a. mit Verursacher, Dauerschleifen und Reflektor-Doppelungen; fehlender IGMP-Querier, ARP-Scans; TCP-Wiederholungen dieses PCs und der Agent-PCs.
 "Gerät dreht frei": Ausreißer je Endgeräte-Port gegenüber dem gelernten Normalwert, PAUSE-Frames (Flow Control), im Mitschnitt ARP-/Broadcast-/IPv6-Fluten und Dauerschleifen je Absender.
+Geräteart-Erkennung (Ports, Hersteller, Web, SNMP, mDNS): Server, DC, VMs, NAS, Drucker, Kameras, TK/IP-Telefone, USV, Industrie (S7, Modbus, OPC UA), Wechselrichter, Smart Home (Tuya, Sonoff, ESPHome, Shelly ...), Cast/AirPlay/Sonos.
 Benachrichtigung per Webhook (JSON) und/oder E-Mail (SMTP) bei Ausfall/Wiederherstellung und bei sicheren Befunden - mit Filtern (Mindestdauer, Geräte, WLAN-Geräte, Sicherheit, Bereiche), Ruhezeit und Tagesbericht.
 
 - Kompilieren: `build.bat` ausführen (nutzt den in Windows enthaltenen .NET-Framework-4.x-Compiler, keine Installation nötig)
