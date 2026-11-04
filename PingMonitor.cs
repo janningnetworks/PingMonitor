@@ -35,8 +35,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCompany("janning networks")]
 [assembly: System.Reflection.AssemblyProduct("PingMonitor")]
 [assembly: System.Reflection.AssemblyCopyright("janning networks")]
-[assembly: System.Reflection.AssemblyVersion("4.6.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("4.6.0.0")]
+[assembly: System.Reflection.AssemblyVersion("4.6.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("4.6.1.0")]
 
 namespace PingMonitor
 {
@@ -13314,6 +13314,8 @@ namespace PingMonitor
         readonly Dictionary<string, int> arpRequests = new Dictionary<string, int>();       // Requester|Ziel-IP
         readonly Dictionary<string, int> arpReplies = new Dictionary<string, int>();
         readonly HashSet<string> requestersWithReplies = new HashSet<string>();
+        readonly HashSet<string> seenIps = new HashSet<string>();                       // IPs, die selbst gesendet haben (lebt)
+        readonly Dictionary<string, string> arpSenderIp = new Dictionary<string, string>();   // MAC -> IP aus ARP
         readonly Dictionary<string, DateTime> arpFirstReq = new Dictionary<string, DateTime>();
         int gratuitous;
 
@@ -13445,13 +13447,119 @@ namespace PingMonitor
                     if (t < First) First = t;
                     if (t > Last) Last = t;
                 }
-                try { Decode(t, link, d, len); }
+                try
+                {
+                    // WLAN: pktmon speichert auf WLAN-Karten rohe 802.11-Frames, kennzeichnet sie aber als "Ethernet" (Linktyp 1);
+                    // dazu echte 802.11- (105) und Radiotap-Mitschnitte (127). Datenframes werden in Ethernet-Frames umgewandelt.
+                    bool wifi = link == 105 || link == 127;
+                    int off = 0;
+                    if (link == 127 && len >= 4) { off = d[2] | d[3] << 8; if (off >= len) { Undecoded++; return; } }
+                    List<byte[]> frames = wifi || link == 1 && (WifiFrames > 0 || LooksWifi(d, len)) ? Wifi(d, off, len, wifi || WifiFrames > 0) : null;
+                    if (frames != null)
+                    {
+                        foreach (byte[] f in frames) Decode(t, 1, f, f.Length);
+                        return;
+                    }
+                    Decode(t, link, d, len);
+                }
                 catch (IndexOutOfRangeException) { Undecoded++; }
                 catch (ArgumentException) { Undecoded++; }
                 if (Packets % 20000 == 0 && progress != null) progress(Packets);
             }, out drops);
             Drops = drops;
             Evaluate();
+        }
+
+        public long WifiFrames, WifiRetry, WifiRetryIn, WifiIn, WifiOther;
+
+        static bool Snap(byte[] d, int o, int len) { return o + 8 <= len && d[o] == 0xAA && d[o + 1] == 0xAA && d[o + 2] == 0x03; }
+
+        /// <summary>Header-Länge eines 802.11-Datenframes ab off (ohne Verschlüsselungs-Header), -1 = kein Datenframe.</summary>
+        static int WifiHeader(byte[] d, int off, int len, out bool amsdu)
+        {
+            amsdu = false;
+            if (len - off < 24) return -1;
+            int fc0 = d[off], fc1 = d[off + 1];
+            if ((fc0 & 3) != 0 || ((fc0 >> 2) & 3) != 2) return -1;
+            int hdr = (fc1 & 3) == 3 ? 30 : 24;
+            if (((fc0 >> 4) & 8) != 0)
+            {
+                if (off + hdr + 2 > len) return -1;
+                amsdu = (d[off + hdr] & 0x80) != 0;
+                hdr += 2;
+                if ((fc1 & 0x80) != 0) hdr += 4;   // HT-Control
+            }
+            return hdr;
+        }
+
+        /// <summary>Sieht ein als Ethernet gekennzeichneter Frame wie ein 802.11-Datenframe mit LLC/SNAP aus?</summary>
+        static bool LooksWifi(byte[] d, int len)
+        {
+            bool amsdu;
+            int h = WifiHeader(d, 0, len, out amsdu);
+            if (h < 0) return false;
+            return Snap(d, h, len) || Snap(d, h + 8, len) || amsdu && Snap(d, h + 14, len);
+        }
+
+        /// <summary>
+        /// 802.11-Frame in Ethernet-Frames umwandeln (A-MSDU = mehrere). Verwaltungs-/Steuer-/Null-Frames: leere Liste.
+        /// null = kein 802.11 (nur wenn !sure).
+        /// </summary>
+        List<byte[]> Wifi(byte[] d, int off, int len, bool sure)
+        {
+            List<byte[]> r = new List<byte[]>();
+            bool amsdu;
+            int h = WifiHeader(d, off, len, out amsdu);
+            if (h < 0)
+            {
+                if (!sure) return null;
+                WifiOther++;
+                return r;
+            }
+            int fc0 = d[off], fc1 = d[off + 1];
+            WifiFrames++;
+            bool retry = (fc1 & 0x08) != 0, fromDs = (fc1 & 3) == 2;
+            if (retry) WifiRetry++;
+            if (fromDs) { WifiIn++; if (retry) WifiRetryIn++; }
+            if (((fc0 >> 4) & 4) != 0) return r;   // Null-Daten (Energiesparen)
+            int da, sa;
+            switch (fc1 & 3)
+            {
+                case 0: da = 4; sa = 10; break;      // direkt (Ad-hoc)
+                case 1: da = 16; sa = 10; break;     // zum AP
+                case 2: da = 4; sa = 16; break;      // vom AP
+                default: da = 16; sa = 24; break;    // WDS/Mesh
+            }
+            int p = off + h;
+            if (!amsdu)
+            {
+                if (!Snap(d, p, len) && (fc1 & 0x40) != 0 && Snap(d, p + 8, len)) p += 8;   // CCMP-Header noch vorhanden
+                if (!Snap(d, p, len)) { if (!sure) return null; WifiOther++; return r; }
+                r.Add(EthFrame(d, off + da, off + sa, d, p + 6, len));
+                return r;
+            }
+            // A-MSDU: Unterframes DA(6) SA(6) Länge(2) + LLC/SNAP + Daten, auf 4 Byte aufgefüllt
+            if (!Snap(d, p + 14, len) && Snap(d, p + 22, len)) p += 8;
+            while (p + 14 <= len)
+            {
+                int l = U16(d, p + 12);
+                if (l < 8 || p + 14 + l > len || !Snap(d, p + 14, len)) break;
+                r.Add(EthFrame(d, p, p + 6, d, p + 14 + 6, p + 14 + l));
+                p += 14 + l;
+                p += (4 - (14 + l) % 4) % 4;
+            }
+            return r;
+        }
+
+        /// <summary>Ethernet-Frame aus Ziel-/Quell-MAC und Ethertype+Nutzdaten (ab typ bis end).</summary>
+        static byte[] EthFrame(byte[] d, int da, int sa, byte[] src, int typ, int end)
+        {
+            int n = Math.Max(0, end - typ);
+            byte[] f = new byte[12 + n];
+            Buffer.BlockCopy(d, da, f, 0, 6);
+            Buffer.BlockCopy(d, sa, f, 6, 6);
+            Buffer.BlockCopy(src, typ, f, 12, n);
+            return f;
         }
 
         static string Mac(byte[] d, int p) { return BitConverter.ToString(d, p, 6); }
@@ -13730,6 +13838,7 @@ namespace PingMonitor
             int op = U16(d, p + 6);
             string sMac = Mac(d, p + 8), sIp = Ip4(d, p + 14), tIp = Ip4(d, p + 24);
             if (sIp == tIp) gratuitous++;
+            if (sIp != "0.0.0.0") { if (seenIps.Count < 50000) seenIps.Add(sIp); if (arpSenderIp.Count < 5000) arpSenderIp[sMac] = sIp; }
             if (sIp != "0.0.0.0" && sMac != "00-00-00-00-00-00")
             {
                 Vlan(curVlan).Ips[sIp] = sMac;
@@ -13778,6 +13887,7 @@ namespace PingMonitor
             int flagsFrag = U16(d, p + 6);
             int proto = d[p + 9];
             string src = Ip4(d, p + 12), dst = Ip4(d, p + 16);
+            if (seenIps.Count < 50000) seenIps.Add(src);
             long b; talkers.TryGetValue(src, out b); talkers[src] = b + total;
             if ((flagsFrag & 0x1FFF) != 0 || (flagsFrag & 0x2000) != 0) { fragments++; if ((flagsFrag & 0x1FFF) != 0) return; }
             int l4 = p + ihl, end = p + total;
@@ -14399,8 +14509,13 @@ namespace PingMonitor
             foreach (KeyValuePair<string, int> kv in arpRequests)
             {
                 string[] k = kv.Key.Split('|');
-                if (!requestersWithReplies.Contains(k[0]) || arpReplies.ContainsKey(kv.Key) || kv.Value < 3) continue;
-                unanswered.Add("  • " + k[1] + "  (" + kv.Value + " Anfragen von " + k[0] + ", zuerst " + arpFirstReq[kv.Key].ToString("HH:mm:ss") + ")");
+                // Antworten gehen per Unicast an den Fragenden - an einem Endgerät (oder im WLAN) nicht sichtbar. Darum zählt nur, wenn
+                // das Ziel im ganzen Mitschnitt nie selbst gesendet hat und oft genug gefragt wurde.
+                if (arpReplies.ContainsKey(kv.Key) || seenIps.Contains(k[1]) || kv.Value < 3) continue;
+                if (!requestersWithReplies.Contains(k[0]) && kv.Value < 10) continue;
+                string rip;
+                arpSenderIp.TryGetValue(k[0], out rip);
+                unanswered.Add("  • " + k[1] + "  (" + kv.Value + " Anfragen von " + (rip != null ? rip + " / " : "") + k[0] + " " + MacVendors.Lookup(k[0]) + ", zuerst " + arpFirstReq[kv.Key].ToString("HH:mm:ss") + ")");
             }
             if (unanswered.Count > 0)
             {
@@ -14610,6 +14725,18 @@ namespace PingMonitor
                 return ipMac.TryGetValue(ip, out mac) ? MacVendors.Lookup(mac) : "";
             }))
                 Add(df.Level, df.Title, df.Text.TrimEnd(), df.Filter, df.Proto.StartsWith("mDNS") ? "https://de.wikipedia.org/wiki/Zeroconf" : "");
+
+            if (WifiFrames > 0)
+            {
+                double rin = WifiIn > 0 ? 100.0 * WifiRetryIn / WifiIn : 0;
+                Add(rin >= 10 ? Finding.Warning : Finding.Info, "Mitschnitt über WLAN" + (rin >= 10 ? ": viele Funk-Wiederholungen (" + rin.ToString("0.0") + " %)" : ""),
+                    WifiFrames + " WLAN-Datenframes (802.11, z. B. pktmon auf der WLAN-Karte) - umgewandelt und ausgewertet. Funk-Wiederholungen vom Access Point: " +
+                    WifiRetryIn + " von " + WifiIn + " (" + rin.ToString("0.0") + " %; normal unter 10 %).\r\n" +
+                    "Einschränkungen: Ein WLAN-Mitschnitt sieht nur den eigenen Verkehr sowie Broadcast/Multicast - keine Unicast-Antworten an andere Geräte. " +
+                    "Einzelne eingehende Frames können im Mitschnitt fehlen; Ping-Verluste und unbeantwortete DNS-Anfragen daher mit der Ping-Überwachung bzw. " +
+                    "einem Mitschnitt an der Firewall/am Spiegel-Port gegenprüfen. Für Switch-/Kabelprobleme immer kabelgebunden mitschneiden.",
+                    "wlan.fc.retry == 1", "");
+            }
 
             if (Drops > 0)
                 Add(Finding.Info, Drops + " Pakete beim Aufzeichnen verloren", "Der Mitschnitt selbst ist unvollständig (das Aufzeichnungsprogramm kam nicht hinterher). Einzelne \"Verluste\" können daher vom Mitschnitt stammen.", "", "");
@@ -14906,9 +15033,11 @@ namespace PingMonitor
             new object[] { 32414, "Plex-Suche (GDM)", "udp.port == 32412 || udp.port == 32414", 1.0, 10.0, "Plex-Server/-Clients" },
             new object[] { 6667, "Tuya/Smart-Home", "udp.port == 6666 || udp.port == 6667", 1.0, 10.0, "Smart-Steckdosen/-Lampen (Tuya, Smart Life)" },
             new object[] { 10001, "Ubiquiti-Discovery", "udp.port == 10001", 2.0, 20.0, "UniFi-Geräte melden sich" },
+            new object[] { 1947, "Sentinel/HASP-Lizenzsuche", "udp.port == 1947", 2.0, 20.0, "Lizenzdienst (Dongle/Netzwerklizenz) sucht Lizenzserver per Broadcast" },
+            new object[] { 15600, "Samsung-Gerätesuche", "udp.port == 15600", 2.0, 20.0, "Samsung-TVs/-Smartphones (SmartView) suchen Geräte" },
         };
 
-        public static readonly int[] Ports = { 5353, 1900, 5355, 137, 138, 3702, 161, 427, 3289, 8612, 17500, 57621, 27036, 32414, 32412, 6666, 6667, 10001 };
+        public static readonly int[] Ports = { 5353, 1900, 5355, 137, 138, 3702, 161, 427, 3289, 8612, 17500, 57621, 27036, 32414, 32412, 6666, 6667, 10001, 1947, 15600 };
 
         public readonly Dictionary<int, Proto> Protos = new Dictionary<int, Proto>();
         public DateTime First = DateTime.MinValue, Last = DateTime.MinValue;
@@ -15225,6 +15354,10 @@ namespace PingMonitor
                 case 32414:
                     f.Causes.Add("Programm sucht andere Instanzen im LAN (" + p.Note + ")");
                     f.Fix.Add("In den Einstellungen des Programms die LAN-Suche abschalten (Dropbox: \"LAN-Synchronisierung\") oder per Firewall/VLAN trennen, wenn es stört.");
+                    break;
+                case 1947:
+                    f.Causes.Add("Sentinel/HASP License Manager (Software mit Dongle- oder Netzwerklizenz, z. B. CAD/Branchensoftware) sucht per Broadcast nach Lizenzservern");
+                    f.Fix.Add("Auf dem Absender http://localhost:1947 → Configuration → \"Access to Remote License Managers\": \"Broadcast Search for Remote Licenses\" ausschalten bzw. den Lizenzserver fest eintragen.");
                     break;
                 case 6667:
                     f.Causes.Add("Smart-Home-Geräte (Tuya/Smart Life) senden regelmäßig Broadcasts");
