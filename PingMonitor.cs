@@ -35,13 +35,25 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCompany("janning networks")]
 [assembly: System.Reflection.AssemblyProduct("PingMonitor")]
 [assembly: System.Reflection.AssemblyCopyright("janning networks")]
-[assembly: System.Reflection.AssemblyVersion("4.6.2.0")]
-[assembly: System.Reflection.AssemblyFileVersion("4.6.2.0")]
+[assembly: System.Reflection.AssemblyVersion("4.6.3.0")]
+[assembly: System.Reflection.AssemblyFileVersion("4.6.3.0")]
 
 namespace PingMonitor
 {
     static class Program
     {
+        /// <summary>Genaue Version (Dateiversion), z. B. "4.6.2" - zeigt, welche EXE wirklich läuft.</summary>
+        public static string Version
+        {
+            get
+            {
+                object[] a = typeof(Program).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyFileVersionAttribute), false);
+                string v = a.Length > 0 ? ((System.Reflection.AssemblyFileVersionAttribute)a[0]).Version : "";
+                while (v.EndsWith(".0") && v.Split('.').Length > 2) v = v.Substring(0, v.Length - 2);
+                return v;
+            }
+        }
+
         [STAThread]
         static int Main(string[] args)
         {
@@ -2215,7 +2227,7 @@ namespace PingMonitor
 
         public MainForm()
         {
-            Text = "PingMonitor 4.6";
+            Text = "PingMonitor " + Program.Version;
             Size = new Size(1360, 800);
             MinimumSize = new Size(850, 520);
             StartPosition = FormStartPosition.CenterScreen;
@@ -2536,7 +2548,7 @@ namespace PingMonitor
             });
             help.DropDownItems.Add("Über PingMonitor", null, delegate
             {
-                MessageBox.Show(this, "PingMonitor 4.6\n\nÜberwacht Geräte, Switches, WLAN, Firewall und Internet-Leitung, erkennt Fehler im Netz mit Sicherheitsstufe " +
+                MessageBox.Show(this, "PingMonitor " + Program.Version + "\n" + Application.ExecutablePath + "\n\nÜberwacht Geräte, Switches, WLAN, Firewall und Internet-Leitung, erkennt Fehler im Netz mit Sicherheitsstufe " +
                     "und Maßnahmenplan und prüft Maßnahmen nach.\n\nProgrammordner: " + Config.BaseDir, Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
             });
             m.Items.AddRange(new ToolStripItem[] { file, dev, net, ana, set, svc, help });
@@ -15762,7 +15774,7 @@ namespace PingMonitor
 
         public AnalysisForm()
         {
-            Text = "Mitschnitt analysieren";
+            Text = "Mitschnitt analysieren - PingMonitor " + Program.Version;
             Font = new Font("Segoe UI", 9.5F);
             Size = new Size(1250, 800);
             MinimumSize = new Size(900, 550);

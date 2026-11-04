@@ -6,6 +6,14 @@ Ablage
 Ordner z. B. nach C:\PingMonitor kopieren (NICHT nach C:\Programme, dort fehlen
 Schreibrechte für hosts.txt und Logs).
 
+Aktualisieren auf eine neue Version
+-----------------------------------
+1. Läuft der Windows-Dienst: Menü Dienst -> "Dienst stoppen" (sonst ist PingMonitor.exe gesperrt und Windows ersetzt
+   sie NICHT - es läuft unbemerkt die alte Version weiter). App schließen.
+2. PingMonitor.exe ersetzen (Einstellungen, Geräte und Logs bleiben erhalten).
+3. App starten, Dienst wieder starten. Die genaue Version steht im Fenstertitel (z. B. "PingMonitor 4.6.3") und unter
+   Hilfe -> Info (mit Pfad der laufenden EXE).
+
 Start
 -----
 PingMonitor.exe doppelklicken (benötigt .NET Framework 4.x, ist in Windows 10/11 enthalten).
