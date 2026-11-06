@@ -35,8 +35,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCompany("janning networks")]
 [assembly: System.Reflection.AssemblyProduct("PingMonitor")]
 [assembly: System.Reflection.AssemblyCopyright("janning networks")]
-[assembly: System.Reflection.AssemblyVersion("4.7.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("4.7.0.0")]
+[assembly: System.Reflection.AssemblyVersion("4.7.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("4.7.1.0")]
 
 namespace PingMonitor
 {
@@ -16575,22 +16575,23 @@ namespace PingMonitor
                 WebHeaderCollection headers;
                 // UniFi OS (UDM, Cloud Key Gen2+, UniFi OS Server)
                 bool os = Http("POST", b + "/api/auth/login", body, cookies, "", out status, out resp, out headers);
+                int osStatus = status;
                 if (os && status == 200)
                 {
                     prefix = "/proxy/network";
                     csrf = headers["X-CSRF-Token"] ?? headers["X-Updated-CSRF-Token"] ?? "";
                 }
-                else if (os && (status == 400 || status == 401 || status == 403))
-                {
-                    errors.Add(b + ": Anmeldung abgelehnt (Benutzer/Passwort prüfen; lokales Konto verwenden, kein UI-Cloud-Konto mit 2FA)");
-                    continue;
-                }
-                // klassischer Controller
+                // klassischer Controller / selbst betriebener UniFi Network Server (z. B. in der Cloud, Port 8443): kennt /api/auth/login
+                // nicht und antwortet darauf mit 401 "LoginRequired" - deshalb in jedem Fall auch /api/login versuchen.
                 else if (Http("POST", b + "/api/login", body, cookies, "", out status, out resp, out headers) && status == 200)
                     prefix = "";
                 else
                 {
-                    errors.Add(b + ": " + (status == 0 ? resp : status == 400 || status == 401 || status == 403 ? "Anmeldung abgelehnt (Benutzer/Passwort prüfen)" : "HTTP " + status));
+                    bool denied = status == 400 || status == 401 || status == 403 || osStatus == 400 || osStatus == 401 || osStatus == 403;
+                    string mfa = resp != null && resp.IndexOf("MFA", StringComparison.OrdinalIgnoreCase) >= 0 || resp != null && resp.IndexOf("2fa", StringComparison.OrdinalIgnoreCase) >= 0
+                        ? " - das Konto verlangt Zwei-Faktor-Anmeldung" : "";
+                    errors.Add(b + ": " + (status == 0 && osStatus == 0 ? resp : denied ? "Anmeldung abgelehnt" + mfa +
+                        " (Benutzer/Passwort prüfen; ein LOKALES Konto des Controllers ohne 2FA verwenden, kein UI-Konto/SSO)" : "HTTP " + status));
                     continue;
                 }
 

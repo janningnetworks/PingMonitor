@@ -299,6 +299,9 @@ klassischer Controller: https://name:8443), Benutzer, Passwort, Site.
     "Verbindung testen" lädt die Liste aller Sites in das Auswahlfeld. Gibt es nur eine Site, genügt "default".
   - Im Controller einen eigenen LOKALEN Benutzer anlegen (Admins -> Benutzer hinzufügen, "Restrict to local
     access only"), Rolle "View Only" bzw. "Nur lesen". UI-Cloud-Konten mit Zwei-Faktor gehen nicht.
+  - Selbst betriebener UniFi Network Server in der Cloud/im Rechenzentrum (z. B. https://unifi.firma.de:8443)
+    funktioniert genauso, wenn der PC ihn per HTTPS erreicht. Nicht möglich: nur über unifi.ui.com (Site Manager)
+    erreichbare Controller ohne eigene Adresse.
   - PingMonitor liest nur (Geräte- und Clientliste), ändert nichts. Das Passwort wird verschlüsselt
     (Windows-DPAPI) in settings.txt gespeichert. Das selbstsignierte Zertifikat des Controllers wird akzeptiert.
   - Abgefragt wird bei jeder Switch-Abfragerunde (Dienst bzw. App). Nicht erreichbar / wieder erreichbar
