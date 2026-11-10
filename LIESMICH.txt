@@ -146,6 +146,9 @@ Menü Netzwerk -> "Switches / Controller / Firewall ...": Switches mit IP-Adress
   (Quelle "Switch"). Benachrichtigt wird über die Befunde (nur sichere, siehe "Befunde").
 - Läuft der Windows-Dienst, fragt er die Switches rund um die Uhr ab; sonst die App, solange sie offen ist.
 - Abfrage standardmäßig alle 60 Sekunden (einstellbar). Zähler gelten "seit Überwachungsbeginn".
+- Ohne Dienst fragt die App selbst ab. Ist ein Dienst installiert, liefert aber keine Daten für diesen Ordner
+  (anderer Ordner, hängt, Status älter als 5 Minuten), übernimmt die App die Abfrage ebenfalls selbst
+  (Statuszeile: "liefert keine Daten, die App fragt ... selbst ab").
 - Status bleibt bei "wird abgefragt ...": Die Abfrage läuft gar nicht. Häufigste Ursache: Der Windows-Dienst
   wurde aus einem ANDEREN Ordner installiert (z. B. alte Kopie) und liest dort eigene switches.txt/hosts.txt.
   Die Statuszeile unten zeigt das rot an ("aus anderem Ordner"). Abhilfe: Dienst -> deinstallieren, dann aus

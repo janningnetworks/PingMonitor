@@ -35,8 +35,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCompany("janning networks")]
 [assembly: System.Reflection.AssemblyProduct("PingMonitor")]
 [assembly: System.Reflection.AssemblyCopyright("janning networks")]
-[assembly: System.Reflection.AssemblyVersion("4.7.2.0")]
-[assembly: System.Reflection.AssemblyFileVersion("4.7.2.0")]
+[assembly: System.Reflection.AssemblyVersion("4.7.3.0")]
+[assembly: System.Reflection.AssemblyFileVersion("4.7.3.0")]
 
 namespace PingMonitor
 {
@@ -2073,6 +2073,19 @@ namespace PingMonitor
             catch { return ""; }
         }
 
+        /// <summary>
+        /// Liefert der Dienst Daten für DIESE App? Er muss laufen, aus demselben Ordner stammen und seinen Status in den letzten
+        /// 5 Minuten geschrieben haben. Sonst fragt die App selbst ab (z. B. Dienst aus altem Ordner, hängt oder ist gerade gestartet).
+        /// </summary>
+        public static bool Delivers(ServiceControllerStatus? st)
+        {
+            if (st != ServiceControllerStatus.Running || OtherFolder().Length > 0) return false;
+            DateTime newest = DateTime.MinValue;
+            foreach (string f in new string[] { SwitchMonitor.StatusFile, Config.StatusFile })
+                try { if (File.Exists(f) && File.GetLastWriteTime(f) > newest) newest = File.GetLastWriteTime(f); } catch { }
+            return DateTime.Now - newest < TimeSpan.FromMinutes(5);
+        }
+
         public static string StatusText(ServiceControllerStatus? s)
         {
             if (!s.HasValue) return "nicht installiert";
@@ -2255,6 +2268,7 @@ namespace PingMonitor
         WorkflowPanel workflow;
 
         ServiceControllerStatus? svcStatus;
+        bool svcData;   // Dienst läuft UND liefert Daten für diesen Ordner - sonst fragt die App selbst ab
         string tailFile;
         long tailPos;
 
@@ -2615,7 +2629,7 @@ namespace PingMonitor
 
         void OpenIssues()
         {
-            using (IssuesForm f = new IssuesForm(delegate { return SwitchMonitor.CurrentIssues(svcStatus == ServiceControllerStatus.Running); },
+            using (IssuesForm f = new IssuesForm(delegate { return SwitchMonitor.CurrentIssues(svcData); },
                 delegate (string host) { OpenTools(host); }))
                 f.ShowDialog(this);
             RefreshPorts();
@@ -2636,21 +2650,21 @@ namespace PingMonitor
 
         void OpenSwitches()
         {
-            using (SwitchForm f = new SwitchForm(delegate { return svcStatus == ServiceControllerStatus.Running; })) f.ShowDialog(this);
+            using (SwitchForm f = new SwitchForm(delegate { return svcData; })) f.ShowDialog(this);
             RefreshPorts();
         }
 
         void OpenTopology()
         {
-            using (TopologyForm f = new TopologyForm(delegate { return SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running); },
+            using (TopologyForm f = new TopologyForm(delegate { return SwitchMonitor.Current(svcData); },
                 delegate { return new List<PingTarget>(targets); },
-                delegate { return SwitchMonitor.CurrentUniFi(svcStatus == ServiceControllerStatus.Running); }, delegate (PingTarget t) { ShowDetails(t); }))
+                delegate { return SwitchMonitor.CurrentUniFi(svcData); }, delegate (PingTarget t) { ShowDetails(t); }))
                 f.ShowDialog(this);
         }
 
         void OpenDoc()
         {
-            bool svc = svcStatus == ServiceControllerStatus.Running;
+            bool svc = svcData;
             DocExport.Run(this, SwitchMonitor.Current(svc), SwitchMonitor.CurrentUniFi(svc), new List<PingTarget>(targets));
         }
 
@@ -2661,7 +2675,7 @@ namespace PingMonitor
         /// <summary>Übersicht aller Datenquellen mit Zustand und Alter, Vorrangregeln und aktuellen Widersprüchen.</summary>
         void ShowSources()
         {
-            bool svc = svcStatus == ServiceControllerStatus.Running;
+            bool svc = svcData;
             StringBuilder sb = new StringBuilder();
             Func<DateTime, string> age = delegate (DateTime t) { return t == DateTime.MinValue ? "nie" : "vor " + Milestones.Fmt(DateTime.Now - t); };
             DateTime stand = SwitchMonitor.Stand(svc);
@@ -2751,7 +2765,7 @@ namespace PingMonitor
         /// <summary>Arbeitsablauf aktualisieren: Was ist erledigt, was ist der nächste sinnvolle Schritt?</summary>
         void UpdateWorkflow(List<SwitchState> sw)
         {
-            bool svc = svcStatus == ServiceControllerStatus.Running;
+            bool svc = svcData;
             UniFiSnapshot uf = SwitchMonitor.CurrentUniFi(svc);
             // 1 Netzwerk
             int nSw = 0, nAp = 0; bool fw = false;
@@ -2931,10 +2945,10 @@ namespace PingMonitor
                 SaveHosts();
                 if (added.Count == 0) return;
                 if (MessageBox.Show(this, added.Count + " Gerät(e) hinzugefügt (Intervall " + numInterval.Value + " ms, Timeout " + numTimeout.Value +
-                        " ms).\n\n" + (svcStatus == ServiceControllerStatus.Running
+                        " ms).\n\n" + (svcData
                             ? "Der Dienst überwacht sie ab sofort automatisch."
                             : "Überwachung in der App jetzt starten?"),
-                        Text, svcStatus == ServiceControllerStatus.Running ? MessageBoxButtons.OK : MessageBoxButtons.YesNo,
+                        Text, svcData ? MessageBoxButtons.OK : MessageBoxButtons.YesNo,
                         MessageBoxIcon.Information) == DialogResult.Yes)
                     StartTargets(added);
             }
@@ -3075,7 +3089,7 @@ namespace PingMonitor
         void StartTargets(List<PingTarget> list)
         {
             if (list.Count == 0) return;
-            if (svcStatus == ServiceControllerStatus.Running &&
+            if (svcData &&
                 MessageBox.Show(this, "Der Windows-Dienst überwacht diese Geräte bereits und protokolliert Ausfälle.\n\n" +
                     "Trotzdem zusätzlich in der App pingen? (Ausfälle werden dann doppelt protokolliert.)",
                     Text, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
@@ -3139,7 +3153,7 @@ namespace PingMonitor
         void OnOutageStarted(PingTarget t, string source)
         {
             if (source != LocalSource) return;
-            bool svc = svcStatus == ServiceControllerStatus.Running;
+            bool svc = svcData;
             Outages.Diagnose(t, delegate { return SwitchMonitor.Current(svc); }, delegate (PingTarget x, LogEntry e)
             {
                 try
@@ -3232,7 +3246,7 @@ namespace PingMonitor
         /// <summary>Offene Befunde und Widersprüche, die dieses Gerät betreffen (IP, MAC oder Name).</summary>
         string RelatedIssues(PingTarget t)
         {
-            bool svc = svcStatus == ServiceControllerStatus.Running;
+            bool svc = svcData;
             string mac = NetTools.MacHex(t.Mac), dashed = NetTools.FormatMac(t.Mac);
             Predicate<string> hit = delegate (string x)
             {
@@ -3256,7 +3270,7 @@ namespace PingMonitor
         /// <summary>WLAN-Zustand und -Verlauf eines Geräts laut UniFi-Controller, mit Bewertung.</summary>
         string WlanDetails(PingTarget t)
         {
-            UniFiSnapshot u = SwitchMonitor.CurrentUniFi(svcStatus == ServiceControllerStatus.Running);
+            UniFiSnapshot u = SwitchMonitor.CurrentUniFi(svcData);
             if (!u.Valid) return "";
             UniFiClientInfo c = u.Client(t.Mac, t.Host);
             WlanTrack tr;
@@ -3299,11 +3313,11 @@ namespace PingMonitor
         void RefreshPorts()
         {
             Dictionary<string, KeyValuePair<SwitchState, PortState>> map = new Dictionary<string, KeyValuePair<SwitchState, PortState>>();
-            List<SwitchState> current = SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running);
+            List<SwitchState> current = SwitchMonitor.Current(svcData);
             // Fehlende MACs (z. B. Handy schlief beim Scan, anderes VLAN) aus der ARP-Tabelle der Firewall übernehmen
             Dictionary<PingTarget, string> before = new Dictionary<PingTarget, string>();
             foreach (PingTarget t in targets) before[t] = t.Mac;
-            if (SwitchMonitor.FillMacs(targets, current, SwitchMonitor.CurrentOpn(svcStatus == ServiceControllerStatus.Running)) > 0)
+            if (SwitchMonitor.FillMacs(targets, current, SwitchMonitor.CurrentOpn(svcData)) > 0)
             {
                 foreach (PingTarget t in targets)
                     if (t.Mac != before[t]) RefreshInfo(t);
@@ -3316,8 +3330,8 @@ namespace PingMonitor
             try { if (workflow != null) BeginInvoke(new Action(delegate { UpdateWorkflow(current); })); } catch (InvalidOperationException) { }
             portByMac = map;
             Dictionary<PingTarget, DeviceLink> links;
-            try { Topology.Build(SwitchMonitor.Current(svcStatus == ServiceControllerStatus.Running), new List<PingTarget>(targets),
-                SwitchMonitor.CurrentUniFi(svcStatus == ServiceControllerStatus.Running), out links); }
+            try { Topology.Build(SwitchMonitor.Current(svcData), new List<PingTarget>(targets),
+                SwitchMonitor.CurrentUniFi(svcData), out links); }
             catch { links = new Dictionary<PingTarget, DeviceLink>(); }
             foreach (PingTarget t in targets)
             {
@@ -3685,7 +3699,13 @@ namespace PingMonitor
         {
             svcStatus = ServiceSetup.Status();
             lblService.Text = "Windows-Dienst: " + ServiceSetup.StatusText(svcStatus);
+            svcData = ServiceSetup.Delivers(svcStatus);
             lblService.ForeColor = svcStatus == ServiceControllerStatus.Running ? Color.DarkGreen : SystemColors.ControlText;
+            if (svcStatus == ServiceControllerStatus.Running && !svcData)
+            {
+                lblService.Text += " - liefert keine Daten, die App fragt Switches/Controller selbst ab";
+                lblService.ForeColor = Color.DarkOrange;
+            }
             string other = svcStatus.HasValue ? ServiceSetup.OtherFolder() : "";
             if (other.Length > 0)
             {
@@ -3698,11 +3718,11 @@ namespace PingMonitor
             miSvcStart.Enabled = svcStatus == ServiceControllerStatus.Stopped;
             miSvcStop.Enabled = svcStatus == ServiceControllerStatus.Running;
 
-            ReadServiceStatus(svcStatus == ServiceControllerStatus.Running);
+            ReadServiceStatus(svcData);
             TailLog();
 
             // Switch-Abfrage: übernimmt der Dienst, wenn er läuft - sonst die App.
-            bool svcRunning = svcStatus == ServiceControllerStatus.Running;
+            bool svcRunning = svcData;
             if (svcRunning && SwitchMonitor.Running) SwitchMonitor.Stop();
             else if (!svcRunning && !SwitchMonitor.Running) SwitchMonitor.Start(LocalSource, false);
             if (++portRefresh % 5 == 1) RefreshPorts();
@@ -20852,7 +20872,7 @@ namespace PingMonitor
             o("");
             o("2) WAN-Adresse der Firewall (SNMP):");
             string wan = "", fwName = "";
-            bool svc = ServiceSetup.Status() == System.ServiceProcess.ServiceControllerStatus.Running;
+            bool svc = ServiceSetup.Delivers(ServiceSetup.Status());
             foreach (SwitchState s in SwitchMonitor.Current(svc))
             {
                 if (s.Kind != "Firewall") continue;
