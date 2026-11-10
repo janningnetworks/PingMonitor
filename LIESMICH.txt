@@ -146,6 +146,19 @@ Menü Netzwerk -> "Switches / Controller / Firewall ...": Switches mit IP-Adress
   (Quelle "Switch"). Benachrichtigt wird über die Befunde (nur sichere, siehe "Befunde").
 - Läuft der Windows-Dienst, fragt er die Switches rund um die Uhr ab; sonst die App, solange sie offen ist.
 - Abfrage standardmäßig alle 60 Sekunden (einstellbar). Zähler gelten "seit Überwachungsbeginn".
+- Status bleibt bei "wird abgefragt ...": Die Abfrage läuft gar nicht. Häufigste Ursache: Der Windows-Dienst
+  wurde aus einem ANDEREN Ordner installiert (z. B. alte Kopie) und liest dort eigene switches.txt/hosts.txt.
+  Die Statuszeile unten zeigt das rot an ("aus anderem Ordner"). Abhilfe: Dienst -> deinstallieren, dann aus
+  dem aktuellen Ordner wieder installieren. "Diagnosedaten speichern" zeigt Version, Dienst-Pfad und testet
+  SNMP zu jedem eingetragenen Switch direkt.
+- "KEINE SNMP-ANTWORT" bei HP/Aruba:
+    ProCurve/Aruba 2530/2540/2930 u. a. (CLI):  snmp-server community "public" operator  (bzw. eigene Community),
+      ggf. "snmp-server host"/Zugriffslisten und das Management-VLAN beachten.
+    HPE OfficeConnect 1820/1850/1920 (Web): SNMP aktivieren, v1/v2c zulassen, Community mit Leserecht anlegen.
+    HPE/H3C Comware (1910/1950/5130 ...): snmp-agent; snmp-agent sys-info version v2c;
+      snmp-agent community read public.
+    Aruba Instant On 1930/1960: SNMP nur in der lokalen Weboberfläche (nicht im Cloud-Modus) - dort aktivieren.
+  Prüfen mit Netzwerk -> Werkzeuge -> SNMP (Community testen).
 - Hinweis: Welche Werte ein Switch liefert, hängt vom Modell ab. Fehlende Werte (z. B. Duplex oder
   CRC-Zähler bei manchen Geräten) werden durch allgemeine Fehlerzähler ersetzt bzw. leer gelassen.
 

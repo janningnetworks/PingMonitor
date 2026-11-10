@@ -35,8 +35,8 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyCompany("janning networks")]
 [assembly: System.Reflection.AssemblyProduct("PingMonitor")]
 [assembly: System.Reflection.AssemblyCopyright("janning networks")]
-[assembly: System.Reflection.AssemblyVersion("4.7.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("4.7.1.0")]
+[assembly: System.Reflection.AssemblyVersion("4.7.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("4.7.2.0")]
 
 namespace PingMonitor
 {
@@ -2040,6 +2040,39 @@ namespace PingMonitor
             catch { return null; }
         }
 
+        /// <summary>Pfad der EXE, aus der der installierte Dienst startet ("" = unbekannt/nicht installiert).</summary>
+        public static string ServiceExePath()
+        {
+            try
+            {
+                using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + ServiceName))
+                {
+                    string ip = k == null ? "" : Convert.ToString(k.GetValue("ImagePath")) ?? "";
+                    ip = ip.Trim();
+                    if (ip.StartsWith("\"")) { int e = ip.IndexOf('"', 1); return e > 1 ? ip.Substring(1, e - 1) : ip.Trim('"'); }
+                    int x = ip.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+                    return x > 0 ? ip.Substring(0, x + 4) : ip;
+                }
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>
+        /// Läuft der Dienst aus einem ANDEREN Ordner als diese App? Dann liest er andere Einstellungen/Switches/Geräte,
+        /// und die App zeigt dessen Daten nicht (häufig nach Kopieren in einen neuen Ordner).
+        /// </summary>
+        public static string OtherFolder()
+        {
+            string p = ServiceExePath();
+            if (p.Length == 0) return "";
+            try
+            {
+                string a = Path.GetFullPath(Path.GetDirectoryName(p)).TrimEnd('\\'), b = Path.GetFullPath(Config.BaseDir).TrimEnd('\\');
+                return string.Equals(a, b, StringComparison.OrdinalIgnoreCase) ? "" : Path.GetDirectoryName(p);
+            }
+            catch { return ""; }
+        }
+
         public static string StatusText(ServiceControllerStatus? s)
         {
             if (!s.HasValue) return "nicht installiert";
@@ -3653,6 +3686,13 @@ namespace PingMonitor
             svcStatus = ServiceSetup.Status();
             lblService.Text = "Windows-Dienst: " + ServiceSetup.StatusText(svcStatus);
             lblService.ForeColor = svcStatus == ServiceControllerStatus.Running ? Color.DarkGreen : SystemColors.ControlText;
+            string other = svcStatus.HasValue ? ServiceSetup.OtherFolder() : "";
+            if (other.Length > 0)
+            {
+                // Dienst und App arbeiten mit verschiedenen Ordnern: Switches/Geräte/Einstellungen dieser App erreichen den Dienst nicht.
+                lblService.Text += " - ACHTUNG: aus anderem Ordner (" + other + ") - Dienst deinstallieren und hier neu installieren";
+                lblService.ForeColor = Color.DarkRed;
+            }
             miSvcInstall.Enabled = !svcStatus.HasValue;
             miSvcUninstall.Enabled = svcStatus.HasValue;
             miSvcStart.Enabled = svcStatus == ServiceControllerStatus.Stopped;
@@ -16936,6 +16976,33 @@ namespace PingMonitor
             StringBuilder sb = new StringBuilder();
             sb.Append("PingMonitor - Diagnosedaten " + DateTime.Now.ToString(Fmt.Time) + "\r\n");
             sb.Append("Enthält IP-/MAC-Adressen und Gerätenamen, aber keine Passwörter oder Communities.\r\n\r\n");
+            // Version, Ordner, Dienst: häufigste Ursache für "nichts wird abgefragt" ist ein Dienst aus einem anderen Ordner
+            ServiceControllerStatus? st = ServiceSetup.Status();
+            string svcPath = ServiceSetup.ServiceExePath(), other = ServiceSetup.OtherFolder();
+            sb.Append("Version: " + Program.Version + "  ·  App: " + Application.ExecutablePath + "\r\n");
+            sb.Append("Dienst: " + ServiceSetup.StatusText(st) + (svcPath.Length > 0 ? "  ·  " + svcPath : "") +
+                (other.Length > 0 ? "  ·  ACHTUNG: ANDERER ORDNER als die App - der Dienst nutzt dort eigene Switches/Geräte/Einstellungen" : "") + "\r\n");
+            string stat = Path.Combine(Config.BaseDir, "Switch_Status.csv");
+            sb.Append("Switch-Status des Dienstes: " + (File.Exists(stat) ? "zuletzt geschrieben " + File.GetLastWriteTime(stat).ToString(Fmt.Time) : "fehlt") + "\r\n");
+            List<SwitchState> cfg;
+            try { cfg = SwitchMonitor.LoadConfig(); } catch { cfg = new List<SwitchState>(); }
+            sb.Append("Eingetragene Switches (switches.txt): " + cfg.Count + "\r\n");
+            foreach (SwitchState c in cfg)
+            {
+                // Direkter SNMP-Test aus der App (unabhängig vom Dienst)
+                string res;
+                IPAddress a;
+                if (!IPAddress.TryParse(c.Address, out a)) res = "Adresse ungültig";
+                else
+                {
+                    Dictionary<string, string> v = Snmp.Get(a, c.Community, 2000, Snmp.SysName, Snmp.SysDescr);
+                    string n, ds;
+                    v.TryGetValue(Snmp.SysName, out n); v.TryGetValue(Snmp.SysDescr, out ds);
+                    res = v.Count > 0 ? "SNMP OK: " + n + " | " + ds : "KEINE SNMP-ANTWORT (SNMP am Switch aus, falsche Community, nur SNMPv3, Zugriffsliste/Management-VLAN oder Firewall)";
+                }
+                sb.Append("    " + c.Name + " (" + c.Address + "): " + res + "\r\n");
+            }
+            sb.Append("\r\n");
             IPAddress gw = Topology.Gateway();
             sb.Append("Gateway: " + (gw != null ? gw.ToString() : "-") + "  MAC " + Topology.GatewayMac() + "\r\n\r\n");
             foreach (SwitchState s in switches)
