@@ -14,3 +14,11 @@ ARP-Scan, TCP-Wiederholungen (dieser PC, Agent, Mitschnitt).
 - PAUSE-Zähler: prüfen, welche Switches die dot3PauseTable liefern (UniFi per SNMP?); UniFi-Controller-API liefert keine.
 - Normalwert je Port geht beim Neustart verloren (30 min Anlernzeit) - ggf. aus den Langzeitdaten vorbelegen.
 - Proxmox: Ceph-Zustand, Speicher (Storage voll), Backups.
+
+## Nächste Version (nach 4.7.3)
+
+- SNMP v3 unterstützen (authPriv: Benutzer, SHA-Authentifizierung, AES-Verschlüsselung), damit Switches/UniFi
+  nicht mehr per v2c mit Community abgefragt werden müssen. Einstellbar global und je Switch; v2c als Fallback.
+- Standard-Community „public“ nicht mehr stillschweigend verwenden: beim ersten Start bzw. in den Einstellungen
+  eine eigene Community abfragen und einen Hinweis zeigen, wenn noch „public“ eingetragen ist.
+- Anlass: UniFi-Controller (ca. 20 Kunden-Sites) hat SNMP v1/2c mit Community „public“ aktiv, nur wegen PingMonitor.
